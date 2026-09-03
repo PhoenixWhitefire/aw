@@ -36,7 +36,7 @@ type OperatorToken = {
 }
 
 -- TODO luau why do these have to be `read`
-type Token =
+type TokenData =
     | {
         read Type: "Keyword",
         read Keyword: Keyword,
@@ -56,7 +56,10 @@ type Token =
     | OperatorToken
     | SingleCharacterToken
 
-type Expression =
+type Position = { line: number, char: number }
+type Token = TokenData & { position: Position }
+
+type ExpressionData =
     | {
         read Type: "Declaration",
         read Declaration: {
@@ -94,6 +97,8 @@ type Expression =
         read Type: "InvalidSyntax",
         read Token: string,
       }
+
+type Expression = ExpressionData & { position: Position }
 
 local keywords: { read [string]: Keyword? } = {
     let = "let",
@@ -141,7 +146,7 @@ local function isSeparator(c: string)
     return isEof(c) or isWhitespace(c) or c == ";" or c == "=" or c == "(" or c == ")" or c == "," or c == "^" or c == '"' or operators[c]
 end
 
-local function nextToken(state: { position: number, line: number, program: string }): Token
+local function nextToken(state: { position: number, line: number, char: number, program: string }): Token
     local token = ""
     local c
 
@@ -150,8 +155,19 @@ local function nextToken(state: { position: number, line: number, program: strin
 
         if c == "\n" then
             state.line += 1
+            state.char = 1
         end
     until not isWhitespace(c)
+
+    state.char += 1
+    local start = { line = state.line, char = state.char }
+
+    local function tk(t: TokenData): Token
+        local tok: Token = t :: Token
+        tok.position = start
+
+        return tok
+    end
 
     if isSeparator(c) then
         token = c
@@ -174,7 +190,7 @@ local function nextToken(state: { position: number, line: number, program: strin
             error(`Invalid reference '{ token }'.`)
         end
 
-        return {
+        return tk{
             Type = "Literal",
             Literal = literal,
         }
@@ -185,7 +201,7 @@ local function nextToken(state: { position: number, line: number, program: strin
 
         while nextC ~= '"' do
             if isEof(nextC) then
-                return {
+                return tk{
                     Type = "InvalidSyntax",
                     Token = '"' .. strlit,
                 }
@@ -195,61 +211,76 @@ local function nextToken(state: { position: number, line: number, program: strin
             nextC, state.position = nextCharacter(state.program, state.position)
         end
 
-        return {
-            Type = "Literal",
+        return tk{
+            -- TODO luau cast
+            Type = "Literal" :: "Literal",
             Literal = strlit,
         }
     elseif operators[token :: Operator] then -- TODO luau cast (also not accurate)
-        return {
+        return tk{
             Type = "Operator",
             Operator = token :: Operator,
         }
     elseif correspond[token] then
-        return {
+        return tk{
             -- TODO luau
             Type = assert(correspond[token])
         }
     elseif string.match(nextCharacter(token, 1), "%a") or (string.byte(nextCharacter(token, 1)) and string.byte(nextCharacter(token, 1)) > 127) then
         if keywords[token] then
-            return {
+            return tk{
                 Type = "Keyword",
                 Keyword = token :: Keyword,
             }
         else
-            return {
+            return tk{
                 Type = "Identifier",
                 Identifier = token,
             }
         end
     end
 
-    return {
+    return tk{
         Type = "InvalidSyntax",
         Token = token,
     }
 end
 
+type ParseState = {
+    program: string,
+    position: number,
+    line: number,
+    char: number,
+}
+
+local function ex(expr: ExpressionData, t: { position: Position }): Expression
+    local x: Expression = expr :: Expression
+    x.position = t.position
+
+    return x
+end
+
 local parseExpression
 
-local function parseBinaryOperation(state: { position: number, line: number, program: string }, report: (string) -> (), left: Expression, opTk: OperatorToken): Expression
-    return {
+local function parseBinaryOperation(state: ParseState, report: (string, Position) -> (), left: Expression, opTk: OperatorToken): Expression
+    return ex({
         Type = "BinaryOperation",
         Operator = opTk.Operator,
         Left = left,
         Right = parseExpression(state, report),
-    }
+    }, left)
 end
 
-function parseExpression(state: { position: number, line: number, program: string }, report: (string) -> (), shallow: boolean?): Expression
+function parseExpression(state: ParseState, report: (string, Position) -> (), shallow: boolean?): Expression
     local token = nextToken(state)
 
     if token.Type == "InvalidSyntax" then
-        report(`Invalid syntax '{ token.Token }'.`)
+        report(`Invalid syntax '{ token.Token }'.`, token.position)
 
-        return {
+        return ex({
             Type = "InvalidSyntax",
             Token = token.Token,
-        }
+        }, token)
     elseif token.Type == "Keyword" then
         if token.Keyword == "let" then
             local nameTk = nextToken(state)
@@ -258,38 +289,48 @@ function parseExpression(state: { position: number, line: number, program: strin
             if nameTk.Type == "Identifier" then
                 name = nameTk.Identifier
             else
-                report(`Expected an identifier, got a { nameTk.Type }.`)
+                report(`Expected an identifier, got a { nameTk.Type }.`, nameTk.position)
+
+                return ex({
+                    Type = "InvalidSyntax",
+                    Token = nameTk.Type,
+                }, nameTk)
             end
 
             local equalsTk = nextToken(state)
 
             if equalsTk.Type ~= "Equals" then
-                report(`Expected an '=' to follow declaration identifier, got a { equalsTk.Type }`)
+                report(`Expected an '=' to follow declaration identifier, got a { equalsTk.Type }`, equalsTk.position)
+
+                return ex({
+                    Type = "InvalidSyntax",
+                    Token = equalsTk.Type,
+                }, equalsTk)
             end
 
             local expr = parseExpression(state, report)
 
-            return {
+            return ex({
                 Type = "Declaration",
                 Declaration = {
                     Name = name,
                     Value = expr,
                 },
-            }
+            }, token)
         elseif token.Keyword == "nil" then
-            return {
+            return ex({
                 Type = "Constant",
                 Constant = { Type = "nil" },
-            }
+            }, token)
         else
             unreachable(token.Keyword)
             error(`Unreachable`)
         end
     elseif token.Type == "Identifier" then
-        local reference: Expression = {
+        local reference: Expression = ex({
             Type = "Reference",
             Reference = token.Identifier,
-        }
+        }, token)
 
         local callParseState = table.clone(state)
         local nextTk = nextToken(callParseState)
@@ -308,13 +349,13 @@ function parseExpression(state: { position: number, line: number, program: strin
 
             state.position += 1 -- skip parens
 
-            return {
+            return ex({
                 Type = "Call",
                 Call = {
                     Identifier = token.Identifier,
                     Arguments = args,
                 },
-            }
+            }, token)
         elseif not shallow and nextTk.Type == "Operator" then
             state.position = callParseState.position
             state.line = callParseState.line
@@ -324,13 +365,14 @@ function parseExpression(state: { position: number, line: number, program: strin
             return reference
         end
     elseif token.Type == "Literal" then
-        local constant: Expression = {
+        -- TODO luau does not report error when `position` is not attached even though the annotation is explicit
+        local constant: Expression = ex({
             Type = "Constant",
             Constant = {
                 Type = typeof(token.Literal) :: any,
                 Value = token.Literal :: any,
             },
-        }
+        }, token)
 
         local operatorParseState = table.clone(state)
         local nextTk = nextToken(operatorParseState)
@@ -364,11 +406,11 @@ function parseExpression(state: { position: number, line: number, program: strin
                 inner = parseExpression(state, report, true)
             end
 
-            local negation = {
+            local negation = ex({
                 Type = "UnaryOperation",
                 Operator = "-",
                 Operand = inner,
-            }
+            }, token)
 
             local maybeOpParseState = table.clone(state)
             local maybeOpTk = nextToken(maybeOpParseState)
@@ -382,20 +424,20 @@ function parseExpression(state: { position: number, line: number, program: strin
                 return negation
             end
         else
-            report(`Unexpected '{ token.Operator }'`)
+            report(`Unexpected '{ token.Operator }'.`, token.position)
 
-            return {
+            return ex({
                 Type = "InvalidSyntax",
                 Token = token.Operator,
-            }
+            }, token)
         end
     else
-        report(`Unexpected { token.Type }.`)
+        report(`Unexpected { token.Type }.`, token.position)
 
-        return {
+        return ex({
             Type = "InvalidSyntax",
             Token = token.Type,
-        }
+        }, token)
     end
 end
 
@@ -416,31 +458,35 @@ local function prettyPrint(t, indent: string?)
     return s
 end
 
-local function parse(program: string): { Expression }?
-    local state = {
+local function parse(program: string): { Success: boolean, Expressions: { Expression } }
+    local state: ParseState = {
+        program = program,
         position = 1,
         line = 1,
-        program = program,
+        char = 1,
     }
 
     -- TODO luau extraneous annotation
     local exprs: { Expression } = {}
-    local compFailed = false
+    local success = true
     local tk = nextToken(table.clone(state))
 
     while tk.Type ~= "EndOfFile" do
-        local expr = parseExpression(state, function(s) error(s) end)
+        local expr = parseExpression(state, function(s, l)
+            success = false
+            print(`{ l.line }:{ l.char }: { s }`)
+        end)
         table.insert(exprs, expr)
         tk = nextToken(table.clone(state))
     end
 
-    print(prettyPrint(exprs))
-    print("\n-->\n")
+    -- print(prettyPrint(exprs))
+    -- print("\n-->\n")
 
-    return exprs
+    return { Success = success, Expressions = exprs }
 end
 
-local vars = {}
+local vars: { [string]: Value? } = {}
 local lib = {
     print = function(args: { read Value }): Value
         local str = ""
@@ -462,8 +508,12 @@ local lib = {
     end,
 }
 
-function eval(expr: Expression): Value
+local function eval(expr: Expression): Value
     assert(expr.Type ~= "InvalidSyntax")
+
+    local function fail(msg): never
+        error(`{ expr.position.line }:{ expr.position.char }: { msg }`)
+    end
 
     if expr.Type == "Declaration" then
         local v = eval(expr.Declaration.Value)
@@ -481,22 +531,33 @@ function eval(expr: Expression): Value
 
             return fn(arguments)
         else
-            error(`Unknown function '{ expr.Call.Identifier }'`)
+            fail(`Unknown function '{ expr.Call.Identifier }'`)
+            error(`Unreachable.`)
         end
     elseif expr.Type == "Constant" then
         return expr.Constant
     elseif expr.Type == "Reference" then
-        return vars[expr.Reference]
+        local v = vars[expr.Reference]
+
+        if v then
+            return v
+        else
+            fail(`Invalid reference '{ expr.Reference }'`)
+            error(`Unreachable.`)
+        end
+
     elseif expr.Type == "BinaryOperation" then
         local leftEval = eval(expr.Left)
         local rightEval = eval(expr.Right)
 
         if leftEval.Type ~= "number" then
-            error(`Expected LHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
+            fail(`Expected LHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
+            error(`Unreachable.`)
         end
 
         if rightEval.Type ~= "number" then
-            error(`Expected RHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
+            fail(`Expected RHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
+            error(`Unreachable.`)
         end
 
         local left = leftEval.Value
@@ -520,7 +581,8 @@ function eval(expr: Expression): Value
         local operandEval = eval(expr.Operand)
 
         if operandEval.Type ~= "number" then
-            error(`Cannot negate a { operandEval.Type }.`)
+            fail(`Cannot negate a { operandEval.Type }.`)
+            error(`Unreachable.`)
         end
 
         return { Type = "number", Value = -operandEval.Value }
@@ -531,20 +593,31 @@ function eval(expr: Expression): Value
 end
 
 local function run(exprs: { Expression })
-    for _, expr in exprs do
-        eval(expr)
+    local success, err = pcall(function()
+        for _, expr in exprs do
+            eval(expr)
+        end
+    end)
+
+    if not success then
+        local msg = tostring(err)
+        local _, p = string.find(msg, ".luau:%d+:")
+
+        if p then
+            msg = string.sub(msg, p + 2, #msg)
+        end
+
+        print(msg)
     end
 end
 
 local program = [[
 
-let x = 5
-print(x + 1, "hello")
-print(-(4))
+print("hello" + "helo")
 ]]
 
-local ast = parse(program)
+local result = parse(program)
 
-if ast then
-    run(ast)
+if result.Success then
+    run(result.Expressions)
 end
