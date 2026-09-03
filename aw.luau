@@ -1,12 +1,24 @@
 -- aw.luau - erin5/@PhoenixWhitefire, 03/09/2026
 --!strict
-type Value = nil | number | string
+type Value =
+    | {
+        Type: "nil",
+        Value: nil,
+      }
+    | {
+        Type: "number",
+        Value: number,
+      }
+    | {
+        Type: "string",
+        Value: string,
+      }
 
 type SingleCharacterToken = {
     read Type: "Equals" | "OpenParentheses" | "CloseParentheses" | "Comma" | "EndOfFile",
 }
 
-type Keyword = "let"
+type Keyword = "let" | "nil"
 
 local operators = {
     ["+"] = true,
@@ -54,7 +66,7 @@ type Expression =
       }
     | {
         read Type: "Constant",
-        read Constant: number | string,
+        read Constant: Value,
       }
     | {
         read Type: "Call",
@@ -80,6 +92,7 @@ type Expression =
 
 local keywords: { read [string]: Keyword? } = {
     let = "let",
+    ["nil"] = "nil",
 }
 
 -- TODO luau
@@ -258,11 +271,21 @@ function parseExpression(state: { position: number, line: number, program: strin
                     Value = expr,
                 },
             }
+        elseif token.Keyword == "nil" then
+            return {
+                Type = "Constant",
+                Constant = { Type = "nil" },
+            }
         else
             unreachable(token.Keyword)
             error(`Unreachable`)
         end
     elseif token.Type == "Identifier" then
+        local reference: Expression = {
+            Type = "Reference",
+            Reference = token.Identifier,
+        }
+
         local callParseState = table.clone(state)
         local nextTk = nextToken(callParseState)
 
@@ -287,17 +310,34 @@ function parseExpression(state: { position: number, line: number, program: strin
                     Arguments = args,
                 },
             }
+        elseif nextTk.Type == "Operator" then
+            state.position = callParseState.position
+            state.line = callParseState.line
+
+            return parseBinaryOperation(state, report, reference, nextTk)
         else
-            return {
-                Type = "Reference",
-                Reference = token.Identifier,
-            }
+            return reference
         end
     elseif token.Type == "Literal" then
-        return {
+        local constant: Expression = {
             Type = "Constant",
-            Constant = token.Literal,
+            Constant = {
+                Type = typeof(token.Literal) :: any,
+                Value = token.Literal :: any,
+            },
         }
+
+        local operatorParseState = table.clone(state)
+        local nextTk = nextToken(operatorParseState)
+
+        if nextTk.Type == "Operator" then
+            state.position = operatorParseState.position
+            state.line = operatorParseState.line
+
+            return parseBinaryOperation(state, report, constant, nextTk)
+        else
+            return constant
+        end
     elseif token.Type == "Comma" then
         -- TODO check
         state.position += 1
@@ -332,7 +372,7 @@ end
 local program = [[
 
 let x = 5
-print(x, "hello")
+print(x + 1, "hello")
 
 ]]
 
@@ -360,17 +400,23 @@ local eval
 
 local vars = {}
 local lib = {
-    print = function(args: { Expression }): Value
+    print = function(args: { read Value }): Value
         local str = ""
 
         for _, a in args do
-            str ..= tostring(eval(a)) .. " "
+            str ..= tostring(a.Value) .. " "
         end
 
         str = string.sub(str, 1, #str - 1)
         print(str)
 
-        return nil
+        return { Type = "nil" }
+    end,
+
+    typeof = function(args: { read Value }): Value
+        assert(#args == 1, `'typeof' requires 1 argument.`)
+
+        return { Type = "string", Value = typeof(args[1].Value) }
     end,
 }
 
@@ -385,7 +431,13 @@ function eval(expr: Expression): Value
     elseif expr.Type == "Call" then
         if lib[expr.Call.Identifier] then
             local fn = lib[expr.Call.Identifier]
-            return fn(expr.Call.Arguments)
+            local arguments = table.create<<Value>>(#expr.Call.Arguments)
+
+            for i, a in expr.Call.Arguments do
+                arguments[i] = eval(a)
+            end
+
+            return fn(arguments)
         else
             error(`Unknown function '{ expr.Call.Identifier }'`)
         end
@@ -393,6 +445,35 @@ function eval(expr: Expression): Value
         return expr.Constant
     elseif expr.Type == "Reference" then
         return vars[expr.Reference]
+    elseif expr.Type == "BinaryOperation" then
+        local leftEval = eval(expr.Left)
+        local rightEval = eval(expr.Right)
+
+        if leftEval.Type ~= "number" then
+            error(`Expected LHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
+        end
+
+        if rightEval.Type ~= "number" then
+            error(`Expected RHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
+        end
+
+        local left = leftEval.Value
+        local right = rightEval.Value
+
+        if expr.Operator == "+" then
+            return { Type = "number", Value = left + right }
+        elseif expr.Operator == "-" then
+            return { Type = "number", Value = left - right }
+        elseif expr.Operator == "*" then
+            return { Type = "number", Value = left * right }
+        elseif expr.Operator == "/" then
+            return { Type = "number", Value = left / right }
+        elseif expr.Operator == "//" then
+            return { Type = "number", Value = left // right }
+        else
+            unreachable(expr.Operation)
+            error(`Unreachable.`)
+        end
     else
         unreachable(expr.Type)
         error(`Unreachable.`)
