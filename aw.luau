@@ -6,6 +6,10 @@ type Value =
         Value: nil,
       }
     | {
+        Type: "boolean",
+        Value: boolean,
+      }
+    | {
         Type: "number",
         Value: number,
       }
@@ -33,10 +37,10 @@ type Value =
       }
 
 type BasicToken = {
-    read Type: "Equals" | "OpenParentheses" | "CloseParentheses" | "Comma" | "Ellipsis" | "EndOfFile",
+    read Type: "Equals" | "IsEqualTo" | "OpenParentheses" | "CloseParentheses" | "Comma" | "Ellipsis" | "EndOfFile",
 }
 
-type Keyword = "nil" | "let" | "function" | "return" | "end"
+type Keyword = "nil" | "true" | "false" | "let" | "function" | "return" | "end" | "if" | "then"
 
 local operators = {
     ["+"] = true,
@@ -45,6 +49,7 @@ local operators = {
     ["/"] = true,
     ["//"] = true,
     [".."] = true,
+    ["=="] = true,
 }
 
 type Operator = keyof<typeof(operators)>
@@ -128,6 +133,11 @@ type ExpressionData =
         read Type: "VariadicArguments",
       }
     | {
+        read Type: "IfCondition",
+        read Condition: Expression,
+        read Body: { read Expression },
+      }
+    | {
         read Type: "InvalidSyntax",
         read Token: string,
       }
@@ -136,9 +146,13 @@ type Expression = ExpressionData & { position: Position }
 
 local keywords: { read [string]: Keyword? } = {
     ["nil"] = "nil",
+    ["true"] = "true",
+    ["false"] = "false",
     let = "let",
     ["function"] = "function",
     ["return"] = "return",
+    ["if"] = "if",
+    ["then"] = "then",
     ["end"] = "end",
 }
 
@@ -208,7 +222,14 @@ local function nextToken(state: { position: number, line: number, char: number, 
     end
 
     if isSeparator(c) then
-        token = c
+        local next, pos = nextCharacter(state.program, state.position)
+
+        if next == "=" then
+            token = c .. next
+            state.position = pos
+        else
+            token = c
+        end
     else
         local before = state.position
 
@@ -310,6 +331,33 @@ end
 
 local parseExpression
 
+local function parseBody(state: ParseState, report: (string, { position: Position }) -> ()): { Expression }
+    local body: { Expression } = {}
+    local endTkParseState = table.clone(state)
+    local endTk = nextToken(endTkParseState)
+
+    while endTk.Type ~= "Keyword" or endTk.Keyword ~= "end" do
+        if endTk.Type == "EndOfFile" then
+            report(`Unexpected end-of-file before function 'end'.`, endTk)
+            break
+        end
+
+        local expr = parseExpression(state, report)
+        if not expr then
+            break
+        end
+
+        table.insert(body, expr)
+        endTkParseState = table.clone(state)
+        endTk = nextToken(endTkParseState)
+    end
+
+    state.position = endTkParseState.position
+    state.line = endTkParseState.line
+    state.char = endTkParseState.char
+    return body
+end
+
 local function parseBinaryOperation(state: ParseState, report: (string, { position: Position }) -> (), left: Expression, opTk: OperatorToken): Expression
     return ex({
         Type = "BinaryOperation",
@@ -370,6 +418,11 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 Type = "Constant",
                 Constant = { Type = "nil" },
             }, token)
+        elseif token.Keyword == "true" or token.Keyword == "false" then
+            return ex({
+                Type = "Constant",
+                Constant = { Type = "boolean", Value = token.Keyword == "true" }
+            }, token)
         elseif token.Keyword == "function" then
             local openParenTk = nextToken(state)
 
@@ -410,29 +463,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 end
             end
 
-            local body: { Expression } = {}
-            local endTkParseState = table.clone(state)
-            local endTk = nextToken(endTkParseState)
-
-            while endTk.Type ~= "Keyword" or endTk.Keyword ~= "end" do
-                if endTk.Type == "EndOfFile" then
-                    report(`Unexpected end-of-file before function 'end'.`, endTk)
-                    break
-                end
-
-                local expr = parseExpression(state, report)
-                if not expr then
-                    break
-                end
-
-                table.insert(body, expr)
-                endTkParseState = table.clone(state)
-                endTk = nextToken(endTkParseState)
-            end
-
-            state.position = endTkParseState.position
-            state.line = endTkParseState.line
-            state.char = endTkParseState.char
+            local body = parseBody(state, report)
 
             return ex({
                 Type = "Function",
@@ -457,6 +488,23 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 Type = "InvalidSyntax",
                 Token = token.Keyword,
             }, token)
+        elseif token.Keyword == "if" then
+            local condition = parseExpression(state, report) or invalidExpr(state, "Reached end-of-file trying to parse 'if' condition", report)
+            local thenTk = nextToken(state)
+
+            if thenTk.Type ~= "Keyword" or thenTk.Keyword ~= "then" then
+                return invalidExpr(state, `Expected 'then' keyword following condition, got { thenTk.Type }`, report)
+            end
+
+            local body = parseBody(state, report)
+
+            return ex({
+                Type = "IfCondition",
+                Condition = condition,
+                Body = body,
+            }, token)
+        elseif token.Keyword == "then" then
+            return invalidExpr(state, "Unexpected 'then'", report)
         else
             unreachable(token.Keyword)
             error(`Unreachable`)
@@ -748,9 +796,19 @@ local function eval(expr: Expression): Value?
 
                 table.insert(callFrames, { VariadicArguments = variadicArgs })
 
-                local returned = runUnprotected(fn.Value.Body)
+                local success, data = pcall(runUnprotected, fn.Value.Body)
 
                 table.remove(callFrames)
+
+                local returned: Value?
+
+                if success then
+                    returned = data
+                elseif typeof(data) == "table" and (data :: any).NormalReturn == true then
+                    returned = (data :: any).NormalReturnValue
+                else
+                    error(data)
+                end
 
                 for p, old in shadowed do
                     env[p] = old
@@ -778,7 +836,9 @@ local function eval(expr: Expression): Value?
         local leftEval = eval(expr.Left) or nilVal()
         local rightEval = eval(expr.Right) or nilVal()
 
-        if expr.Operator == ".." then
+        if expr.Operator == "==" then
+            return { Type = "boolean", Value = leftEval.Value == rightEval.Value }
+        elseif expr.Operator == ".." then
             if leftEval.Type ~= "string" then
                 fail(`Expected LHS of '{ expr.Operator }' operation to be a string, got a { leftEval.Type } instead.`)
                 error(`Unreachable.`)
@@ -815,7 +875,7 @@ local function eval(expr: Expression): Value?
             elseif expr.Operator == "//" then
                 return { Type = "number", Value = left // right }
             else
-                unreachable(expr.Operation)
+                unreachable(expr.Operator)
                 error(`Unreachable.`)
             end
         end
@@ -851,16 +911,32 @@ local function eval(expr: Expression): Value?
             },
         }
     elseif expr.Type == "Return" then
-        return if expr.Return then eval(expr.Return) else nil
+        error({
+            NormalReturn = true,
+            NormalReturnValue = if expr.Return then eval(expr.Return) else nil,
+        })
     elseif expr.Type == "VariadicArguments" then
         return callFrames[#callFrames].VariadicArguments[1]
+    elseif expr.Type == "IfCondition" then
+        local conditionResult = eval(expr.Condition) or nilVal()
+
+        if conditionResult.Type ~= "boolean" then
+            fail(`Expected boolean for condition, got { conditionResult.Type }`)
+            error(`Unreachable.`)
+        end
+
+        if conditionResult.Value == true then
+            return runUnprotected(expr.Body)
+        else
+            return nilVal()
+        end
     else
         unreachable(expr.Type)
         error(`Unreachable.`)
     end
 end
 
-function runUnprotected(exprs: { Expression }): Value?
+function runUnprotected(exprs: { read Expression }): Value?
     for _, expr in exprs do
         local result = eval(expr)
 
@@ -872,7 +948,7 @@ function runUnprotected(exprs: { Expression }): Value?
     return nil
 end
 
-local function run(exprs: { Expression }): Value?
+local function run(exprs: { read Expression }): Value?
     table.insert(callFrames, { VariadicArguments = {} })
 
     local success, data = pcall(runUnprotected, exprs)
@@ -896,11 +972,18 @@ end
 
 local program = [[
 
-let debugprint = function(...)
-    print(#...)
+let fn = function(x)
+    if x == 5 then
+        print("Yes!")
+        return true
+    end
+
+    print("No")
+    return false
 end
 
-debugprint("Hello!", 2, 3)
+print(fn(5))
+print(fn(0))
 
 ]]
 
