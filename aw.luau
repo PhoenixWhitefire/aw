@@ -27,9 +27,13 @@ type Value =
                 Body: { Expression },
               },
       }
+    | {
+        Type: "VariadicArguments",
+        Value: { read Value },
+      }
 
-type SingleCharacterToken = {
-    read Type: "Equals" | "OpenParentheses" | "CloseParentheses" | "Comma" | "EndOfFile",
+type BasicToken = {
+    read Type: "Equals" | "OpenParentheses" | "CloseParentheses" | "Comma" | "Ellipsis" | "EndOfFile",
 }
 
 type Keyword = "nil" | "let" | "function" | "return" | "end"
@@ -69,7 +73,7 @@ type TokenData =
         read Token: string,
       }
     | OperatorToken
-    | SingleCharacterToken
+    | BasicToken
 
 type Position = { line: number, char: number }
 type Token = TokenData & { position: Position }
@@ -121,6 +125,9 @@ type ExpressionData =
         read Return: Expression?,
       }
     | {
+        read Type: "VariadicArguments",
+      }
+    | {
         read Type: "InvalidSyntax",
         read Token: string,
       }
@@ -136,16 +143,17 @@ local keywords: { read [string]: Keyword? } = {
 }
 
 -- TODO luau
-local correspond: { read [string]: index<SingleCharacterToken, "Type">? } = {
+local correspond: { read [string]: index<BasicToken, "Type">? } = {
     ["="] = "Equals",
     ["("] = "OpenParentheses",
     [")"] = "CloseParentheses",
     [","] = "Comma",
+    ["..."] = "Ellipsis",
     [""] = "EndOfFile",
 }
 
 local function unreachable(x: never): never
-    error(`Got value '{ x }' ({ typeof(x) }).`)
+    error(`Unexpected branch with value '{ x }' ({ typeof(x) }), this is an internal error.`)
 end
 
 local function nextCharacter(str: string, position: number): (string, number)
@@ -375,6 +383,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
             end
 
             local parameters = {}
+            local variadic = false
             local paramTk = nextToken(state)
 
             while paramTk.Type ~= "CloseParentheses" do
@@ -385,6 +394,16 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                     if paramTk.Type == "Comma" then
                         paramTk = nextToken(state)
                     end
+                elseif paramTk.Type == "Ellipsis" then
+                    variadic = true
+
+                    local closeParen = nextToken(state)
+
+                    if closeParen.Type ~= "CloseParentheses" then
+                        return invalidExpr(state, `Expected closing parentheses after ellipsis in function parameter list, got { closeParen.Type } instead`, report)
+                    end
+
+                    break
                 else
                     report(`Expected function parameter name, got { paramTk.Type }.`, paramTk)
                     break
@@ -419,7 +438,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 Type = "Function",
                 Function = {
                     Parameters = parameters,
-                    Variadic = false,
+                    Variadic = variadic,
                     Body = body,
                 },
             }, token)
@@ -552,6 +571,10 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 Token = token.Operator,
             }, token)
         end
+    elseif token.Type == "Ellipsis" then
+        return ex({
+            Type = "VariadicArguments",
+        }, token)
     elseif token.Type == "EndOfFile" then
         return nil
     else
@@ -637,9 +660,15 @@ local env: { [string]: Value? } = {
     typeof = makeLuauFuncValue(function(args): Value -- TODO luau extraneous annotation
         assert(#args == 1, `'typeof' requires 1 argument.`)
 
-        return { Type = "string", Value = args[1].Type }
+        return { Type = "string", Value = args[1].Type } -- TODO luau weird type error?
     end),
 }
+
+type CallFrame = {
+    read VariadicArguments: { read Value },
+}
+
+local callFrames: { CallFrame } = {}
 
 local runUnprotected
 
@@ -683,11 +712,24 @@ local function eval(expr: Expression): Value?
             local arguments = table.create<<Value>>(#expr.Call.Arguments)
 
             for i, a in expr.Call.Arguments do
-                arguments[i] = eval(a)
+                if a.Type == "VariadicArguments" then
+                    local varargs = callFrames[#callFrames].VariadicArguments
+
+                    for vi, va in varargs do
+                        arguments[i + vi - 1] = va
+                    end
+                else
+                    arguments[i] = eval(a)
+                end
             end
 
             if fn.Value.IsLuau then
-                return fn.Value.Function(arguments)
+                table.insert(callFrames, { VariadicArguments = {} })
+
+                local returned = fn.Value.Function(arguments)
+
+                table.remove(callFrames)
+                return returned
             else
                 local shadowed = {}
 
@@ -696,7 +738,19 @@ local function eval(expr: Expression): Value?
                     env[p] = arguments[i]
                 end
 
+                local variadicArgs = {}
+
+                if #fn.Value.Parameters < #expr.Call.Arguments and fn.Value.Variadic then
+                    for i = #fn.Value.Parameters + 1, #expr.Call.Arguments do
+                        table.insert(variadicArgs, eval(expr.Call.Arguments[i]))
+                    end
+                end
+
+                table.insert(callFrames, { VariadicArguments = variadicArgs })
+
                 local returned = runUnprotected(fn.Value.Body)
+
+                table.remove(callFrames)
 
                 for p, old in shadowed do
                     env[p] = old
@@ -786,6 +840,8 @@ local function eval(expr: Expression): Value?
         }
     elseif expr.Type == "Return" then
         return if expr.Return then eval(expr.Return) else nil
+    elseif expr.Type == "VariadicArguments" then
+        return callFrames[#callFrames].VariadicArguments[1]
     else
         unreachable(expr.Type)
         error(`Unreachable.`)
@@ -805,7 +861,11 @@ function runUnprotected(exprs: { Expression }): Value?
 end
 
 local function run(exprs: { Expression }): Value?
+    table.insert(callFrames, { VariadicArguments = {} })
+
     local success, data = pcall(runUnprotected, exprs)
+
+    table.remove(callFrames)
 
     if success then
         return data
@@ -814,7 +874,7 @@ local function run(exprs: { Expression }): Value?
         local _, p = string.find(msg, ".luau:%d+:")
 
         if p then
-            msg = string.sub(msg, p + 2, #msg)
+            --msg = string.sub(msg, p + 2, #msg)
         end
 
         print(msg)
@@ -824,11 +884,11 @@ end
 
 local program = [[
 
-let debugprint = function(str)
-    print("[DBG]: " .. str)
+let debugprint = function(...)
+    print(...)
 end
 
-debugprint("Hello!")
+debugprint("Hello!", 2, 3)
 
 ]]
 
