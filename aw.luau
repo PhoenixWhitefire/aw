@@ -109,7 +109,7 @@ type ExpressionData =
       }
     | {
         read Type: "UnaryOperation",
-        read Operator: "-",
+        read Operator: "-" | "#",
         read Operand: Expression,
       }
     | {
@@ -181,7 +181,7 @@ local function isEof(c: string)
 end
 
 local function isSeparator(c: string)
-    return isEof(c) or isWhitespace(c) or c == ";" or c == "=" or c == "(" or c == ")" or c == "," or c == "^" or c == '"' or operators[c]
+    return isEof(c) or isWhitespace(c) or c == ";" or c == "=" or c == "(" or c == ")" or c == "," or c == "^" or c == '"' or c == "#" or operators[c]
 end
 
 local function nextToken(state: { position: number, line: number, char: number, program: string }): Token
@@ -254,7 +254,7 @@ local function nextToken(state: { position: number, line: number, char: number, 
             Type = "Literal" :: "Literal",
             Literal = strlit,
         }
-    elseif operators[token :: Operator] then -- TODO luau cast (also not accurate)
+    elseif operators[token :: Operator] or token == "#" then -- TODO luau cast (also not accurate)
         return tk{
             Type = "Operator",
             Operator = token :: Operator,
@@ -530,7 +530,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
         state.position += 1
         return parseExpression(state, report)
     elseif token.Type == "Operator" then
-        if token.Operator == "-" then
+        if token.Operator == "-" or token.Operator == "#" then
             local inner: Expression
 
             local parenParseState = table.clone(state)
@@ -540,15 +540,15 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 state.position = parenParseState.position
                 state.line = parenParseState.line
 
-                inner = parseExpression(state, report) or invalidExpr(state, "Got end-of-file parsing negation expression after parentheses", report)
+                inner = parseExpression(state, report) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression after parentheses`, report)
                 state.position += 1 -- skip closing parens
             else
-                inner = parseExpression(state, report, true) or invalidExpr(state, "Got end-of-file parsing negation expression", report)
+                inner = parseExpression(state, report, true) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression`, report)
             end
 
             local negation = ex({
                 Type = "UnaryOperation",
-                Operator = "-",
+                Operator = token.Operator,
                 Operand = inner,
             }, token)
 
@@ -822,12 +822,24 @@ local function eval(expr: Expression): Value?
     elseif expr.Type == "UnaryOperation" then
         local operandEval = eval(expr.Operand) or nilVal()
 
-        if operandEval.Type ~= "number" then
-            fail(`Cannot negate a { operandEval.Type }.`)
+        if expr.Operator == "-" then
+            if operandEval.Type ~= "number" then
+                fail(`Cannot negate a { operandEval.Type }.`)
+                error(`Unreachable.`)
+            end
+
+            return { Type = "number", Value = -operandEval.Value }
+        elseif expr.Operator == "#" then
+            if operandEval.Type ~= "string" then
+                fail(`Cannot get the length of a { operandEval.Type }.`)
+                error(`Unreachable.`)
+            end
+
+            return { Type = "number", Value = #operandEval.Value }
+        else
+            unreachable(expr.Operator)
             error(`Unreachable.`)
         end
-
-        return { Type = "number", Value = -operandEval.Value }
     elseif expr.Type == "Function" then
         return {
             Type = "Function",
@@ -885,7 +897,7 @@ end
 local program = [[
 
 let debugprint = function(...)
-    print(...)
+    print(#...)
 end
 
 debugprint("Hello!", 2, 3)
