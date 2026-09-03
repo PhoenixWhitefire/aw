@@ -86,6 +86,11 @@ type Expression =
         read Right: Expression,
       }
     | {
+        read Type: "UnaryOperation",
+        read Operator: "-",
+        read Operand: Expression,
+      }
+    | {
         read Type: "InvalidSyntax",
         read Token: string,
       }
@@ -235,7 +240,7 @@ local function parseBinaryOperation(state: { position: number, line: number, pro
     }
 end
 
-function parseExpression(state: { position: number, line: number, program: string }, report: (string) -> ()): Expression
+function parseExpression(state: { position: number, line: number, program: string }, report: (string) -> (), shallow: boolean?): Expression
     local token = nextToken(state)
 
     if token.Type == "InvalidSyntax" then
@@ -310,7 +315,7 @@ function parseExpression(state: { position: number, line: number, program: strin
                     Arguments = args,
                 },
             }
-        elseif nextTk.Type == "Operator" then
+        elseif not shallow and nextTk.Type == "Operator" then
             state.position = callParseState.position
             state.line = callParseState.line
 
@@ -330,7 +335,7 @@ function parseExpression(state: { position: number, line: number, program: strin
         local operatorParseState = table.clone(state)
         local nextTk = nextToken(operatorParseState)
 
-        if nextTk.Type == "Operator" then
+        if not shallow and nextTk.Type == "Operator" then
             state.position = operatorParseState.position
             state.line = operatorParseState.line
 
@@ -342,6 +347,48 @@ function parseExpression(state: { position: number, line: number, program: strin
         -- TODO check
         state.position += 1
         return parseExpression(state, report)
+    elseif token.Type == "Operator" then
+        if token.Operator == "-" then
+            local inner: Expression
+
+            local parenParseState = table.clone(state)
+            local nextTk = nextToken(parenParseState)
+
+            if nextTk.Type == "OpenParentheses" then
+                state.position = parenParseState.position
+                state.line = parenParseState.line
+
+                inner = parseExpression(state, report)
+                state.position += 1 -- skip closing parens
+            else
+                inner = parseExpression(state, report, true)
+            end
+
+            local negation = {
+                Type = "UnaryOperation",
+                Operator = "-",
+                Operand = inner,
+            }
+
+            local maybeOpParseState = table.clone(state)
+            local maybeOpTk = nextToken(maybeOpParseState)
+
+            if not shallow and maybeOpTk.Type == "Operator" then
+                state.position = maybeOpParseState.position
+                state.line = maybeOpParseState.line
+
+                return parseBinaryOperation(state, report, negation, maybeOpTk)
+            else
+                return negation
+            end
+        else
+            report(`Unexpected '{ token.Operator }'`)
+
+            return {
+                Type = "InvalidSyntax",
+                Token = token.Operator,
+            }
+        end
     else
         report(`Unexpected { token.Type }.`)
 
@@ -373,7 +420,7 @@ local program = [[
 
 let x = 5
 print(x + 1, "hello")
-
+print(-(4))
 ]]
 
 local state = {
@@ -474,6 +521,14 @@ function eval(expr: Expression): Value
             unreachable(expr.Operation)
             error(`Unreachable.`)
         end
+    elseif expr.Type == "UnaryOperation" then
+        local operandEval = eval(expr.Operand)
+
+        if operandEval.Type ~= "number" then
+            error(`Cannot negate a { operandEval.Type }.`)
+        end
+
+        return { Type = "number", Value = -operandEval.Value }
     else
         unreachable(expr.Type)
         error(`Unreachable.`)
