@@ -416,34 +416,29 @@ local function prettyPrint(t, indent: string?)
     return s
 end
 
-local program = [[
+local function parse(program: string): { Expression }?
+    local state = {
+        position = 1,
+        line = 1,
+        program = program,
+    }
 
-let x = 5
-print(x + 1, "hello")
-print(-(4))
-]]
+    -- TODO luau extraneous annotation
+    local exprs: { Expression } = {}
+    local compFailed = false
+    local tk = nextToken(table.clone(state))
 
-local state = {
-    position = 1,
-    line = 1,
-    program = program,
-}
+    while tk.Type ~= "EndOfFile" do
+        local expr = parseExpression(state, function(s) error(s) end)
+        table.insert(exprs, expr)
+        tk = nextToken(table.clone(state))
+    end
 
--- TODO luau extraneous annotation
-local exprs: { Expression } = {}
-local compFailed = false
-local tk = nextToken(table.clone(state))
+    print(prettyPrint(exprs))
+    print("\n-->\n")
 
-while tk.Type ~= "EndOfFile" do
-    local expr = parseExpression(state, function(s) error(s) end)
-    table.insert(exprs, expr)
-    tk = nextToken(table.clone(state))
+    return exprs
 end
-
-print(prettyPrint(exprs))
-print("\n-->\n")
-
-local eval
 
 local vars = {}
 local lib = {
@@ -535,10 +530,21 @@ function eval(expr: Expression): Value
     end
 end
 
-if compFailed then
-    print("Compilation finished with errors.")
-else
+local function run(exprs: { Expression })
     for _, expr in exprs do
         eval(expr)
     end
+end
+
+local program = [[
+
+let x = 5
+print(x + 1, "hello")
+print(-(4))
+]]
+
+local ast = parse(program)
+
+if ast then
+    run(ast)
 end
