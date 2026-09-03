@@ -40,6 +40,7 @@ local operators = {
     ["*"] = true,
     ["/"] = true,
     ["//"] = true,
+    [".."] = true,
 }
 
 type Operator = keyof<typeof(operators)>
@@ -625,7 +626,7 @@ local env: { [string]: Value? } = {
         local str = ""
 
         for _, a in args do
-            str ..= tostring(a.Value) .. " "
+            str ..= tostring(if a.Type == "Function" then "function" else a.Value) .. " "
         end
 
         str = string.sub(str, 1, #str - 1)
@@ -704,7 +705,7 @@ local function eval(expr: Expression): Value?
                 return returned
             end
         else
-            fail(`Unknown function '{ expr.Call.Identifier }'`)
+            fail(`Unknown function '{ expr.Call.Identifier }'.`)
             error(`Unreachable.`)
         end
     elseif expr.Type == "Constant" then
@@ -715,7 +716,7 @@ local function eval(expr: Expression): Value?
         if v then
             return v
         else
-            fail(`Invalid reference '{ expr.Reference }'.`)
+            fail(`Unknown reference '{ expr.Reference }'.`)
             error(`Unreachable.`)
         end
 
@@ -723,32 +724,46 @@ local function eval(expr: Expression): Value?
         local leftEval = eval(expr.Left) or nilVal()
         local rightEval = eval(expr.Right) or nilVal()
 
-        if leftEval.Type ~= "number" then
-            fail(`Expected LHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
-            error(`Unreachable.`)
-        end
+        if expr.Operator == ".." then
+            if leftEval.Type ~= "string" then
+                fail(`Expected LHS of '{ expr.Operator }' operation to be a string, got a { leftEval.Type } instead.`)
+                error(`Unreachable.`)
+            end
 
-        if rightEval.Type ~= "number" then
-            fail(`Expected RHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
-            error(`Unreachable.`)
-        end
+            if rightEval.Type ~= "string" then
+                fail(`Expected RHS of '{ expr.Operator }' operation to be a string, got a { leftEval.Type } instead.`)
+                error(`Unreachable.`)
+            end
 
-        local left = leftEval.Value
-        local right = rightEval.Value
-
-        if expr.Operator == "+" then
-            return { Type = "number", Value = left + right }
-        elseif expr.Operator == "-" then
-            return { Type = "number", Value = left - right }
-        elseif expr.Operator == "*" then
-            return { Type = "number", Value = left * right }
-        elseif expr.Operator == "/" then
-            return { Type = "number", Value = left / right }
-        elseif expr.Operator == "//" then
-            return { Type = "number", Value = left // right }
+            return { Type = "string", Value = leftEval.Value .. rightEval.Value }
         else
-            unreachable(expr.Operation)
-            error(`Unreachable.`)
+            if leftEval.Type ~= "number" then
+                fail(`Expected LHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
+                error(`Unreachable.`)
+            end
+
+            if rightEval.Type ~= "number" then
+                fail(`Expected RHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
+                error(`Unreachable.`)
+            end
+
+            local left = leftEval.Value
+            local right = rightEval.Value
+
+            if expr.Operator == "+" then
+                return { Type = "number", Value = left + right }
+            elseif expr.Operator == "-" then
+                return { Type = "number", Value = left - right }
+            elseif expr.Operator == "*" then
+                return { Type = "number", Value = left * right }
+            elseif expr.Operator == "/" then
+                return { Type = "number", Value = left / right }
+            elseif expr.Operator == "//" then
+                return { Type = "number", Value = left // right }
+            else
+                unreachable(expr.Operation)
+                error(`Unreachable.`)
+            end
         end
     elseif expr.Type == "UnaryOperation" then
         local operandEval = eval(expr.Operand) or nilVal()
@@ -809,15 +824,11 @@ end
 
 local program = [[
 
-let fn = function(x, y)
-    return x + y
+let debugprint = function(str)
+    print("[DBG]: " .. str)
 end
 
-let xfn = function(f, j)
-    return f(j, 2)
-end
-
-print(xfn(fn, 1))
+debugprint("Hello!")
 
 ]]
 
