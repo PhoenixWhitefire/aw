@@ -1018,8 +1018,10 @@ end
 local program = [[
 
 let x = function(x)
-    return 5
+    return x + 1
 end
+
+let y = x(5)
 
 ]]
 
@@ -1042,9 +1044,14 @@ type Type =
       }
     | {
         read Kind: "Function",
+        read Generics: { read string }?,
         read Parameters: { read Type },
         read Variadic: Type?,
         read Returns: Type?,
+      }
+    | {
+        read Kind: "Generic",
+        read Name: string,
       }
     | {
         read Kind: "Free",
@@ -1080,9 +1087,11 @@ local function typeToString(ty: Type): string
             returns = typeToString(ty.Returns)
         end
 
-        return `({ table.concat(paramTys, ", ") }) -> { returns }`
+        return `<{ table.concat(ty.Generics or {}, ", ") }>({ table.concat(paramTys, ", ") }) -> { returns }`
     elseif ty.Kind == "unknown" or ty.Kind == "never" then
         return ty.Kind
+    elseif ty.Kind == "Generic" then
+        return ty.Name
     elseif ty.Kind == "Free" then
         return `'{ ty.Name }`
     elseif ty.Kind == "error" then
@@ -1201,7 +1210,7 @@ local function infer(expr: Expression): Type?
             error(`Unreachable.`)
         end
     elseif expr.Type == "Return" then
-        return { Kind = "never" } -- The result of evaluating `return` is not observable
+        return if expr.Return then infer(expr.Return) else nil
     elseif expr.Type == "IfCondition" then
         local condition = infer(expr.Condition)
 
@@ -1242,13 +1251,7 @@ local function infer(expr: Expression): Type?
         return fn.Returns
     elseif expr.Type == "Function" then
         local params = table.create<<Type>>(#expr.Function.Parameters)
-
-        local fnTy: Type = {
-            Kind = "Function",
-            Parameters = params,
-            Variadic = if expr.Function.Variadic then { Kind = "unknown" } else nil,
-            Returns = nil,
-        }
+        local returned
 
         for i = 1, #expr.Function.Parameters do
             params[i] = {
@@ -1265,12 +1268,35 @@ local function infer(expr: Expression): Type?
         end
 
         for _, e in expr.Function.Body do
-            infer(e)
+            local ty = infer(e)
+
+            if e.Type == "Return" then
+                returned = ty
+            end
         end
 
         for p, t in shadowed do
             typeEnv[p] = t
         end
+
+        local gens = {}
+
+        for i, p in params do
+            if p.Kind == "Free" then
+                local name = `_{ i }`
+                local gen = { Kind = "Generic", Name = name }
+                params[i] = gen
+                table.insert(gens, name)
+            end
+        end
+
+        local fnTy: Type = {
+            Kind = "Function",
+            Generics = gens,
+            Parameters = params,
+            Variadic = if expr.Function.Variadic then { Kind = "unknown" } else nil,
+            Returns = returned,
+        }
 
         return fnTy
     elseif expr.Type == "VariadicArguments" then
