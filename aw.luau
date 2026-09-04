@@ -40,7 +40,7 @@ type BasicToken = {
     read Type: "Equals" | "IsEqualTo" | "OpenParentheses" | "CloseParentheses" | "Comma" | "Ellipsis" | "EndOfFile",
 }
 
-type Keyword = "nil" | "true" | "false" | "let" | "function" | "return" | "end" | "if" | "then"
+type Keyword = "nil" | "true" | "false" | "let" | "function" | "return" | "end" | "if" | "else" | "then"
 
 local operators = {
     ["+"] = true,
@@ -135,7 +135,8 @@ type ExpressionData =
     | {
         read Type: "IfCondition",
         read Condition: Expression,
-        read Body: { read Expression },
+        read IfBody: { read Expression },
+        read ElseBody: { read Expression }?,
       }
     | {
         read Type: "InvalidSyntax",
@@ -152,6 +153,7 @@ local keywords: { read [string]: Keyword? } = {
     ["function"] = "function",
     ["return"] = "return",
     ["if"] = "if",
+    ["else"] = "else",
     ["then"] = "then",
     ["end"] = "end",
 }
@@ -331,12 +333,12 @@ end
 
 local parseExpression
 
-local function parseBody(state: ParseState, report: (string, { position: Position }) -> ()): { Expression }
+local function parseBody(state: ParseState, report: (string, { position: Position }) -> (), stopAtElse: boolean?): ({ Expression }, Token)
     local body: { Expression } = {}
     local endTkParseState = table.clone(state)
     local endTk = nextToken(endTkParseState)
 
-    while endTk.Type ~= "Keyword" or endTk.Keyword ~= "end" do
+    while endTk.Type ~= "Keyword" or (endTk.Keyword ~= "end" and (not stopAtElse or endTk.Keyword ~= "else")) do
         if endTk.Type == "EndOfFile" then
             report(`Unexpected end-of-file before function 'end'.`, endTk)
             break
@@ -355,7 +357,7 @@ local function parseBody(state: ParseState, report: (string, { position: Positio
     state.position = endTkParseState.position
     state.line = endTkParseState.line
     state.char = endTkParseState.char
-    return body
+    return body, endTk
 end
 
 local function parseBinaryOperation(state: ParseState, report: (string, { position: Position }) -> (), left: Expression, opTk: OperatorToken): Expression
@@ -453,7 +455,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                     local closeParen = nextToken(state)
 
                     if closeParen.Type ~= "CloseParentheses" then
-                        return invalidExpr(state, `Expected closing parentheses after ellipsis in function parameter list, got { closeParen.Type } instead`, report)
+                        return invalidExpr(state, `Expected closing parentheses after ellipsis in function parameter list, got { closeParen.Type } instead.`, report)
                     end
 
                     break
@@ -489,25 +491,31 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 Token = token.Keyword,
             }, token)
         elseif token.Keyword == "if" then
-            local condition = parseExpression(state, report) or invalidExpr(state, "Reached end-of-file trying to parse 'if' condition", report)
+            local condition = parseExpression(state, report) or invalidExpr(state, "Reached end-of-file trying to parse 'if' condition.", report)
             local thenTk = nextToken(state)
 
             if thenTk.Type ~= "Keyword" or thenTk.Keyword ~= "then" then
-                return invalidExpr(state, `Expected 'then' keyword following condition, got { thenTk.Type }`, report)
+                return invalidExpr(state, `Expected 'then' keyword following condition, got { thenTk.Type }.`, report)
             end
 
-            local body = parseBody(state, report)
+            local ifBody, endTk = parseBody(state, report, true)
+            local elseBody = nil
+
+            if endTk.Type == "Keyword" and endTk.Keyword == "else" then
+                elseBody = parseBody(state, report)
+            end
 
             return ex({
                 Type = "IfCondition",
                 Condition = condition,
-                Body = body,
+                IfBody = ifBody,
+                ElseBody = elseBody,
             }, token)
-        elseif token.Keyword == "then" then
-            return invalidExpr(state, "Unexpected 'then'", report)
+        elseif token.Keyword == "then" or token.Keyword == "else" then
+            return invalidExpr(state, `Unexpected '{ token.Keyword }' keyword.`, report)
         else
             unreachable(token.Keyword)
-            error(`Unreachable`)
+            error(`Unreachable.`)
         end
     elseif token.Type == "Identifier" then
         local reference: Expression = ex({
@@ -588,10 +596,10 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 state.position = parenParseState.position
                 state.line = parenParseState.line
 
-                inner = parseExpression(state, report) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression after parentheses`, report)
+                inner = parseExpression(state, report) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression after parentheses.`, report)
                 state.position += 1 -- skip closing parens
             else
-                inner = parseExpression(state, report, true) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression`, report)
+                inner = parseExpression(state, report, true) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression.`, report)
             end
 
             local negation = ex({
@@ -845,7 +853,7 @@ local function eval(expr: Expression): Value?
             end
 
             if rightEval.Type ~= "string" then
-                fail(`Expected RHS of '{ expr.Operator }' operation to be a string, got a { leftEval.Type } instead.`)
+                fail(`Expected RHS of '{ expr.Operator }' operation to be a string, got a { rightEval.Type } instead.`)
                 error(`Unreachable.`)
             end
 
@@ -857,7 +865,7 @@ local function eval(expr: Expression): Value?
             end
 
             if rightEval.Type ~= "number" then
-                fail(`Expected RHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
+                fail(`Expected RHS of '{ expr.Operator }' operation to be a number, got a { rightEval.Type } instead.`)
                 error(`Unreachable.`)
             end
 
@@ -926,7 +934,9 @@ local function eval(expr: Expression): Value?
         end
 
         if conditionResult.Value == true then
-            return runUnprotected(expr.Body)
+            return runUnprotected(expr.IfBody)
+        elseif expr.ElseBody then
+            return runUnprotected(expr.ElseBody)
         else
             return nilVal()
         end
@@ -976,9 +986,10 @@ let fn = function(x)
     if x == 5 then
         print("Yes!")
         return true
+    else
+        print("No")
     end
 
-    print("No")
     return false
 end
 
