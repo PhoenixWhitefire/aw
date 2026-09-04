@@ -1018,24 +1018,25 @@ end
 local program = [[
 
 let x = function(a)
-    if a == 0 then
-        print("Zero")
-    else
-        print("Non-zero")
-    end
+    let b = a + 1
 
-    return a + 1
+    return tostring(a)
 end
 
 let y = x(1)
 
-let ident = function(x)
-    return x
+let ident = function(t)
+    return t
 end
 
 let z = ident("hello")
 
 print(x, y, z)
+
+let w = function(i)
+    let q = i + 1
+    let r = i .. "World!"
+end
 
 ]]
 
@@ -1052,6 +1053,8 @@ if result.Success then
 else
     print("Compilation failed.")
 end
+
+-- just trying out simple things before i fully take a look at how HM works
 
 type PrimitiveType = {
     read Kind: "Primitive",
@@ -1421,7 +1424,10 @@ local function infer(expr: Expression): Type?
                         local c = constraints[ci]
 
                         if c.Type.Kind ~= "unknown" and not deepEqual(c.Type, curr.Type) then
-                            params[i] = errorReport(`Expected parameter { i } to be both a { typeToString(curr.Type) } and a { typeToString(c.Type) } at the same time.`, c)
+                            params[i] = errorReport(
+                                `Expected parameter '{ expr.Function.Parameters[i] }' to be both a { typeToString(curr.Type) } and a { typeToString(c.Type) } at the same time.`,
+                                c
+                            )
 
                             ok = false
                             break
