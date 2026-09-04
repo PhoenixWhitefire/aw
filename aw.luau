@@ -700,12 +700,16 @@ local function makeLuauFuncValue(fn: ({ Value }) -> Value?): Value
     }
 end
 
+local function valToString(v: Value)
+    return tostring(if v.Type == "Function" then "function" else v.Value)
+end
+
 local env: { [string]: Value? } = {
     print = makeLuauFuncValue(function(args)
         local str = ""
 
         for _, a in args do
-            str ..= tostring(if a.Type == "Function" then "function" else a.Value) .. " "
+            str ..= valToString(a) .. " "
         end
 
         str = string.sub(str, 1, #str - 1)
@@ -717,6 +721,25 @@ local env: { [string]: Value? } = {
         assert(#args == 1, `'typeof' requires 1 argument.`)
 
         return { Type = "string", Value = args[1].Type } -- TODO luau weird type error?
+    end),
+    tostring = makeLuauFuncValue(function(args)
+        assert(#args == 1, `'tostring' requires 1 argument.`)
+
+        return { Type = "string", Value = valToString(args[1]) }
+    end),
+    tonumber = makeLuauFuncValue(function(args): Value -- TODO luau extraneous annotation
+        assert(#args == 1, `'tonumber' requires 1 argument.`)
+
+        local v = args[1]
+        assert(v.Type == "number" or v.Type == "string", `'tonumber' requires a string or number argument, got { v.Type } instead`)
+
+        local n = tonumber(v.Value)
+
+        if n then
+            return { Type = "number", Value = n }
+        else
+            return { Type = "nil" }
+        end
     end),
 }
 
@@ -982,19 +1005,8 @@ end
 
 local program = [[
 
-let fn = function(x)
-    if x == 5 then
-        print("Yes!")
-        return true
-    else
-        print("No")
-    end
-
-    return false
-end
-
-print(fn(5))
-print(fn(0))
+print(tostring(5))
+print(tonumber("Hello"))
 
 ]]
 
