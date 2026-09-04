@@ -1005,8 +1005,7 @@ end
 
 local program = [[
 
-print(tostring(5))
-print(tonumber("Hello"))
+let x = 5
 
 ]]
 
@@ -1018,4 +1017,42 @@ if result.Success then
     if returned then
         print(`= { returned.Value }`)
     end
+else
+    print("Compilation failed.")
+end
+
+type Type =
+    | {
+        Kind: "Primitive",
+        Primitive: string,
+      }
+
+local function typeToString(ty: Type)
+    if ty.Kind == "Primitive" then
+        return ty.Primitive
+    else
+        unreachable(ty.Kind)
+        error(`Unreachable.`)
+    end
+end
+
+local function infer(expr: Expression): Type
+    if expr.Type == "Declaration" then
+        local ty = infer(expr.Declaration.Value)
+        print(`{ expr.Declaration.Name }: { typeToString(ty) }`)
+
+        return ty
+    elseif expr.Type == "Constant" then
+        return {
+            Kind = "Primitive",
+            Primitive = expr.Constant.Type,
+        }
+    else
+        --unreachable(expr.Type)
+        --error(`Unreachable.`)
+    end
+end
+
+for _, v in result.Expressions do
+    infer(v)
 end
