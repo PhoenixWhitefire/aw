@@ -1005,7 +1005,7 @@ end
 
 local program = [[
 
-let x = 5
+let x = then
 
 ]]
 
@@ -1026,20 +1026,32 @@ type Type =
         Kind: "Primitive",
         Primitive: string,
       }
+    | {
+        Kind: "Error",
+      }
 
 local function typeToString(ty: Type)
     if ty.Kind == "Primitive" then
         return ty.Primitive
+    elseif ty.Kind == "Error" then
+        return "*error*"
     else
         unreachable(ty.Kind)
         error(`Unreachable.`)
     end
 end
 
+local function errorReport(msg): Type
+    print(msg)
+    return { Kind = "Error" }
+end
+
+local typeEnv: { [string]: Type? } = {}
+
 local function infer(expr: Expression): Type
     if expr.Type == "Declaration" then
         local ty = infer(expr.Declaration.Value)
-        print(`{ expr.Declaration.Name }: { typeToString(ty) }`)
+        typeEnv[expr.Declaration.Name] = ty
 
         return ty
     elseif expr.Type == "Constant" then
@@ -1047,12 +1059,24 @@ local function infer(expr: Expression): Type
             Kind = "Primitive",
             Primitive = expr.Constant.Type,
         }
+    elseif expr.Type == "Reference" then
+        return typeEnv[expr.Reference] or errorReport(`Unknown declaration '{ expr.Reference }'`)
+    elseif expr.Type == "InvalidSyntax" then
+        return {
+            Kind = "Error",
+        }
     else
-        --unreachable(expr.Type)
-        --error(`Unreachable.`)
+        unreachable(expr.Type)
+        error(`Unreachable.`)
     end
 end
 
 for _, v in result.Expressions do
     infer(v)
+end
+
+print("\nType environment:\n")
+
+for k, v in typeEnv do
+    print(`{ k }: { typeToString(v) }`)
 end
