@@ -96,15 +96,15 @@ type ExpressionData =
         read Constant: Value,
       }
     | {
+        read Type: "Reference",
+        read Reference: string,
+      }
+    | {
         read Type: "Call",
         read Call: {
             read Identifier: string,
             read Arguments: { read Expression },
         },
-      }
-    | {
-        read Type: "Reference",
-        read Reference: string,
       }
     | {
         read Type: "BinaryOperation",
@@ -312,6 +312,7 @@ type ParseState = {
     position: number,
     line: number,
     char: number,
+    functionDepth: number,
 }
 
 local function ex(expr: ExpressionData, t: { position: Position }): Expression
@@ -465,7 +466,11 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 end
             end
 
+            state.functionDepth += 1
+
             local body = parseBody(state, report)
+
+            state.functionDepth -= 1
 
             return ex({
                 Type = "Function",
@@ -476,13 +481,17 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 },
             }, token)
         elseif token.Keyword == "return" then
-            local nextTk = nextToken(table.clone(state))
-            local expr = if nextTk.Type == "Keyword" and nextTk.Keyword == "end" then nil else parseExpression(state, report)
+            if state.functionDepth == 0 then
+                return invalidExpr(state, "Cannot 'return' outside of functions", report)
+            else
+                local nextTk = nextToken(table.clone(state))
+                local expr = if nextTk.Type == "Keyword" and nextTk.Keyword == "end" then nil else parseExpression(state, report)
 
-            return ex({
-                Type = "Return",
-                Return = expr,
-            }, token)
+                return ex({
+                    Type = "Return",
+                    Return = expr,
+                }, token)
+            end
         elseif token.Keyword == "end" then
             report(`Unexpected 'end'.`, token)
 
@@ -666,6 +675,7 @@ local function parse(program: string): { Success: boolean, Expressions: { Expres
         position = 1,
         line = 1,
         char = 1,
+        functionDepth = 0,
     }
 
     -- TODO luau extraneous annotation
@@ -942,6 +952,8 @@ local function eval(expr: Expression): Value?
             },
         }
     elseif expr.Type == "Return" then
+        assert(#callFrames > 1, "'return' expression appeared outside of a function call frame, this should've failed to compile.")
+
         error({
             NormalReturn = true,
             NormalReturnValue = if expr.Return then eval(expr.Return) else nil,
@@ -952,17 +964,17 @@ local function eval(expr: Expression): Value?
         local conditionResult = eval(expr.Condition) or nilVal()
 
         if conditionResult.Type ~= "boolean" then
-            fail(`Expected boolean for condition, got { conditionResult.Type }`)
+            fail(`Expected boolean for condition, got { conditionResult.Type }.`)
             error(`Unreachable.`)
         end
 
         if conditionResult.Value == true then
-            return runUnprotected(expr.IfBody)
+            runUnprotected(expr.IfBody)
         elseif expr.ElseBody then
-            return runUnprotected(expr.ElseBody)
-        else
-            return nilVal()
+            runUnprotected(expr.ElseBody)
         end
+
+        return conditionResult
     else
         unreachable(expr.Type)
         error(`Unreachable.`)
@@ -998,14 +1010,16 @@ local function run(exprs: { read Expression }): Value?
             --msg = string.sub(msg, p + 2, #msg)
         end
 
-        print(msg)
+        print(`Protected error: { msg }`)
         return nil
     end
 end
 
 local program = [[
 
-let x = then
+let x = function(x)
+    return 5
+end
 
 ]]
 
@@ -1023,17 +1037,55 @@ end
 
 type Type =
     | {
-        Kind: "Primitive",
-        Primitive: string,
+        read Kind: "Primitive",
+        read Primitive: index<Value, "Type">,
       }
     | {
-        Kind: "Error",
+        read Kind: "Function",
+        read Parameters: { read Type },
+        read Variadic: Type?,
+        read Returns: Type?,
+      }
+    | {
+        read Kind: "Free",
+        read Name: string,
+      }
+    | {
+        read Kind: "unknown",
+      }
+    | {
+        read Kind: "never",
+      }
+    | {
+        read Kind: "error",
       }
 
-local function typeToString(ty: Type)
+local function typeToString(ty: Type): string
     if ty.Kind == "Primitive" then
         return ty.Primitive
-    elseif ty.Kind == "Error" then
+    elseif ty.Kind == "Function" then
+        local paramTys = table.create<<string>>(#ty.Parameters)
+
+        for i, ty in ty.Parameters do
+            paramTys[i] = typeToString(ty)
+        end
+
+        if ty.Variadic then
+            table.insert(paramTys, `...{ typeToString(ty.Variadic) }`)
+        end
+
+        local returns = "()"
+
+        if ty.Returns then
+            returns = typeToString(ty.Returns)
+        end
+
+        return `({ table.concat(paramTys, ", ") }) -> { returns }`
+    elseif ty.Kind == "unknown" or ty.Kind == "never" then
+        return ty.Kind
+    elseif ty.Kind == "Free" then
+        return `'{ ty.Name }`
+    elseif ty.Kind == "error" then
         return "*error*"
     else
         unreachable(ty.Kind)
@@ -1041,18 +1093,41 @@ local function typeToString(ty: Type)
     end
 end
 
-local function errorReport(msg): Type
-    print(msg)
-    return { Kind = "Error" }
+local function errorReport(msg, pos): Type
+    print(`{ pos.position.line }:{ pos.position.char }: { msg }`)
+    return { Kind = "error" }
 end
 
-local typeEnv: { [string]: Type? } = {}
+local builtin = {
+    print = true,
+    tostring = true,
+}
 
-local function infer(expr: Expression): Type
+local typeEnv: { [string]: Type? } = {
+    print = {
+        Kind = "Function",
+        Parameters = {},
+        Variadic = { Kind = "Primitive", Primitive = "string" },
+        Returns = nil,
+    },
+    tostring = {
+        Kind = "Function",
+        Parameters = { { Kind = "unknown" } },
+        Returns = { Kind = "Primitive", Primitive = "string" }
+    },
+}
+
+print("\nRunning inference...")
+
+local function infer(expr: Expression): Type?
     if expr.Type == "Declaration" then
         local ty = infer(expr.Declaration.Value)
-        typeEnv[expr.Declaration.Name] = ty
 
+        if not ty then
+            ty = errorReport(`Tried to assign '{ expr.Declaration.Name }' to an expression that does not evaluate to a value.`, expr)
+        end
+
+        typeEnv[expr.Declaration.Name] = ty
         return ty
     elseif expr.Type == "Constant" then
         return {
@@ -1060,10 +1135,149 @@ local function infer(expr: Expression): Type
             Primitive = expr.Constant.Type,
         }
     elseif expr.Type == "Reference" then
-        return typeEnv[expr.Reference] or errorReport(`Unknown declaration '{ expr.Reference }'`)
+        return typeEnv[expr.Reference]
+            or errorReport(`Unknown declaration '{ expr.Reference }'.`, expr)
+    elseif expr.Type == "BinaryOperation" then
+        local left = infer(expr.Left)
+        local right = infer(expr.Right)
+
+        if not left then
+            return errorReport(`LHS of '{ expr.Operator }' operation did not evaluate to a value.`, expr.Left)
+        end
+
+        if not right then
+            return errorReport(`RHS of '{ expr.Operator }' operation did not evaluate to a value.`, expr.Right)
+        end
+
+        if expr.Operator == "+" or expr.Operator == "-" or expr.Operator == "*"
+            or expr.Operator == "/" or expr.Operator == "//"
+        then
+            if left.Kind ~= "Primitive" or left.Primitive ~= "number" then
+                return errorReport(`Expected a number as LHS for '{ expr.Operator }' operation, got { typeToString(left) }.`, expr)
+            end
+
+            if right.Kind ~= "Primitive" or right.Primitive ~= "number" then
+                return errorReport(`Expected a number as RHS for '{ expr.Operator }' operation, got { typeToString(right) }.`, expr)
+            end
+
+            return { Kind = "Primitive", Primitive = "number" }
+        elseif expr.Operator == ".." then
+            if left.Kind ~= "Primitive" or left.Primitive ~= "string" then
+                return errorReport(`Expected a string as LHS for '{ expr.Operator }' operation, got { typeToString(left) }.`, expr)
+            end
+
+            if right.Kind ~= "Primitive" or right.Primitive ~= "string" then
+                return errorReport(`Expected a string as RHS for '{ expr.Operator }' operation, got { typeToString(right) }.`, expr)
+            end
+
+            return { Kind = "Primitive", Primitive = "string" }
+        elseif expr.Operator == "==" then
+            return { Kind = "Primitive", Primitive = "boolean" }
+        else
+            unreachable(expr.Operator)
+            error(`Unreachable.`)
+        end
+    elseif expr.Type == "UnaryOperation" then
+        local operand = infer(expr.Operand)
+
+        if not operand then
+            return errorReport(`Operand of '{ expr.Operator }' operation did not evaluate to a value.`, expr.Operand)
+        end
+
+        if expr.Operator == "-" then
+            if operand.Kind ~= "Primitive" or operand.Primitive ~= "number" then
+                return errorReport(`Expected number for negation operation, got { typeToString(operand) }.`, expr)
+            end
+
+            return { Kind = "Primitive", Primitive = "number" }
+        elseif expr.Operator == "#" then
+            if operand.Kind ~= "Primitive" or operand.Primitive ~= "string" then
+                return errorReport(`Expected string for length operation, got { typeToString(operand) }.`, expr)
+            end
+
+            return { Kind = "Primitive", Primitive = "string" }
+        else
+            unreachable(expr.Operator)
+            error(`Unreachable.`)
+        end
+    elseif expr.Type == "Return" then
+        return { Kind = "never" } -- The result of evaluating `return` is not observable
+    elseif expr.Type == "IfCondition" then
+        local condition = infer(expr.Condition)
+
+        if not condition then
+            return errorReport(`Condition did not evaluate to a value.`, expr.Condition)
+        end
+
+        if condition.Kind ~= "Primitive" or condition.Primitive ~= "boolean" then
+            condition = errorReport(`Expected boolean for condition, got { typeToString(condition) }.`, expr.Condition)
+        end
+
+        for _, v in expr.IfBody do
+            infer(v)
+        end
+
+        if expr.ElseBody then
+            for _, v in expr.ElseBody do
+                infer(v)
+            end
+        end
+
+        return condition
+    elseif expr.Type == "Call" then
+        local fn = typeEnv[expr.Call.Identifier]
+
+        if not fn then
+            return errorReport(`Unknown function '{ expr.Call.Identifier }'.`, expr)
+        end
+
+        if fn.Kind ~= "Function" then
+            return errorReport(`Cannot call a value of type { typeToString(fn) }.`, expr)
+        end
+
+        if #expr.Call.Arguments < #fn.Parameters then
+            errorReport(`Function expects at least { #fn.Parameters } argument(s), but only got { #expr.Call.Arguments }`, expr)
+        end
+
+        return fn.Returns
+    elseif expr.Type == "Function" then
+        local params = table.create<<Type>>(#expr.Function.Parameters)
+
+        local fnTy: Type = {
+            Kind = "Function",
+            Parameters = params,
+            Variadic = if expr.Function.Variadic then { Kind = "unknown" } else nil,
+            Returns = nil,
+        }
+
+        for i = 1, #expr.Function.Parameters do
+            params[i] = {
+                Kind = "Free",
+                Name = string.char((i - 1) % 25 + 97),
+            }
+        end
+
+        local shadowed = {}
+
+        for i, p in expr.Function.Parameters do
+            shadowed[p] = typeEnv[p]
+            typeEnv[p] = params[i]
+        end
+
+        for _, e in expr.Function.Body do
+            infer(e)
+        end
+
+        for p, t in shadowed do
+            typeEnv[p] = t
+        end
+
+        return fnTy
+    elseif expr.Type == "VariadicArguments" then
+        return { Kind = "unknown" }
     elseif expr.Type == "InvalidSyntax" then
         return {
-            Kind = "Error",
+            Kind = "error",
         }
     else
         unreachable(expr.Type)
@@ -1078,5 +1292,7 @@ end
 print("\nType environment:\n")
 
 for k, v in typeEnv do
-    print(`{ k }: { typeToString(v) }`)
+    if not builtin[k] then
+        print(`{ k }: { typeToString(v) }`)
+    end
 end
