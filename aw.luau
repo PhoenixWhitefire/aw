@@ -851,8 +851,8 @@ local function eval(expr: Expression): Value?
                     error(data)
                 end
 
-                for p, old in shadowed do
-                    env[p] = old
+                for _, p in fn.Value.Parameters do
+                    env[p] = shadowed[p]
                 end
 
                 return returned
@@ -1018,6 +1018,12 @@ end
 local program = [[
 
 let x = function(a)
+    if a == 0 then
+        print("Zero")
+    else
+        print("Non-zero")
+    end
+
     return a + 1
 end
 
@@ -1029,7 +1035,11 @@ end
 
 let z = ident("hello")
 
+print(x, y, z)
+
 ]]
+
+print("Output:\n")
 
 local result = parse(program)
 
@@ -1200,7 +1210,7 @@ local typeEnv: { [string]: Type? } = {
 
 local substitutions: { [FreeType]: { { Type: Type, position: Position } } } = {}
 
-print("\nRunning inference...")
+print("\n--")
 
 local function infer(expr: Expression): Type?
     local function addConstraint(ftv: FreeType, ty: Type)
@@ -1381,8 +1391,8 @@ local function infer(expr: Expression): Type?
             end
         end
 
-        for p, t in shadowed do
-            typeEnv[p] = t
+        for _, p in expr.Function.Parameters do
+            typeEnv[p] = shadowed[p]
         end
 
         local gens = {}
@@ -1452,7 +1462,7 @@ for _, v in result.Expressions do
     infer(v)
 end
 
-print("\nType environment:\n")
+print("\nInferred types:\n")
 
 for k, v in typeEnv do
     if not builtin[k] then
