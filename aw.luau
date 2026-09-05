@@ -50,6 +50,11 @@ local operators = {
     ["//"] = true,
     [".."] = true,
     ["=="] = true,
+    ["~="] = true,
+    [">"] = true,
+    [">="] = true,
+    ["<"] = true,
+    ["<="] = true,
 }
 
 type Operator = keyof<typeof(operators)>
@@ -120,6 +125,7 @@ type ExpressionData =
     | {
         read Type: "Function",
         read Function: {
+            read Name: string?,
             read Parameters: { string },
             read Variadic: boolean,
             read Body: { Expression },
@@ -206,6 +212,7 @@ local function nextToken(state: { position: number, line: number, char: number, 
 
     repeat
         c, state.position = nextCharacter(state.program, state.position)
+        state.char += 1
 
         if c == "\n" then
             state.line += 1
@@ -370,6 +377,64 @@ local function parseBinaryOperation(state: ParseState, report: (string, { positi
     }, left)
 end
 
+local function parseFunction(state: ParseState, report: (string, { position: Position }) -> (), token: Token): Expression
+    local name = nil
+    local openParenTk = nextToken(state)
+
+    if openParenTk.Type == "Identifier" then
+        name = openParenTk.Identifier
+        openParenTk = nextToken(state)
+    end
+
+    if openParenTk.Type ~= "OpenParentheses" then
+        return invalidExpr(state, `Expected opening parentheses after function prefix, got { openParenTk.Type }.`, report)
+    end
+
+    local parameters = {}
+    local variadic = false
+    local paramTk = nextToken(state)
+
+    while paramTk.Type ~= "CloseParentheses" do
+        if paramTk.Type == "Identifier" then
+            table.insert(parameters, paramTk.Identifier)
+            paramTk = nextToken(state)
+
+            if paramTk.Type == "Comma" then
+                paramTk = nextToken(state)
+            end
+        elseif paramTk.Type == "Ellipsis" then
+            variadic = true
+
+            local closeParen = nextToken(state)
+
+            if closeParen.Type ~= "CloseParentheses" then
+                return invalidExpr(state, `Expected closing parentheses after ellipsis in function parameter list, got { closeParen.Type } instead.`, report)
+            end
+
+            break
+        else
+            report(`Expected function parameter name, got { paramTk.Type }.`, paramTk)
+            break
+        end
+    end
+
+    state.functionDepth += 1
+
+    local body = parseBody(state, report)
+
+    state.functionDepth -= 1
+
+    return ex({
+        Type = "Function",
+        Function = {
+            Name = name,
+            Parameters = parameters,
+            Variadic = variadic,
+            Body = body,
+        },
+    }, token)
+end
+
 function parseExpression(state: ParseState, report: (string, { position: Position }) -> (), shallow: boolean?): Expression?
     local token = nextToken(state)
 
@@ -427,59 +492,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 Constant = { Type = "boolean", Value = token.Keyword == "true" }
             }, token)
         elseif token.Keyword == "function" then
-            local openParenTk = nextToken(state)
-
-            if openParenTk.Type ~= "OpenParentheses" then
-                report(`Expected opening parentheses after 'function' keyword, got { openParenTk.Type }.`, openParenTk)
-
-                return ex({
-                    Type = "InvalidSyntax",
-                    Token = openParenTk.Type,
-                }, openParenTk)
-            end
-
-            local parameters = {}
-            local variadic = false
-            local paramTk = nextToken(state)
-
-            while paramTk.Type ~= "CloseParentheses" do
-                if paramTk.Type == "Identifier" then
-                    table.insert(parameters, paramTk.Identifier)
-                    paramTk = nextToken(state)
-
-                    if paramTk.Type == "Comma" then
-                        paramTk = nextToken(state)
-                    end
-                elseif paramTk.Type == "Ellipsis" then
-                    variadic = true
-
-                    local closeParen = nextToken(state)
-
-                    if closeParen.Type ~= "CloseParentheses" then
-                        return invalidExpr(state, `Expected closing parentheses after ellipsis in function parameter list, got { closeParen.Type } instead.`, report)
-                    end
-
-                    break
-                else
-                    report(`Expected function parameter name, got { paramTk.Type }.`, paramTk)
-                    break
-                end
-            end
-
-            state.functionDepth += 1
-
-            local body = parseBody(state, report)
-
-            state.functionDepth -= 1
-
-            return ex({
-                Type = "Function",
-                Function = {
-                    Parameters = parameters,
-                    Variadic = variadic,
-                    Body = body,
-                },
-            }, token)
+            return parseFunction(state, report, token)
         elseif token.Keyword == "return" then
             if state.functionDepth == 0 then
                 return invalidExpr(state, "Cannot 'return' outside of functions", report)
@@ -527,10 +540,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
             error(`Unreachable.`)
         end
     elseif token.Type == "Identifier" then
-        local reference: Expression = ex({
-            Type = "Reference",
-            Reference = token.Identifier,
-        }, token)
+        local left: Expression
 
         local callParseState = table.clone(state)
         local nextTk = nextToken(callParseState)
@@ -554,20 +564,27 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
 
             state.position += 1 -- skip parens
 
-            return ex({
+            left = ex({
                 Type = "Call",
                 Call = {
                     Identifier = token.Identifier,
                     Arguments = args,
                 },
             }, token)
-        elseif not shallow and nextTk.Type == "Operator" then
+        else
+            left = ex({
+                Type = "Reference",
+                Reference = token.Identifier,
+            }, token)
+        end
+
+        if not shallow and nextTk.Type == "Operator" then
             state.position = callParseState.position
             state.line = callParseState.line
 
-            return parseBinaryOperation(state, report, reference, nextTk)
+            return parseBinaryOperation(state, report, left, nextTk)
         else
-            return reference
+            return left
         end
     elseif token.Type == "Literal" then
         -- TODO luau does not report error when `position` is not attached even though the annotation is explicit
@@ -877,8 +894,44 @@ local function eval(expr: Expression): Value?
         local leftEval = eval(expr.Left) or nilVal()
         local rightEval = eval(expr.Right) or nilVal()
 
-        if expr.Operator == "==" then
-            return { Type = "boolean", Value = leftEval.Value == rightEval.Value }
+        if expr.Operator == "==" or expr.Operator == "~=" or expr.Operator == ">" or expr.Operator == ">="
+            or expr.Operator == "<" or expr.Operator == "<="
+        then
+            if expr.Operator ~= "==" and expr.Operator ~= "~=" then
+                if leftEval.Type ~= "number" then
+                    fail(`Expected LHS of '{ expr.Operator }' expression to be a number, got a { leftEval.Type } instead.`)
+                    error(`Unreachable.`)
+                end
+
+                if rightEval.Type ~= "number" then
+                    fail(`Expected RHS of '{ expr.Operator }' expression to be a number, got a { rightEval.Type } instead.`)
+                    error(`Unreachable.`)
+                end
+            end
+
+            local left = leftEval.Value
+            local right = rightEval.Value
+
+            if expr.Operator == "==" then
+                return { Type = "boolean", Value = left == right }
+            elseif expr.Operator == "~=" then
+                return { Type = "boolean", Value = left ~= right }
+            elseif expr.Operator == ">" then
+                assert(typeof(left) == "number" and typeof(right) == "number")
+                return { Type = "boolean", Value = left > right }
+            elseif expr.Operator == ">=" then
+                assert(typeof(left) == "number" and typeof(right) == "number")
+                return { Type = "boolean", Value = left >= right }
+            elseif expr.Operator == "<" then
+                assert(typeof(left) == "number" and typeof(right) == "number")
+                return { Type = "boolean", Value = left < right }
+            elseif expr.Operator == "<=" then
+                assert(typeof(left) == "number" and typeof(right) == "number")
+                return { Type = "boolean", Value = left <= right }
+            else
+                unreachable(expr.Operator)
+                error(`Unreachable.`)
+            end
         elseif expr.Operator == ".." then
             if leftEval.Type ~= "string" then
                 fail(`Expected LHS of '{ expr.Operator }' operation to be a string, got a { leftEval.Type } instead.`)
@@ -942,7 +995,8 @@ local function eval(expr: Expression): Value?
             error(`Unreachable.`)
         end
     elseif expr.Type == "Function" then
-        return {
+        -- TODO luau extraneous annotation
+        local f: Value = {
             Type = "Function",
             Value = {
                 IsLuau = false,
@@ -951,6 +1005,12 @@ local function eval(expr: Expression): Value?
                 Body = expr.Function.Body,
             },
         }
+
+        if expr.Function.Name then
+            env[expr.Function.Name] = f
+        end
+
+        return f
     elseif expr.Type == "Return" then
         assert(#callFrames > 1, "'return' expression appeared outside of a function call frame, this should've failed to compile.")
 
@@ -1018,9 +1078,39 @@ end
 local program = [[
 
 let x = function(a)
-    let b = a
-    return b - 5
+    let b = a + 1
+
+    return tostring(a)
 end
+
+let y = x(1)
+
+let ident = function(t)
+    return t
+end
+
+let z = ident("hello")
+
+print(x)
+print(y)
+print(z)
+
+let w = function(i)
+    let q = i + 1
+    let r = i .. "World!"
+end
+
+function fac(n)
+    if n > 1 then
+        let m = n * fac(n - 1)
+    else
+        let m = n
+    end
+
+    return m
+end
+
+print(fac(5))
 
 ]]
 
@@ -1086,16 +1176,22 @@ local function stringType()
     return primitiveType("string")
 end
 
-local function functionType(param: Type, returns: Type): TypeOperator
+local function functionType(params: { read Type }, returns: Type?): TypeOperator
+    local types = table.create<<Type>>(#params + if returns then 1 else 0)
+
+    for i, p in params do
+        types[i] = p
+    end
+
+    if returns then
+        table.insert(types, returns)
+    end
+
     return {
         Kind = "Operator",
         Name = "->",
-        Types = { param, returns },
+        Types = types,
     }
-end
-
-local function unknownType()
-    return primitiveType("unknown")
 end
 
 local function errorType()
@@ -1106,6 +1202,11 @@ local function typeVariable(): TypeVariable
     return {
         Kind = "Variable",
     }
+end
+
+local function errorReport(msg, pos: Position)
+    print(`{ pos.line }:{ pos.char }: { msg }`)
+    return errorType()
 end
 
 local function variableName(tyvar: TypeVariable)
@@ -1130,8 +1231,19 @@ local function typeToString(ty: Type): string
     elseif ty.Kind == "Operator" then
         if #ty.Types == 0 then
             return ty.Name
-        elseif #ty.Types == 2 then
-            return `{ typeToString(ty.Types[1]) } { ty.Name } { typeToString(ty.Types[2]) }`
+        elseif ty.Name == "->" then
+            local params = table.create<<string>>(#ty.Types)
+            local ret = "void"
+
+            for i, p in ty.Types do
+                if i == #ty.Types then
+                    ret = typeToString(p)
+                else
+                    params[i] = typeToString(p)
+                end
+            end
+
+            return `({ table.concat(params, ", ") }) -> { ret }`
         else
             local stringified = table.create<<string>>(#ty.Types)
             for i, t in ty.Types do
@@ -1194,12 +1306,12 @@ local function fresh(t: Type, nonGenerics: { [Type]: true? })
         if t.Kind == "Variable" then
             if isGeneric(t, nonGenerics) then
                 if seen[t] then
+                    return seen[t]
+                else
                     local newVar = typeVariable()
                     seen[t] = newVar
 
                     return newVar
-                else
-                    return seen[t]
                 end
             else
                 return t
@@ -1221,66 +1333,66 @@ local function fresh(t: Type, nonGenerics: { [Type]: true? })
     return tp(t)
 end
 
-local builtin = {
-    print = true,
-    tostring = true,
-}
-
-local typeEnv: { [string]: Type? } = {
-    -- print = {
-    --     Kind = "Function",
-    --     Function = {
-    --         Parameters = {},
-    --         Variadic = stringType(),
-    --         Returns = nil,
-    --     },
-    -- },
-    -- tostring = {
-    --     Kind = "Function",
-    --     Function = {
-    --         Parameters = { { Kind = "unknown" } },
-    --         Returns = stringType(),
-    --     },
-    -- },
-}
-
-local function unify(a: Type, b: Type)
+local function unify(a: Type, b: Type, pos: Position)
     a = prune(a)
     b = prune(b)
 
     if a.Kind == "Variable" then
         if a ~= b then
             if occursInType(a, b) then
-                error(`Recursive unification.`)
+                a.Instance = errorReport(`Recursive unification.`, pos)
+            else
+                a.Instance = b
             end
-
-            a.Instance = b
         end
+
     elseif a.Kind == "Operator" and b.Kind == "Variable" then
-        return unify(b, a)
+        return unify(b, a, pos)
+
     elseif a.Kind == "Operator" and b.Kind == "Operator" then
         if a.Name ~= b.Name or #a.Types ~= #b.Types then
-            error(`Type mismatch: { typeToString(a) } != { typeToString(b) }`)
-        end
-
-        for i, t1 in a.Types do
-            unify(t1, b.Types[i])
+            if a.Name ~= "*error*" and b.Name ~= "*error*" then
+                errorReport(`Type mismatch: { typeToString(a) } != { typeToString(b) }.`, pos)
+            end
+        else
+            for i, t1 in a.Types do
+                unify(t1, b.Types[i], pos)
+            end
         end
     end
 end
 
+local builtin = {
+    print = true,
+    tostring = true,
+}
+
+local typeEnv: { [string]: Type? } = {
+    print = {
+        Kind = "Operator",
+        Name = "->",
+        Types = { typeVariable(), voidType() },
+    },
+    tostring = {
+        Kind = "Operator",
+        Name = "->",
+        Types = { typeVariable(), stringType() },
+    },
+}
+
 print("\n--")
 
-local function infer(expr: Expression, nonGeneric): Type
+local function infer(expr: Expression, nonGeneric: { [Type]: true? }): Type
     if expr.Type == "Declaration" then
         local ty = infer(expr.Declaration.Value, nonGeneric)
 
-        -- if not ty then
-        --     ty = errorReport(`Tried to assign '{ expr.Declaration.Name }' to an expression that does not evaluate to a value.`, expr)
-        -- end
+        if ty.Kind == "Operator" and ty.Name == "void" then
+            ty = errorReport(`Tried to assign '{ expr.Declaration.Name }' to an expression that returns 'void'.`, expr.position)
+        end
 
         typeEnv[expr.Declaration.Name] = ty
         return ty
+
     elseif expr.Type == "Constant" then
         if expr.Constant.Type == "nil" then
             return nilType()
@@ -1291,7 +1403,7 @@ local function infer(expr: Expression, nonGeneric): Type
         elseif expr.Constant.Type == "string" then
             return stringType()
         else
-            error(`Unrecognized constant type '{ expr.Constant.Type }'.`)
+            return errorReport(`Unrecognized constant type '{ expr.Constant.Type }'.`, expr.position)
         end
     elseif expr.Type == "Reference" then
         local fromEnv = typeEnv[expr.Reference]
@@ -1299,7 +1411,7 @@ local function infer(expr: Expression, nonGeneric): Type
         if fromEnv then
             return fresh(fromEnv, nonGeneric)
         else
-            error(`Unknown symbol '{ expr.Reference }'.`)
+            return errorReport(`Unknown symbol '{ expr.Reference }'.`, expr.position)
         end
     elseif expr.Type == "BinaryOperation" then
         local left = infer(expr.Left, nonGeneric)
@@ -1308,16 +1420,23 @@ local function infer(expr: Expression, nonGeneric): Type
         if expr.Operator == "+" or expr.Operator == "-" or expr.Operator == "*"
             or expr.Operator == "/" or expr.Operator == "//"
         then
-            unify(left, numberType())
-            unify(right, numberType())
+            unify(left, numberType(), expr.Left.position)
+            unify(right, numberType(), expr.Right.position)
 
             return numberType()
+        elseif expr.Operator == ">"
+            or expr.Operator == ">=" or expr.Operator == "<" or expr.Operator == "<="
+        then
+            unify(left, numberType(), expr.Left.position)
+            unify(right, numberType(), expr.Right.position)
+
+            return booleanType()
         elseif expr.Operator == ".." then
-            unify(left, stringType())
-            unify(right, stringType())
+            unify(left, stringType(), expr.Left.position)
+            unify(right, stringType(), expr.Right.position)
 
             return stringType()
-        elseif expr.Operator == "==" then
+        elseif expr.Operator == "==" or expr.Operator == "~=" then
             return booleanType()
         else
             unreachable(expr.Operator)
@@ -1327,11 +1446,11 @@ local function infer(expr: Expression, nonGeneric): Type
         local operand = infer(expr.Operand, nonGeneric)
 
         if expr.Operator == "-" then
-            unify(operand, numberType())
+            unify(operand, numberType(), expr.Operand.position)
 
             return numberType()
         elseif expr.Operator == "#" then
-            unify(operand, stringType())
+            unify(operand, stringType(), expr.Operand.position)
 
             return numberType()
         else
@@ -1340,66 +1459,98 @@ local function infer(expr: Expression, nonGeneric): Type
         end
     elseif expr.Type == "Return" then
         return if expr.Return then infer(expr.Return, nonGeneric) else voidType()
-    --[[
+
     elseif expr.Type == "IfCondition" then
-        local condition = infer(expr.Condition)
-
-        if not condition then
-            return errorReport(`Condition did not evaluate to a value.`, expr.Condition)
-        end
-
-        if condition.Kind ~= "Primitive" or condition.Primitive ~= "boolean" then
-            condition = errorReport(`Expected boolean for condition, got { typeToString(condition) }.`, expr.Condition)
-        end
+        local condition = infer(expr.Condition, nonGeneric)
+        unify(condition, booleanType(), expr.Condition.position)
 
         for _, v in expr.IfBody do
-            infer(v)
+            infer(v, nonGeneric)
         end
 
         if expr.ElseBody then
             for _, v in expr.ElseBody do
-                infer(v)
+                infer(v, nonGeneric)
             end
         end
 
         return condition
-    ]]--
+
     elseif expr.Type == "Call" then
         local fnTy = typeEnv[expr.Call.Identifier]
 
         if not fnTy then
-            error(`Unknown function '{ expr.Call.Identifier }'.`)
+            return errorReport(`Unknown function '{ expr.Call.Identifier }'.`, expr.position)
         end
 
-        local argTy = infer(expr.Call.Arguments[1], nonGeneric)
+        fnTy = fresh(fnTy, nonGeneric)
+        local argTys = table.create<<Type>>(#expr.Call.Arguments)
+
+        for i, a in expr.Call.Arguments do
+            argTys[i] = infer(a, nonGeneric)
+        end
+
         local retTy = typeVariable()
 
-        unify(functionType(argTy, retTy), fnTy)
-
+        unify(functionType(argTys, retTy), fnTy, expr.position)
         return retTy
+
     elseif expr.Type == "Function" then
-        local argTy = typeVariable()
-        nonGeneric[argTy] = true
+        local argTys = table.create<<Type>>(#expr.Function.Parameters)
+        local retTy = typeVariable()
 
-        local param = expr.Function.Parameters[1]
-        local shadowed = typeEnv[param]
-        typeEnv[param] = argTy
+        local shadowed = {}
 
-        local retTy = voidType()
+        for i, p in expr.Function.Parameters do
+            local tv = typeVariable()
+            argTys[i] = tv
+            nonGeneric[tv] = true
+            shadowed[p] = typeEnv[p]
+            typeEnv[p] = tv
+        end
+
+        local fnTy = functionType(argTys, retTy)
+        local foundRet = false
+
+        if expr.Function.Name then
+            shadowed[expr.Function.Name] = typeEnv[expr.Function.Name]
+            typeEnv[expr.Function.Name] = fnTy
+        end
 
         for _, b in expr.Function.Body do
             local result = infer(b, nonGeneric)
 
             if b.Type == "Return" then
-                retTy = result
+                retTy.Instance = result
+                foundRet = true
+
                 break
             end
         end
 
-        nonGeneric[argTy] = nil
-        typeEnv[param] = shadowed
+        if not foundRet then
+            retTy.Instance = voidType()
+        end
 
-        return functionType(argTy, retTy)
+        for i, a in argTys do
+            nonGeneric[a] = nil
+
+            local param = expr.Function.Parameters[i]
+            typeEnv[param] = shadowed[param]
+        end
+
+        if expr.Function.Name then
+            typeEnv[expr.Function.Name] = shadowed[expr.Function.Name]
+        end
+
+        fnTy = functionType(argTys, retTy)
+
+        if expr.Function.Name then
+            typeEnv[expr.Function.Name] = fnTy
+        end
+
+        return fnTy
+
     elseif expr.Type == "VariadicArguments" then
         return errorType()
     elseif expr.Type == "InvalidSyntax" then
