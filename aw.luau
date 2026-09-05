@@ -18,6 +18,10 @@ type Value =
         Value: string,
       }
     | {
+        Type: "List",
+        Value: { Value },
+      }
+    | {
         Type: "Function",
         Value:
             | {
@@ -37,7 +41,7 @@ type Value =
       }
 
 type BasicToken = {
-    read Type: "Equals" | "IsEqualTo" | "OpenParentheses" | "CloseParentheses" | "Comma" | "Ellipsis" | "EndOfFile",
+    read Type: "Equals" | "IsEqualTo" | "OpenParentheses" | "CloseParentheses" | "OpenCurlyBraces" | "CloseCurlyBraces" | "Comma" | "Ellipsis" | "EndOfFile",
 }
 
 type Keyword = "nil" | "true" | "false" | "let" | "function" | "return" | "end" | "if" | "else" | "then"
@@ -136,6 +140,10 @@ type ExpressionData =
         read Return: Expression?,
       }
     | {
+        read Type: "List",
+        read List: { read Expression },
+      }
+    | {
         read Type: "VariadicArguments",
       }
     | {
@@ -169,6 +177,8 @@ local correspond: { read [string]: index<BasicToken, "Type">? } = {
     ["="] = "Equals",
     ["("] = "OpenParentheses",
     [")"] = "CloseParentheses",
+    ["{"] = "OpenCurlyBraces",
+    ["}"] = "CloseCurlyBraces",
     [","] = "Comma",
     ["..."] = "Ellipsis",
     [""] = "EndOfFile",
@@ -203,7 +213,7 @@ local function isEof(c: string)
 end
 
 local function isSeparator(c: string)
-    return isEof(c) or isWhitespace(c) or c == ";" or c == "=" or c == "(" or c == ")" or c == "," or c == "^" or c == '"' or c == "#" or operators[c]
+    return isEof(c) or isWhitespace(c) or c == ";" or c == "=" or c == "(" or c == ")" or c == "{" or c == "}" or c == "," or c == "^" or c == '"' or c == "#" or operators[c]
 end
 
 local function nextToken(state: { position: number, line: number, char: number, program: string }): Token
@@ -653,6 +663,39 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 Token = token.Operator,
             }, token)
         end
+    elseif token.Type == "OpenCurlyBraces" then
+        local items: { Expression } = {}
+        local itemParseState = table.clone(state)
+        local itemTk = nextToken(itemParseState)
+
+        while itemTk.Type ~= "CloseCurlyBraces" do
+            local item = parseExpression(state, report)
+
+            if item then
+                table.insert(items, item)
+            else
+                return invalidExpr(state, `Reached end-of-file parsing list items.`, report)
+            end
+
+            itemParseState = table.clone(state)
+            itemTk = nextToken(itemParseState)
+
+            if itemTk.Type ~= "CloseCurlyBraces" then
+                if itemTk.Type ~= "Comma" then
+                    return invalidExpr(state, `Expected comma or closing parentheses, got { itemTk.Type }.`, report)
+                end
+            end
+        end
+
+        state.position = itemParseState.position
+        state.line = itemParseState.line
+        state.char = itemParseState.char
+
+        return ex({
+            Type = "List",
+            List = items,
+        }, token)
+
     elseif token.Type == "Ellipsis" then
         return ex({
             Type = "VariadicArguments",
@@ -728,7 +771,19 @@ local function makeLuauFuncValue(fn: ({ Value }) -> Value?): Value
 end
 
 local function valToString(v: Value)
-    return tostring(if v.Type == "Function" then "function" else v.Value)
+    if v.Type == "Function" then
+        return "function"
+    elseif v.Type == "List" then
+        local items = table.create<<string>>(#v.Value)
+
+        for i, v in v.Value do
+            items[i] = valToString(v)
+        end
+
+        return `\{ { table.concat(items, ", ") } \}`
+    else
+        return tostring(if v.Type == "Function" then "function" else v.Value)
+    end
 end
 
 local env: { [string]: Value? } = {
@@ -744,16 +799,19 @@ local env: { [string]: Value? } = {
 
         return nil
     end),
+
     typeof = makeLuauFuncValue(function(args): Value -- TODO luau extraneous annotation
         assert(#args == 1, `'typeof' requires 1 argument.`)
 
         return { Type = "string", Value = args[1].Type } -- TODO luau weird type error?
     end),
+
     tostring = makeLuauFuncValue(function(args)
         assert(#args == 1, `'tostring' requires 1 argument.`)
 
         return { Type = "string", Value = valToString(args[1]) }
     end),
+
     tonumber = makeLuauFuncValue(function(args): Value -- TODO luau extraneous annotation
         assert(#args == 1, `'tonumber' requires 1 argument.`)
 
@@ -767,6 +825,57 @@ local env: { [string]: Value? } = {
         else
             return { Type = "nil" }
         end
+    end),
+
+    List_get = makeLuauFuncValue(function(args): Value
+        assert(#args == 2, `'List_get' requires 2 arguments.`)
+
+        local l = args[1]
+        assert(l.Type == "List", `'List_get' expects a List as the first argument.'`)
+
+        local i = args[2]
+        assert(i.Type == "number", `'List_get' expects a number as the second argument.`)
+        assert(i.Value > 0 and i.Value <= #l.Value, `'List_get' received an out-of-bounds index.`)
+
+        return l.Value[i.Value]
+    end),
+
+    List_set = makeLuauFuncValue(function(args): Value?
+        assert(#args == 3, `'List_set' requires 3 arguments.`)
+
+        local l = args[1]
+        assert(l.Type == "List", `'List_set' expects a List as the first argument.`)
+
+        local i = args[2]
+        assert(i.Type == "number", `'List_set' expects a number as the second argument.`)
+        assert(i.Value > 0 and i.Value <= #l.Value, `'List_set' received an out-of-bounds index.`)
+
+        local v = args[3]
+
+        l.Value[i.Value] = v
+        return nil
+    end),
+
+    List_length = makeLuauFuncValue(function(args): Value
+        assert(#args == 1, `'List_length' requires 1 arguments.`)
+
+        local l = args[1]
+        assert(l.Type == "List", `'List_length' expects a List as the first argument.`)
+
+        return { Type = "number", Value = #l.Value }
+    end),
+
+    List_clear = makeLuauFuncValue(function(args): Value
+        assert(#args == 2, `'List_clear' requires 2 arguments.`)
+
+        local l = args[1]
+        assert(l.Type == "List", `'List_clear' expects a List as the first argument.`)
+
+        local n = args[2]
+        assert(n.Type == "number", `'List_set' expects a number as the second argument.`)
+
+        l.Value = table.create<<Value>>(n.Value)
+        return { Type = "nil" }
     end),
 }
 
@@ -1018,6 +1127,17 @@ local function eval(expr: Expression): Value?
             NormalReturn = true,
             NormalReturnValue = if expr.Return then eval(expr.Return) else nil,
         })
+    elseif expr.Type == "List" then
+        local values = table.create<<Value>>(#expr.List)
+
+        for i, v in expr.List do
+            values[i] = eval(v)
+        end
+
+        return {
+            Type = "List",
+            Value = values,
+        }
     elseif expr.Type == "VariadicArguments" then
         return callFrames[#callFrames].VariadicArguments[1]
     elseif expr.Type == "IfCondition" then
@@ -1077,40 +1197,53 @@ end
 
 local program = [[
 
-let x = function(a)
-    let b = a + 1
+let a_toasting = function(toToast)
+    let a_toaster = toToast + 1
 
-    return tostring(a)
+    return tostring(toToast)
 end
 
-let y = x(1)
+let a_toasted = a_toasting(42)
 
-let ident = function(t)
-    return t
+let b_id = function(x)
+    return x
 end
 
-let z = ident("hello")
+let b_hello = b_id("hello")
 
-print(x)
-print(y)
-print(z)
+print(a_toasting)
+print(a_toasted)
+print(b_hello)
 
-let w = function(i)
-    let q = i + 1
-    let r = i .. "World!"
+let c_wrong = function(wrongAgain)
+    let c_q = wrongAgain + 1
+    let c_r = wrongAgain .. "World!"
 end
 
-function fac(n)
+function d_fac(n)
     if n > 1 then
-        let m = n * fac(n - 1)
+        let d_m = n * d_fac(n - 1)
     else
-        let m = n
+        let d_m = n
     end
 
-    return m
+    return d_m
 end
 
-print(fac(5))
+print(d_fac(5))
+
+let e_swap = function(lis, in, jn)
+    let e_vi = List_get(lis, in)
+    let e_vj = List_get(lis, jn)
+
+    List_set(lis, in, e_vj)
+    List_set(lis, jn, e_vi)
+
+    return e_vj
+end
+
+let e_cool_list_full_of_cool_things = { 1, 2, true }
+let e_second = e_swap(e_cool_list_full_of_cool_things, 1, 3)
 
 ]]
 
@@ -1177,7 +1310,7 @@ local function stringType()
 end
 
 local function functionType(params: { read Type }, returns: Type?): TypeOperator
-    local types = table.create<<Type>>(#params + if returns then 1 else 0)
+    local types = table.create<<Type>>(#params + 1)
 
     for i, p in params do
         types[i] = p
@@ -1185,12 +1318,22 @@ local function functionType(params: { read Type }, returns: Type?): TypeOperator
 
     if returns then
         table.insert(types, returns)
+    else
+        table.insert(types, voidType())
     end
 
     return {
         Kind = "Operator",
         Name = "->",
         Types = types,
+    }
+end
+
+local function listType(contains: Type): Type
+    return {
+        Kind = "Operator",
+        Name = "List",
+        Types = { contains },
     }
 end
 
@@ -1213,7 +1356,7 @@ local function variableName(tyvar: TypeVariable)
     if tyvar.Name then
         return tyvar.Name
     else
-        local name = `'{ string.char(tyVarNameIndex % 26 + 97) }`
+        local name = string.char(tyVarNameIndex % 26 + 84)
         tyvar.Name = name
         tyVarNameIndex += 1
 
@@ -1232,6 +1375,8 @@ local function typeToString(ty: Type): string
         if #ty.Types == 0 then
             return ty.Name
         elseif ty.Name == "->" then
+            tyVarNameIndex = 0
+
             local params = table.create<<string>>(#ty.Types)
             local ret = "void"
 
@@ -1246,11 +1391,12 @@ local function typeToString(ty: Type): string
             return `({ table.concat(params, ", ") }) -> { ret }`
         else
             local stringified = table.create<<string>>(#ty.Types)
+
             for i, t in ty.Types do
                 stringified[i] = typeToString(t)
             end
 
-            return `{ ty.Name } { table.concat(stringified, " ") }`
+            return `{ ty.Name }<{ table.concat(stringified, ", ") }>`
         end
     else
         unreachable(ty.Kind)
@@ -1294,7 +1440,13 @@ function occursIn(t: Type, types: { read Type })
 end
 
 local function isGeneric(v: Type, nonGenerics: { [Type]: true? })
-    return nonGenerics[v] == nil
+    local types = {}
+
+    for ng, _ in nonGenerics do
+        table.insert(types, ng)
+    end
+
+    return not occursIn(v, types)
 end
 
 local function fresh(t: Type, nonGenerics: { [Type]: true? })
@@ -1352,7 +1504,7 @@ local function unify(a: Type, b: Type, pos: Position)
     elseif a.Kind == "Operator" and b.Kind == "Operator" then
         if a.Name ~= b.Name or #a.Types ~= #b.Types then
             if a.Name ~= "*error*" and b.Name ~= "*error*" then
-                errorReport(`Type mismatch: { typeToString(a) } != { typeToString(b) }.`, pos)
+                errorReport(`Mismatching types: { typeToString(a) } is not { typeToString(b) }.`, pos);
             end
         else
             for i, t1 in a.Types do
@@ -1362,23 +1514,25 @@ local function unify(a: Type, b: Type, pos: Position)
     end
 end
 
-local builtin = {
-    print = true,
-    tostring = true,
-}
+local tv = typeVariable()
 
 local typeEnv: { [string]: Type? } = {
-    print = {
-        Kind = "Operator",
-        Name = "->",
-        Types = { typeVariable(), voidType() },
-    },
-    tostring = {
-        Kind = "Operator",
-        Name = "->",
-        Types = { typeVariable(), stringType() },
-    },
+    print = functionType({ typeVariable() }),
+    typeof = functionType({ typeVariable() }, stringType()),
+    tostring = functionType({ typeVariable() }, stringType()),
+    tonumber = functionType({ numberType() }, stringType()),
+
+    List_get = functionType({ listType(tv), numberType() }, tv),
+    List_set = functionType({ listType(tv), numberType(), tv }),
+    List_length = functionType({ listType(tv) }, numberType()),
+    List_clear = functionType({ listType(tv), numberType() }),
 }
+
+local builtin = {}
+
+for bi, _ in typeEnv do
+    builtin[bi] = true
+end
 
 print("\n--")
 
@@ -1524,7 +1678,7 @@ local function infer(expr: Expression, nonGeneric: { [Type]: true? }): Type
                 retTy.Instance = result
                 foundRet = true
 
-                break
+                break -- TODO only checking top-level here
             end
         end
 
@@ -1551,8 +1705,30 @@ local function infer(expr: Expression, nonGeneric: { [Type]: true? }): Type
 
         return fnTy
 
+    elseif expr.Type == "List" then
+        local itemTy = typeVariable()
+
+        if #expr.List > 0 then
+            local first = infer(expr.List[1], nonGeneric)
+
+            if #expr.List > 1 then
+                for i = 2, #expr.List do
+                    local item = expr.List[i]
+                    unify(infer(item, nonGeneric), first, item.position)
+                end
+            end
+
+            itemTy = first
+        end
+
+        return {
+            Kind = "Operator",
+            Name = "List",
+            Types = { itemTy },
+        }
+
     elseif expr.Type == "VariadicArguments" then
-        return errorType()
+        return nilType()
     elseif expr.Type == "InvalidSyntax" then
         return errorType()
     else
@@ -1567,8 +1743,18 @@ end
 
 print("\nInferred types:\n")
 
-for k, v in typeEnv do
+local orderedInferences = {}
+
+for k, _ in typeEnv do
+    table.insert(orderedInferences, k)
+end
+
+table.sort(orderedInferences)
+
+for _, k in orderedInferences do
     if not builtin[k] then
+        local v = assert(typeEnv[k])
+
         print(`{ k }: { typeToString(v) }`)
     end
 end
