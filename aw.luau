@@ -1018,24 +1018,8 @@ end
 local program = [[
 
 let x = function(a)
-    let b = a + 1
-
-    return tostring(a)
-end
-
-let y = x(1)
-
-let ident = function(t)
-    return t
-end
-
-let z = ident("hello")
-
-print(x, y, z)
-
-let w = function(i)
-    let q = i + 1
-    let r = i .. "World!"
+    let b = a
+    return b - 5
 end
 
 ]]
@@ -1054,56 +1038,39 @@ else
     print("Compilation failed.")
 end
 
--- just trying out simple things before i fully take a look at how HM works
+-- https://github.com/7sharp9/write-you-an-inference-in-fsharp/blob/master/HMBasic/HMBasic.fs
 
-type PrimitiveType = {
-    read Kind: "Primitive",
-    read Primitive: index<Value, "Type">
+type TypeVariable = {
+    read Kind: "Variable",
+    Name: string?,
+    Instance: Type?,
 }
 
-type FunctionType = {
-    read Kind: "Function",
-    read Function: {
-        read Generics: { read string }?,
-        read Parameters: { read Type },
-        read Variadic: Type?,
-        read Returns: Type?,
-    }
-}
-
-type UnknownType = {
-    read Kind: "unknown",
-}
-
-type NeverType = {
-    read Kind: "never",
-}
-
-type GenericType = {
-    read Kind: "Generic",
+type TypeOperator = {
+    read Kind: "Operator",
     read Name: string,
+    read Types: { read Type },
 }
-
-type FreeType = { read Kind: "Free", read Name: string }
-type ErrorType = { read Kind: "Error" }
 
 type Type =
-    | PrimitiveType
-    | FunctionType
-    | GenericType
-    | UnknownType
-    | NeverType
-    | FreeType
-    | ErrorType
+    | TypeVariable
+    | TypeOperator
 
-local function primitiveType(prim): PrimitiveType
+local tyVarNameIndex = 0
+
+local function primitiveType(prim): TypeOperator
     return {
-        Kind = "Primitive",
-        Primitive = prim,
+        Kind = "Operator",
+        Name = prim,
+        Types = {},
     }
 end
 
-local function nilType(): PrimitiveType
+local function voidType()
+    return primitiveType("void")
+end
+
+local function nilType()
     return primitiveType("nil")
 end
 
@@ -1119,73 +1086,139 @@ local function stringType()
     return primitiveType("string")
 end
 
-local function unknownType(): UnknownType
-    return { Kind = "unknown" }
+local function functionType(param: Type, returns: Type): TypeOperator
+    return {
+        Kind = "Operator",
+        Name = "->",
+        Types = { param, returns },
+    }
+end
+
+local function unknownType()
+    return primitiveType("unknown")
+end
+
+local function errorType()
+    return primitiveType("*error*")
+end
+
+local function typeVariable(): TypeVariable
+    return {
+        Kind = "Variable",
+    }
+end
+
+local function variableName(tyvar: TypeVariable)
+    if tyvar.Name then
+        return tyvar.Name
+    else
+        local name = `'{ string.char(tyVarNameIndex % 26 + 97) }`
+        tyvar.Name = name
+        tyVarNameIndex += 1
+
+        return name
+    end
 end
 
 local function typeToString(ty: Type): string
-    if ty.Kind == "Primitive" then
-        return ty.Primitive
-    elseif ty.Kind == "Function" then
-        local fn = ty.Function
-        local paramTys = table.create<<string>>(#fn.Parameters)
-
-        for i, p in fn.Parameters do
-            paramTys[i] = typeToString(p)
+    if ty.Kind == "Variable" then
+        if ty.Instance then
+            return typeToString(ty.Instance)
+        else
+            return variableName(ty)
         end
+    elseif ty.Kind == "Operator" then
+        if #ty.Types == 0 then
+            return ty.Name
+        elseif #ty.Types == 2 then
+            return `{ typeToString(ty.Types[1]) } { ty.Name } { typeToString(ty.Types[2]) }`
+        else
+            local stringified = table.create<<string>>(#ty.Types)
+            for i, t in ty.Types do
+                stringified[i] = typeToString(t)
+            end
 
-        if fn.Variadic then
-            table.insert(paramTys, `...{ typeToString(fn.Variadic) }`)
+            return `{ ty.Name } { table.concat(stringified, " ") }`
         end
-
-        local returns = "()"
-
-        if fn.Returns then
-            returns = typeToString(fn.Returns)
-        end
-
-        return `<{ table.concat(fn.Generics or {}, ", ") }>({ table.concat(paramTys, ", ") }) -> { returns }`
-    elseif ty.Kind == "unknown" or ty.Kind == "never" then
-        return ty.Kind
-    elseif ty.Kind == "Generic" then
-        return ty.Name
-    elseif ty.Kind == "Free" then
-        return `'{ ty.Name }`
-    elseif ty.Kind == "Error" then
-        return "*error*"
     else
         unreachable(ty.Kind)
         error(`Unreachable.`)
     end
 end
 
-local function deepEqual(t1: unknown, t2: unknown)
-    if typeof(t1) ~= "table" or typeof(t2) ~= "table" then
-        return t1 == t2
+local function prune(ty: Type): Type
+    if ty.Kind == "Variable" and ty.Instance then
+        local newInstance = prune(ty.Instance)
+        ty.Instance = newInstance -- TODO luau this assignment makes `newInstance` be inferred optional without the return annotation?
+
+        return newInstance
     else
-        for k, v in t1 do
-            local v2 = t2[k]
-
-            if not deepEqual(v, v2) then
-                return false
-            end
-        end
-
-        for k, v in t2 do
-            local v2 = t1[k]
-
-            if not deepEqual(v, v2) then
-                return false
-            end
-        end
-
-        return true
+        return ty
     end
 end
 
-local function errorReport(msg, pos): ErrorType
-    print(`{ pos.position.line }:{ pos.position.char }: { msg }`)
-    return { Kind = "Error" }
+local occursIn
+
+local function occursInType(v: Type, t2: Type)
+    t2 = prune(t2)
+
+    if t2 == v then
+        return true
+    elseif t2.Kind == "Operator" then
+        return occursIn(v, t2.Types)
+    else
+        return false
+    end
+end
+
+function occursIn(t: Type, types: { read Type })
+    for _, ty in types do
+        if occursInType(t, ty) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function isGeneric(v: Type, nonGenerics: { [Type]: true? })
+    return nonGenerics[v] == nil
+end
+
+local function fresh(t: Type, nonGenerics: { [Type]: true? })
+    local seen = {}
+
+    local function tp(t: Type): Type
+        t = prune(t)
+
+        if t.Kind == "Variable" then
+            if isGeneric(t, nonGenerics) then
+                if seen[t] then
+                    local newVar = typeVariable()
+                    seen[t] = newVar
+
+                    return newVar
+                else
+                    return seen[t]
+                end
+            else
+                return t
+            end
+        elseif t.Kind == "Operator" then
+            local newTypes = table.create<<Type>>(#t.Types)
+
+            for i, ty in t.Types do
+                newTypes[i] = tp(ty)
+            end
+
+            return { Kind = "Operator", Name = t.Name, Types = newTypes }
+        else
+            unreachable(t.Kind)
+            error(`Unreachable.`)
+        end
+    end
+
+    return tp(t)
 end
 
 local builtin = {
@@ -1194,91 +1227,94 @@ local builtin = {
 }
 
 local typeEnv: { [string]: Type? } = {
-    print = {
-        Kind = "Function",
-        Function = {
-            Parameters = {},
-            Variadic = stringType(),
-            Returns = nil,
-        },
-    },
-    tostring = {
-        Kind = "Function",
-        Function = {
-            Parameters = { { Kind = "unknown" } },
-            Returns = stringType(),
-        },
-    },
+    -- print = {
+    --     Kind = "Function",
+    --     Function = {
+    --         Parameters = {},
+    --         Variadic = stringType(),
+    --         Returns = nil,
+    --     },
+    -- },
+    -- tostring = {
+    --     Kind = "Function",
+    --     Function = {
+    --         Parameters = { { Kind = "unknown" } },
+    --         Returns = stringType(),
+    --     },
+    -- },
 }
 
-local substitutions: { [FreeType]: { { Type: Type, position: Position } } } = {}
+local function unify(a: Type, b: Type)
+    a = prune(a)
+    b = prune(b)
+
+    if a.Kind == "Variable" then
+        if a ~= b then
+            if occursInType(a, b) then
+                error(`Recursive unification.`)
+            end
+
+            a.Instance = b
+        end
+    elseif a.Kind == "Operator" and b.Kind == "Variable" then
+        return unify(b, a)
+    elseif a.Kind == "Operator" and b.Kind == "Operator" then
+        if a.Name ~= b.Name or #a.Types ~= #b.Types then
+            error(`Type mismatch: { typeToString(a) } != { typeToString(b) }`)
+        end
+
+        for i, t1 in a.Types do
+            unify(t1, b.Types[i])
+        end
+    end
+end
 
 print("\n--")
 
-local function infer(expr: Expression): Type?
-    local function addConstraint(ftv: FreeType, ty: Type)
-        table.insert(substitutions[ftv], { Type = ty, position = expr.position })
-    end
-
+local function infer(expr: Expression, nonGeneric): Type
     if expr.Type == "Declaration" then
-        local ty = infer(expr.Declaration.Value)
+        local ty = infer(expr.Declaration.Value, nonGeneric)
 
-        if not ty then
-            ty = errorReport(`Tried to assign '{ expr.Declaration.Name }' to an expression that does not evaluate to a value.`, expr)
-        end
+        -- if not ty then
+        --     ty = errorReport(`Tried to assign '{ expr.Declaration.Name }' to an expression that does not evaluate to a value.`, expr)
+        -- end
 
         typeEnv[expr.Declaration.Name] = ty
         return ty
     elseif expr.Type == "Constant" then
-        return {
-            Kind = "Primitive",
-            Primitive = expr.Constant.Type,
-        }
+        if expr.Constant.Type == "nil" then
+            return nilType()
+        elseif expr.Constant.Type == "boolean" then
+            return booleanType()
+        elseif expr.Constant.Type == "number" then
+            return numberType()
+        elseif expr.Constant.Type == "string" then
+            return stringType()
+        else
+            error(`Unrecognized constant type '{ expr.Constant.Type }'.`)
+        end
     elseif expr.Type == "Reference" then
-        return typeEnv[expr.Reference]
-            or errorReport(`Unknown declaration '{ expr.Reference }'.`, expr)
+        local fromEnv = typeEnv[expr.Reference]
+
+        if fromEnv then
+            return fresh(fromEnv, nonGeneric)
+        else
+            error(`Unknown symbol '{ expr.Reference }'.`)
+        end
     elseif expr.Type == "BinaryOperation" then
-        local left = infer(expr.Left)
-        local right = infer(expr.Right)
-
-        if not left then
-            return errorReport(`LHS of '{ expr.Operator }' operation did not evaluate to a value.`, expr.Left)
-        end
-
-        if not right then
-            return errorReport(`RHS of '{ expr.Operator }' operation did not evaluate to a value.`, expr.Right)
-        end
+        local left = infer(expr.Left, nonGeneric)
+        local right = infer(expr.Right, nonGeneric)
 
         if expr.Operator == "+" or expr.Operator == "-" or expr.Operator == "*"
             or expr.Operator == "/" or expr.Operator == "//"
         then
-            if left.Kind == "Free" then
-                -- TODO luau
-                -- table.insert(substitutions[left], { Kind = "Primitive", Primitive = "number" })
-                addConstraint(left, numberType())
-            elseif left.Kind ~= "Primitive" or left.Primitive ~= "number" then
-                return errorReport(`Expected a number as LHS for '{ expr.Operator }' operation, got { typeToString(left) }.`, expr)
-            end
-
-            if right.Kind == "Free" then
-                addConstraint(right, numberType())
-            elseif right.Kind ~= "Primitive" or right.Primitive ~= "number" then
-                return errorReport(`Expected a number as RHS for '{ expr.Operator }' operation, got { typeToString(right) }.`, expr)
-            end
+            unify(left, numberType())
+            unify(right, numberType())
 
             return numberType()
         elseif expr.Operator == ".." then
-            if left.Kind == "Free" then
-                addConstraint(left, stringType())
-            elseif left.Kind ~= "Primitive" or left.Primitive ~= "string" then
-                return errorReport(`Expected a string as LHS for '{ expr.Operator }' operation, got { typeToString(left) }.`, expr)
-            end
-
-            if right.Kind == "Free" then
-                addConstraint(right, stringType())
-            elseif right.Kind ~= "Primitive" or right.Primitive ~= "string" then
-                return errorReport(`Expected a string as RHS for '{ expr.Operator }' operation, got { typeToString(right) }.`, expr)
-            end
+            unify(left, stringType())
+            unify(right, stringType())
 
             return stringType()
         elseif expr.Operator == "==" then
@@ -1288,26 +1324,14 @@ local function infer(expr: Expression): Type?
             error(`Unreachable.`)
         end
     elseif expr.Type == "UnaryOperation" then
-        local operand = infer(expr.Operand)
-
-        if not operand then
-            return errorReport(`Operand of '{ expr.Operator }' operation did not evaluate to a value.`, expr.Operand)
-        end
+        local operand = infer(expr.Operand, nonGeneric)
 
         if expr.Operator == "-" then
-            if operand.Kind == "Free" then
-                addConstraint(operand, numberType())
-            elseif operand.Kind ~= "Primitive" or operand.Primitive ~= "number" then
-                return errorReport(`Expected number for negation operation, got { typeToString(operand) }.`, expr)
-            end
+            unify(operand, numberType())
 
             return numberType()
         elseif expr.Operator == "#" then
-            if operand.Kind == "Free" then
-                addConstraint(operand, stringType())
-            elseif operand.Kind ~= "Primitive" or operand.Primitive ~= "string" then
-                return errorReport(`Expected string for length operation, got { typeToString(operand) }.`, expr)
-            end
+            unify(operand, stringType())
 
             return numberType()
         else
@@ -1315,7 +1339,8 @@ local function infer(expr: Expression): Type?
             error(`Unreachable.`)
         end
     elseif expr.Type == "Return" then
-        return if expr.Return then infer(expr.Return) else nil
+        return if expr.Return then infer(expr.Return, nonGeneric) else voidType()
+    --[[
     elseif expr.Type == "IfCondition" then
         local condition = infer(expr.Condition)
 
@@ -1338,126 +1363,47 @@ local function infer(expr: Expression): Type?
         end
 
         return condition
+    ]]--
     elseif expr.Type == "Call" then
         local fnTy = typeEnv[expr.Call.Identifier]
 
         if not fnTy then
-            return errorReport(`Unknown function '{ expr.Call.Identifier }'.`, expr)
+            error(`Unknown function '{ expr.Call.Identifier }'.`)
         end
 
-        if fnTy.Kind ~= "Function" then
-            return errorReport(`Cannot call a value of type { typeToString(fnTy) }.`, expr)
-        end
+        local argTy = infer(expr.Call.Arguments[1], nonGeneric)
+        local retTy = typeVariable()
 
-        local fn = fnTy.Function
+        unify(functionType(argTy, retTy), fnTy)
 
-        if #expr.Call.Arguments < #fn.Parameters then
-            return errorReport(`Function expects at least { #fn.Parameters } argument(s), but only got { #expr.Call.Arguments }`, expr)
-        end
-
-        if fn.Returns and fn.Returns.Kind == "Generic" then
-            if table.find(fn.Generics, fn.Returns.Name) then
-                for i, arg in fn.Parameters do
-                    if arg.Kind == "Generic" and arg.Name == fn.Returns.Name then
-                        return infer(expr.Call.Arguments[i])
-                    end
-                end
-            end
-        end
-
-        return fn.Returns
+        return retTy
     elseif expr.Type == "Function" then
-        local params = table.create<<Type>>(#expr.Function.Parameters)
-        local returned
+        local argTy = typeVariable()
+        nonGeneric[argTy] = true
 
-        for i = 1, #expr.Function.Parameters do
-            local ftv = {
-                Kind = "Free",
-                Name = string.char((i - 1) % 25 + 97),
-            }
-            params[i] = ftv
-            substitutions[ftv] = {}
-        end
+        local param = expr.Function.Parameters[1]
+        local shadowed = typeEnv[param]
+        typeEnv[param] = argTy
 
-        local shadowed = {}
+        local retTy = voidType()
 
-        for i, p in expr.Function.Parameters do
-            shadowed[p] = typeEnv[p]
-            typeEnv[p] = params[i]
-        end
+        for _, b in expr.Function.Body do
+            local result = infer(b, nonGeneric)
 
-        for _, e in expr.Function.Body do
-            local ty = infer(e)
-
-            if e.Type == "Return" then
-                returned = ty
+            if b.Type == "Return" then
+                retTy = result
+                break
             end
         end
 
-        for _, p in expr.Function.Parameters do
-            typeEnv[p] = shadowed[p]
-        end
+        nonGeneric[argTy] = nil
+        typeEnv[param] = shadowed
 
-        local gens = {}
-
-        for i, p in params do
-            assert(p.Kind == "Free")
-            local constraints = substitutions[p]
-            substitutions[p] = nil
-
-            if #constraints == 0 then
-                if returned == p then
-                    local name = string.char((#gens + 13) % 25 + 71)
-                    local gen = { Kind = "Generic", Name = name }
-                    params[i] = gen
-                    returned = gen
-                    table.insert(gens, name)
-                else
-                    params[i] = unknownType()
-                end
-            else
-                local curr = constraints[1]
-                local ok = true
-
-                if #constraints > 1 then
-                    for ci = 2, #constraints do
-                        local c = constraints[ci]
-
-                        if c.Type.Kind ~= "unknown" and not deepEqual(c.Type, curr.Type) then
-                            params[i] = errorReport(
-                                `Expected parameter '{ expr.Function.Parameters[i] }' to be both a { typeToString(curr.Type) } and a { typeToString(c.Type) } at the same time.`,
-                                c
-                            )
-
-                            ok = false
-                            break
-                        else
-                            curr = c
-                        end
-                    end
-                end
-
-                if ok then
-                    params[i] = curr.Type
-                end
-            end
-        end
-
-        return {
-            Kind = "Function",
-            Function = {
-                Generics = gens,
-                Parameters = params,
-                Variadic = if expr.Function.Variadic then { Kind = "unknown" } else nil,
-                Returns = returned,
-            },
-        }
+        return functionType(argTy, retTy)
     elseif expr.Type == "VariadicArguments" then
-        return { Kind = "unknown" }
+        return errorType()
     elseif expr.Type == "InvalidSyntax" then
-        return {
-            Kind = "Error",
-        }
+        return errorType()
     else
         unreachable(expr.Type)
         error(`Unreachable.`)
@@ -1465,7 +1411,7 @@ local function infer(expr: Expression): Type?
 end
 
 for _, v in result.Expressions do
-    infer(v)
+    infer(v, {})
 end
 
 print("\nInferred types:\n")
