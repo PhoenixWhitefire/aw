@@ -1244,6 +1244,7 @@ end
 
 let e_cool_list_full_of_cool_things = { 1, 2, true }
 let e_second = e_swap(e_cool_list_full_of_cool_things, 1, 3)
+print(e_second)
 
 ]]
 
