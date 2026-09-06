@@ -243,11 +243,22 @@ local function nextToken(state: { position: number, line: number, char: number, 
     if isSeparator(c) then
         local next, pos = nextCharacter(state.program, state.position)
 
-        if next == "=" then
+        if next == "=" or next == "-" then
             token = c .. next
             state.position = pos
         else
             token = c
+        end
+
+        if token == "--" then
+            repeat
+                next, pos = nextCharacter(state.program, state.position)
+                state.position = pos
+            until next == "\n" or next == ""
+
+            state.char = 1
+            state.line += 1
+            return nextToken(state)
         end
     else
         local before = state.position
@@ -505,7 +516,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
             return parseFunction(state, report, token)
         elseif token.Keyword == "return" then
             if state.functionDepth == 0 then
-                return invalidExpr(state, "Cannot 'return' outside of functions", report)
+                return invalidExpr(state, "Cannot 'return' outside of functions.", report)
             else
                 local nextTk = nextToken(table.clone(state))
                 local expr = if nextTk.Type == "Keyword" and nextTk.Keyword == "end" then nil else parseExpression(state, report)
@@ -1187,7 +1198,7 @@ local function run(exprs: { read Expression }): Value?
         local _, p = string.find(msg, ".luau:%d+:")
 
         if p then
-            --msg = string.sub(msg, p + 2, #msg)
+            msg = string.sub(msg, p + 2, #msg)
         end
 
         print(`Protected error: { msg }`)
