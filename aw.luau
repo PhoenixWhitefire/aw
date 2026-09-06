@@ -1222,12 +1222,10 @@ end
 
 function d_fac(n)
     if n > 1 then
-        let d_m = n * d_fac(n - 1)
+        return n * d_fac(n - 1)
     else
-        let d_m = n
+        return n
     end
-
-    return d_m
 end
 
 print(d_fac(5))
@@ -1279,8 +1277,6 @@ type TypeOperator = {
 type Type =
     | TypeVariable
     | TypeOperator
-
-local tyVarNameIndex = 0
 
 local function primitiveType(prim): TypeOperator
     return {
@@ -1348,61 +1344,110 @@ local function typeVariable(): TypeVariable
     }
 end
 
-local function errorReport(msg, pos: Position)
-    print(`{ pos.line }:{ pos.char }: { msg }`)
+local function exprToStringShallow(expr: Expression)
+    if expr.Type == "Declaration" then
+        return `let { expr.Declaration.Name } = { exprToStringShallow(expr.Declaration.Value) }`
+    elseif expr.Type == "BinaryOperation" then
+        return `{ exprToStringShallow(expr.Left) } { expr.Operator } { exprToStringShallow(expr.Right) }`
+    elseif expr.Type == "UnaryOperation" then
+        return `{ expr.Operator }{ exprToStringShallow(expr.Operand) }`
+    elseif expr.Type == "Call" then
+        return `{ expr.Call.Identifier }(`
+    elseif expr.Type == "Constant" then
+        if expr.Constant.Type == "string" then
+            return `"{ expr.Constant.Value }"`
+        else
+            return tostring(expr.Constant.Value)
+        end
+    elseif expr.Type == "Function" then
+        return `function{ if expr.Function.Name then " " .. expr.Function.Name else "" }(`
+    elseif expr.Type == "Reference" then
+        return expr.Reference
+    elseif expr.Type == "IfCondition" then
+        return `if { exprToStringShallow(expr.Condition) }`
+    elseif expr.Type == "Return" then
+        return `return{ if expr.Return then " " .. exprToStringShallow(expr.Return) else "" }`
+    elseif expr.Type == "List" then
+        if #expr.List >= 1 then
+            local first = exprToStringShallow(expr.List[1])
+
+            if #expr.List == 1 then
+                return `\{ { first } \}`
+            else
+                return `\{ { first }`
+            end
+        else
+            return "{}"
+        end
+    elseif expr.Type == "VariadicArguments" then
+        return "..."
+    elseif expr.Type == "InvalidSyntax" then
+        return expr.Token
+    else
+        unreachable(expr.Type)
+        error(`Unreachable.`)
+    end
+end
+
+local function errorReport(msg, expr: Expression)
+    print(`{ expr.position.line }:{ expr.position.char } - { exprToStringShallow(expr) }: { msg }`)
     return errorType()
 end
 
-local function variableName(tyvar: TypeVariable)
-    if tyvar.Name then
-        return tyvar.Name
-    else
-        local name = string.char(tyVarNameIndex % 26 + 84)
-        tyvar.Name = name
-        tyVarNameIndex += 1
-
-        return name
-    end
-end
-
 local function typeToString(ty: Type): string
-    if ty.Kind == "Variable" then
-        if ty.Instance then
-            return typeToString(ty.Instance)
+    local tyVarNameIndex = 0
+
+    local function variableName(tyvar: TypeVariable)
+        if tyvar.Name then
+            return tyvar.Name
         else
-            return variableName(ty)
+            local name = string.char(tyVarNameIndex % 26 + 84)
+            tyvar.Name = name
+            tyVarNameIndex += 1
+
+            return name
         end
-    elseif ty.Kind == "Operator" then
-        if #ty.Types == 0 then
-            return ty.Name
-        elseif ty.Name == "->" then
-            tyVarNameIndex = 0
-
-            local params = table.create<<string>>(#ty.Types)
-            local ret = "void"
-
-            for i, p in ty.Types do
-                if i == #ty.Types then
-                    ret = typeToString(p)
-                else
-                    params[i] = typeToString(p)
-                end
-            end
-
-            return `({ table.concat(params, ", ") }) -> { ret }`
-        else
-            local stringified = table.create<<string>>(#ty.Types)
-
-            for i, t in ty.Types do
-                stringified[i] = typeToString(t)
-            end
-
-            return `{ ty.Name }<{ table.concat(stringified, ", ") }>`
-        end
-    else
-        unreachable(ty.Kind)
-        error(`Unreachable.`)
     end
+
+    local function toString(ty: Type)
+        if ty.Kind == "Variable" then
+            if ty.Instance then
+                return typeToString(ty.Instance)
+            else
+                return variableName(ty)
+            end
+        elseif ty.Kind == "Operator" then
+            if #ty.Types == 0 then
+                return ty.Name
+            elseif ty.Name == "->" then
+                local params = table.create<<string>>(#ty.Types)
+                local ret = "void"
+
+                for i, p in ty.Types do
+                    if i == #ty.Types then
+                        ret = typeToString(p)
+                    else
+                        params[i] = typeToString(p)
+                    end
+                end
+
+                return `({ table.concat(params, ", ") }) -> { ret }`
+            else
+                local stringified = table.create<<string>>(#ty.Types)
+
+                for i, t in ty.Types do
+                    stringified[i] = typeToString(t)
+                end
+
+                return `{ ty.Name }<{ table.concat(stringified, ", ") }>`
+            end
+        else
+            unreachable(ty.Kind)
+            error(`Unreachable.`)
+        end
+    end
+
+    return toString(ty)
 end
 
 local function prune(ty: Type): Type
@@ -1486,30 +1531,48 @@ local function fresh(t: Type, nonGenerics: { [Type]: true? })
     return tp(t)
 end
 
-local function unify(a: Type, b: Type, pos: Position)
+local function isErrorSuppressing(ty: Type)
+    if ty.Kind ~= "Operator" then
+        return false
+    end
+
+    if ty.Name == "*error*" then
+        return true
+    end
+
+    for _, t in ty.Types do
+        if isErrorSuppressing(prune(t)) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function unify(a: Type, b: Type, expr: Expression)
     a = prune(a)
     b = prune(b)
 
     if a.Kind == "Variable" then
         if a ~= b then
             if occursInType(a, b) then
-                a.Instance = errorReport(`Recursive unification.`, pos)
+                a.Instance = errorReport(`Recursive unification, { typeToString(b) } contains { typeToString(a) }.`, expr)
             else
                 a.Instance = b
             end
         end
 
     elseif a.Kind == "Operator" and b.Kind == "Variable" then
-        return unify(b, a, pos)
+        return unify(b, a, expr)
 
     elseif a.Kind == "Operator" and b.Kind == "Operator" then
         if a.Name ~= b.Name or #a.Types ~= #b.Types then
-            if a.Name ~= "*error*" and b.Name ~= "*error*" then
-                errorReport(`Mismatching types: { typeToString(a) } is not { typeToString(b) }.`, pos);
+            if not isErrorSuppressing(a) and not isErrorSuppressing(b) then
+                errorReport(`Mismatching types: { typeToString(a) } is not { typeToString(b) }.`, expr);
             end
         else
             for i, t1 in a.Types do
-                unify(t1, b.Types[i], pos)
+                unify(t1, b.Types[i], expr)
             end
         end
     end
@@ -1535,14 +1598,19 @@ for bi, _ in typeEnv do
     builtin[bi] = true
 end
 
+type InferenceState = {
+    nonGeneric: { [Type]: true? },
+    expectingRetTy: Type?,
+}
+
 print("\n--")
 
-local function infer(expr: Expression, nonGeneric: { [Type]: true? }): Type
+local function infer(expr: Expression, state: InferenceState): Type
     if expr.Type == "Declaration" then
-        local ty = infer(expr.Declaration.Value, nonGeneric)
+        local ty = infer(expr.Declaration.Value, state)
 
         if ty.Kind == "Operator" and ty.Name == "void" then
-            ty = errorReport(`Tried to assign '{ expr.Declaration.Name }' to an expression that returns 'void'.`, expr.position)
+            ty = errorReport(`Tried to assign '{ expr.Declaration.Name }' to an expression that returns 'void'.`, expr)
         end
 
         typeEnv[expr.Declaration.Name] = ty
@@ -1558,37 +1626,37 @@ local function infer(expr: Expression, nonGeneric: { [Type]: true? }): Type
         elseif expr.Constant.Type == "string" then
             return stringType()
         else
-            return errorReport(`Unrecognized constant type '{ expr.Constant.Type }'.`, expr.position)
+            return errorReport(`Unrecognized constant type '{ expr.Constant.Type }'.`, expr)
         end
     elseif expr.Type == "Reference" then
         local fromEnv = typeEnv[expr.Reference]
 
         if fromEnv then
-            return fresh(fromEnv, nonGeneric)
+            return fresh(fromEnv, state.nonGeneric)
         else
-            return errorReport(`Unknown symbol '{ expr.Reference }'.`, expr.position)
+            return errorReport(`Unknown symbol '{ expr.Reference }'.`, expr)
         end
     elseif expr.Type == "BinaryOperation" then
-        local left = infer(expr.Left, nonGeneric)
-        local right = infer(expr.Right, nonGeneric)
+        local left = infer(expr.Left, state)
+        local right = infer(expr.Right, state)
 
         if expr.Operator == "+" or expr.Operator == "-" or expr.Operator == "*"
             or expr.Operator == "/" or expr.Operator == "//"
         then
-            unify(left, numberType(), expr.Left.position)
-            unify(right, numberType(), expr.Right.position)
+            unify(left, numberType(), expr.Left)
+            unify(right, numberType(), expr.Right)
 
             return numberType()
         elseif expr.Operator == ">"
             or expr.Operator == ">=" or expr.Operator == "<" or expr.Operator == "<="
         then
-            unify(left, numberType(), expr.Left.position)
-            unify(right, numberType(), expr.Right.position)
+            unify(left, numberType(), expr.Left)
+            unify(right, numberType(), expr.Right)
 
             return booleanType()
         elseif expr.Operator == ".." then
-            unify(left, stringType(), expr.Left.position)
-            unify(right, stringType(), expr.Right.position)
+            unify(left, stringType(), expr.Left)
+            unify(right, stringType(), expr.Right)
 
             return stringType()
         elseif expr.Operator == "==" or expr.Operator == "~=" then
@@ -1598,14 +1666,14 @@ local function infer(expr: Expression, nonGeneric: { [Type]: true? }): Type
             error(`Unreachable.`)
         end
     elseif expr.Type == "UnaryOperation" then
-        local operand = infer(expr.Operand, nonGeneric)
+        local operand = infer(expr.Operand, state)
 
         if expr.Operator == "-" then
-            unify(operand, numberType(), expr.Operand.position)
+            unify(operand, numberType(), expr.Operand)
 
             return numberType()
         elseif expr.Operator == "#" then
-            unify(operand, stringType(), expr.Operand.position)
+            unify(operand, stringType(), expr.Operand)
 
             return numberType()
         else
@@ -1613,19 +1681,26 @@ local function infer(expr: Expression, nonGeneric: { [Type]: true? }): Type
             error(`Unreachable.`)
         end
     elseif expr.Type == "Return" then
-        return if expr.Return then infer(expr.Return, nonGeneric) else voidType()
+        if not state.expectingRetTy then
+            return errorReport(`Unexpected 'return' outside of function body.`, expr)
+        end
+
+        local here = if expr.Return then infer(expr.Return, state) else voidType()
+        unify(here, state.expectingRetTy, expr)
+
+        return voidType()
 
     elseif expr.Type == "IfCondition" then
-        local condition = infer(expr.Condition, nonGeneric)
-        unify(condition, booleanType(), expr.Condition.position)
+        local condition = infer(expr.Condition, state)
+        unify(condition, booleanType(), expr.Condition)
 
         for _, v in expr.IfBody do
-            infer(v, nonGeneric)
+            infer(v, state)
         end
 
         if expr.ElseBody then
             for _, v in expr.ElseBody do
-                infer(v, nonGeneric)
+                infer(v, state)
             end
         end
 
@@ -1635,70 +1710,74 @@ local function infer(expr: Expression, nonGeneric: { [Type]: true? }): Type
         local fnTy = typeEnv[expr.Call.Identifier]
 
         if not fnTy then
-            return errorReport(`Unknown function '{ expr.Call.Identifier }'.`, expr.position)
+            return errorReport(`Unknown function '{ expr.Call.Identifier }'.`, expr)
         end
 
-        fnTy = fresh(fnTy, nonGeneric)
+        fnTy = fresh(fnTy, state.nonGeneric)
         local argTys = table.create<<Type>>(#expr.Call.Arguments)
 
         for i, a in expr.Call.Arguments do
-            argTys[i] = infer(a, nonGeneric)
+            argTys[i] = infer(a, state)
         end
 
         local retTy = typeVariable()
 
-        unify(functionType(argTys, retTy), fnTy, expr.position)
+        unify(functionType(argTys, retTy), fnTy, expr)
         return retTy
 
     elseif expr.Type == "Function" then
-        local argTys = table.create<<Type>>(#expr.Function.Parameters)
+        local paramTys = table.create<<Type>>(#expr.Function.Parameters)
         local retTy = typeVariable()
 
         local shadowed = {}
 
         for i, p in expr.Function.Parameters do
             local tv = typeVariable()
-            argTys[i] = tv
-            nonGeneric[tv] = true
+            paramTys[i] = tv
+            state.nonGeneric[tv] = true
             shadowed[p] = typeEnv[p]
             typeEnv[p] = tv
         end
 
-        local fnTy = functionType(argTys, retTy)
-        local foundRet = false
+        local fnTy = functionType(paramTys, retTy)
 
         if expr.Function.Name then
             shadowed[expr.Function.Name] = typeEnv[expr.Function.Name]
             typeEnv[expr.Function.Name] = fnTy
         end
 
+        local prevRetTy = state.expectingRetTy
+        state.expectingRetTy = retTy
+
         for _, b in expr.Function.Body do
-            local result = infer(b, nonGeneric)
-
-            if b.Type == "Return" then
-                retTy.Instance = result
-                foundRet = true
-
-                break -- TODO only checking top-level here
-            end
+            infer(b, state)
         end
 
-        if not foundRet then
-            retTy.Instance = voidType()
-        end
+        state.expectingRetTy = prevRetTy
 
-        for i, a in argTys do
-            nonGeneric[a] = nil
+        retTy = prune(retTy)
+        local foundRetTyInParameters = false
+
+        for i, p in paramTys do
+            state.nonGeneric[p] = nil
 
             local param = expr.Function.Parameters[i]
             typeEnv[param] = shadowed[param]
+
+            if occursInType(retTy, p) then
+                foundRetTyInParameters = true
+            end
+        end
+
+        if not foundRetTyInParameters and retTy.Kind == "Variable" then
+            unify(retTy, voidType(), expr)
         end
 
         if expr.Function.Name then
             typeEnv[expr.Function.Name] = shadowed[expr.Function.Name]
         end
 
-        fnTy = functionType(argTys, retTy)
+        fnTy = functionType(paramTys, retTy)
 
         if expr.Function.Name then
             typeEnv[expr.Function.Name] = fnTy
@@ -1710,12 +1789,12 @@ local function infer(expr: Expression, nonGeneric: { [Type]: true? }): Type
         local itemTy = typeVariable()
 
         if #expr.List > 0 then
-            local first = infer(expr.List[1], nonGeneric)
+            local first = infer(expr.List[1], state)
 
             if #expr.List > 1 then
                 for i = 2, #expr.List do
                     local item = expr.List[i]
-                    unify(infer(item, nonGeneric), first, item.position)
+                    unify(infer(item, state), first, item)
                 end
             end
 
@@ -1739,7 +1818,7 @@ local function infer(expr: Expression, nonGeneric: { [Type]: true? }): Type
 end
 
 for _, v in result.Expressions do
-    infer(v, {})
+    infer(v, { nonGeneric = {} })
 end
 
 print("\nInferred types:\n")
