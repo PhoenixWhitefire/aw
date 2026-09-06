@@ -2016,16 +2016,25 @@ local function infer(expr: Expression, state: InferenceState): Type
         }
 
     elseif expr.Type == "VariadicArguments" then
-        assert(state.expectingVariadicTy, `'...' may only be referenced within function bodies.`)
-        return state.expectingVariadicTy
+        if state.expectingVariadicTy then
+            return state.expectingVariadicTy
+        else
+            return errorReport(`'...' may only be referenced within function bodies.`, expr)
+        end
 
     elseif expr.Type == "VariadicSelection" then
-        assert(state.expectingVariadicTy, `'...' may only be referenced within function bodies.`)
-        return state.expectingVariadicTy
+        if state.expectingVariadicTy then
+            return state.expectingVariadicTy
+        else
+            return errorReport(`'...' may only be referenced within function bodies.`, expr)
+        end
 
     elseif expr.Type == "VariadicLength" then
-        assert(state.expectingVariadicTy, `'...' may only be referenced within function bodies.`)
-        return numberType()
+        if state.expectingVariadicTy then
+            return numberType()
+        else
+            return errorReport(`'...' may only be referenced within function bodies.`, expr)
+        end
 
     elseif expr.Type == "InvalidSyntax" then
         return errorType()
