@@ -59,6 +59,7 @@ local operators = {
     [">="] = true,
     ["<"] = true,
     ["<="] = true,
+    [":="] = true,
 }
 
 type Operator = keyof<typeof(operators)>
@@ -213,7 +214,7 @@ local function isEof(c: string)
 end
 
 local function isSeparator(c: string)
-    return isEof(c) or isWhitespace(c) or c == ";" or c == "=" or c == "(" or c == ")" or c == "{" or c == "}" or c == "," or c == "^" or c == '"' or c == "#" or operators[c]
+    return isEof(c) or isWhitespace(c) or c == ":" or c == ";" or c == "=" or c == "(" or c == ")" or c == "{" or c == "}" or c == "," or c == "^" or c == '"' or c == "#" or operators[c]
 end
 
 local function nextToken(state: { position: number, line: number, char: number, program: string }): Token
@@ -390,6 +391,10 @@ local function parseBody(state: ParseState, report: (string, { position: Positio
 end
 
 local function parseBinaryOperation(state: ParseState, report: (string, { position: Position }) -> (), left: Expression, opTk: OperatorToken): Expression
+    if opTk.Operator == ":=" and left.Type ~= "Reference" then
+        report(`Mutation operator expects LHS to be a reference, got a { left.Type } instead.`, left)
+    end
+
     return ex({
         Type = "BinaryOperation",
         Operator = opTk.Operator,
@@ -912,10 +917,6 @@ local function eval(expr: Expression): Value?
     if expr.Type == "Declaration" then
         local name = expr.Declaration.Name
 
-        if env[name] then
-            fail(`'{ name }' was already declared.`)
-        end
-
         local v = eval(expr.Declaration.Value)
         env[name] = v
 
@@ -1088,6 +1089,10 @@ local function eval(expr: Expression): Value?
                 return { Type = "number", Value = left / right }
             elseif expr.Operator == "//" then
                 return { Type = "number", Value = left // right }
+            elseif expr.Operator == ":=" then
+                assert(expr.Left.Type == "Reference", "This should've been caught at compile time.")
+
+                env[expr.Left.Reference] = rightEval
             else
                 unreachable(expr.Operator)
                 error(`Unreachable.`)
@@ -1232,11 +1237,15 @@ let c_wrong = function(wrongAgain)
 end
 
 function d_fac(n)
+    let m = 0
+
     if n > 1 then
-        return n * d_fac(n - 1)
+        m := n * d_fac(n - 1)
     else
-        return n
+        m := n
     end
+
+    return m
 end
 
 print(d_fac(5))
@@ -1672,6 +1681,21 @@ local function infer(expr: Expression, state: InferenceState): Type
             return stringType()
         elseif expr.Operator == "==" or expr.Operator == "~=" then
             return booleanType()
+        elseif expr.Operator == ":=" then
+            if expr.Left.Type == "Reference" then
+                local prev = typeEnv[expr.Left.Reference]
+
+                if not prev then
+                    return errorReport(`Cannot mutate '{ expr.Left.Reference }' because it was not defined.`, expr)
+                end
+
+                local now = infer(expr.Right, state)
+                unify(now, prev, expr.Right)
+
+                return prev
+            else
+                return errorType() -- Error would've already been reported by compiler
+            end
         else
             unreachable(expr.Operator)
             error(`Unreachable.`)
