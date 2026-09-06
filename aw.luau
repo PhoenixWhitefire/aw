@@ -1,43 +1,46 @@
 -- aw.luau - erin5/@PhoenixWhitefire, 03/09/2026
 --!strict
 type Value =
+    | LiteralValue
     | {
-        Type: "nil",
-        Value: nil,
+        read Type: "List",
+        read Value: { Value },
       }
     | {
-        Type: "boolean",
-        Value: boolean,
-      }
-    | {
-        Type: "number",
-        Value: number,
-      }
-    | {
-        Type: "string",
-        Value: string,
-      }
-    | {
-        Type: "List",
-        Value: { Value },
-      }
-    | {
-        Type: "Function",
-        Value:
+        read Type: "Function",
+        read Value:
             | {
-                IsLuau: true,
-                Function: ({ Value }) -> Value?,
+                read IsLuau: true,
+                read Function: ({ Value }) -> Value?,
               }
             | {
-                IsLuau: false,
-                Parameters: { string },
-                Variadic: boolean,
-                Body: { Expression },
+                read IsLuau: false,
+                read Parameters: { string },
+                read Variadic: boolean,
+                read Body: { Expression },
               },
       }
     | {
-        Type: "VariadicArguments",
-        Value: { read Value },
+        read Type: "VariadicArguments",
+        read Value: { read Value },
+      }
+
+type LiteralValue =
+    | {
+        read Type: "nil",
+        read Value: nil,
+      }
+    | {
+        read Type: "boolean",
+        read Value: boolean,
+      }
+    | {
+        read Type: "number",
+        read Value: number,
+      }
+    | {
+        read Type: "string",
+        read Value: string,
       }
 
 type BasicToken = {
@@ -81,7 +84,7 @@ type TokenData =
       }
     | {
         read Type: "Literal",
-        read Literal: string | number,
+        read Literal: LiteralValue,
       }
     | {
         read Type: "InvalidSyntax",
@@ -103,7 +106,7 @@ type ExpressionData =
       }
     | {
         read Type: "Constant",
-        read Constant: Value,
+        read Constant: LiteralValue,
       }
     | {
         read Type: "Reference",
@@ -282,7 +285,10 @@ local function nextToken(state: { position: number, line: number, char: number, 
 
         return tk{
             Type = "Literal",
-            Literal = literal,
+            Literal = {
+                Type = "number" :: "number", -- TODO luau cast
+                Value = literal,
+            },
         }
     elseif token == '"' then
         local strlit = ""
@@ -302,9 +308,11 @@ local function nextToken(state: { position: number, line: number, char: number, 
         end
 
         return tk{
-            -- TODO luau cast
-            Type = "Literal" :: "Literal",
-            Literal = strlit,
+            Type = "Literal",
+            Literal = {
+                Type = "string" :: "string",
+                Value = strlit,
+            },
         }
     elseif operators[token :: Operator] or token == "#" then -- TODO luau cast (also not accurate)
         return tk{
@@ -597,8 +605,6 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                     Arguments = args,
                 },
             }, token)
-        elseif nextTk.Type == "Identifier" then
-            return invalidExpr(state, `Cannot have two identifiers next to each other.`, report)
         else
             left = ex({
                 Type = "Reference",
@@ -618,10 +624,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
         -- TODO luau does not report error when `position` is not attached even though the annotation is explicit
         local constant: Expression = ex({
             Type = "Constant",
-            Constant = {
-                Type = typeof(token.Literal) :: any,
-                Value = token.Literal :: any,
-            },
+            Constant = token.Literal,
         }, token)
 
         local operatorParseState = table.clone(state)
@@ -804,6 +807,22 @@ local function valToString(v: Value)
     end
 end
 
+local function nilValue(): Value
+    return { Type = "nil" }
+end
+
+local function booleanValue(b): Value
+    return { Type = "boolean", Value = b }
+end
+
+local function numberValue(n): Value
+    return { Type = "number", Value = n }
+end
+
+local function stringValue(s): Value
+    return { Type = "string", Value = s }
+end
+
 local env: { [string]: Value? } = {
     print = makeLuauFuncValue(function(args)
         local str = ""
@@ -818,34 +837,34 @@ local env: { [string]: Value? } = {
         return nil
     end),
 
-    typeof = makeLuauFuncValue(function(args): Value -- TODO luau extraneous annotation
+    typeof = makeLuauFuncValue(function(args)
         assert(#args == 1, `'typeof' requires 1 argument.`)
 
-        return { Type = "string", Value = args[1].Type } -- TODO luau weird type error?
+        return stringValue(args[1].Type)
     end),
 
     tostring = makeLuauFuncValue(function(args)
         assert(#args == 1, `'tostring' requires 1 argument.`)
 
-        return { Type = "string", Value = valToString(args[1]) }
+        return stringValue(valToString(args[1]))
     end),
 
-    tonumber = makeLuauFuncValue(function(args): Value -- TODO luau extraneous annotation
+    tonumber = makeLuauFuncValue(function(args)
         assert(#args == 1, `'tonumber' requires 1 argument.`)
 
         local v = args[1]
-        assert(v.Type == "number" or v.Type == "string", `'tonumber' requires a string or number argument, got { v.Type } instead`)
+        assert(v.Type == "number" or v.Type == "string", `'tonumber' requires a string or number argument, got { v.Type } instead.`)
 
         local n = tonumber(v.Value)
 
         if n then
-            return { Type = "number", Value = n }
+            return numberValue(n)
         else
-            return { Type = "nil" }
+            return nilValue()
         end
     end),
 
-    List_get = makeLuauFuncValue(function(args): Value
+    List_get = makeLuauFuncValue(function(args)
         assert(#args == 2, `'List_get' requires 2 arguments.`)
 
         local l = args[1]
@@ -858,7 +877,7 @@ local env: { [string]: Value? } = {
         return l.Value[i.Value]
     end),
 
-    List_set = makeLuauFuncValue(function(args): Value?
+    List_set = makeLuauFuncValue(function(args)
         assert(#args == 3, `'List_set' requires 3 arguments.`)
 
         local l = args[1]
@@ -874,26 +893,33 @@ local env: { [string]: Value? } = {
         return nil
     end),
 
-    List_length = makeLuauFuncValue(function(args): Value
+    List_length = makeLuauFuncValue(function(args)
         assert(#args == 1, `'List_length' requires 1 arguments.`)
 
         local l = args[1]
         assert(l.Type == "List", `'List_length' expects a List as the first argument.`)
 
-        return { Type = "number", Value = #l.Value }
+        return numberValue(#l.Value)
     end),
 
-    List_clear = makeLuauFuncValue(function(args): Value
-        assert(#args == 2, `'List_clear' requires 2 arguments.`)
+    List_clear = makeLuauFuncValue(function(args)
+        assert(#args == 2, `'List_clear' requires 3 arguments.`)
 
         local l = args[1]
         assert(l.Type == "List", `'List_clear' expects a List as the first argument.`)
 
         local n = args[2]
-        assert(n.Type == "number", `'List_set' expects a number as the second argument.`)
+        assert(n.Type == "number", `'List_clear' expects a number as the second argument.`)
 
-        l.Value = table.create<<Value>>(n.Value)
-        return { Type = "nil" }
+        local init = args[3]
+
+        table.clear(l.Value)
+
+        for i = 1, n.Value do
+            l.Value[i] = init
+        end
+
+        return nil
     end),
 }
 
@@ -909,10 +935,6 @@ local function eval(expr: Expression): Value?
 
     local function fail(msg): never
         error(`{ expr.position.line }:{ expr.position.char }: { msg }`)
-    end
-
-    local function nilVal(): Value
-        return { Type = "nil" }
     end
 
     if expr.Type == "Declaration" then
@@ -1013,8 +1035,8 @@ local function eval(expr: Expression): Value?
         end
 
     elseif expr.Type == "BinaryOperation" then
-        local leftEval = eval(expr.Left) or nilVal()
-        local rightEval = eval(expr.Right) or nilVal()
+        local leftEval = eval(expr.Left) or nilValue()
+        local rightEval = eval(expr.Right) or nilValue()
 
         if expr.Operator == "==" or expr.Operator == "~=" or expr.Operator == ">" or expr.Operator == ">="
             or expr.Operator == "<" or expr.Operator == "<="
@@ -1035,21 +1057,21 @@ local function eval(expr: Expression): Value?
             local right = rightEval.Value
 
             if expr.Operator == "==" then
-                return { Type = "boolean", Value = left == right }
+                return booleanValue(left == right)
             elseif expr.Operator == "~=" then
-                return { Type = "boolean", Value = left ~= right }
+                return booleanValue(left ~= right)
             elseif expr.Operator == ">" then
                 assert(typeof(left) == "number" and typeof(right) == "number")
-                return { Type = "boolean", Value = left > right }
+                return booleanValue(left > right)
             elseif expr.Operator == ">=" then
                 assert(typeof(left) == "number" and typeof(right) == "number")
-                return { Type = "boolean", Value = left >= right }
+                return booleanValue(left >= right)
             elseif expr.Operator == "<" then
                 assert(typeof(left) == "number" and typeof(right) == "number")
-                return { Type = "boolean", Value = left < right }
+                return booleanValue(left < right)
             elseif expr.Operator == "<=" then
                 assert(typeof(left) == "number" and typeof(right) == "number")
-                return { Type = "boolean", Value = left <= right }
+                return booleanValue(left <= right)
             else
                 unreachable(expr.Operator)
                 error(`Unreachable.`)
@@ -1065,7 +1087,7 @@ local function eval(expr: Expression): Value?
                 error(`Unreachable.`)
             end
 
-            return { Type = "string", Value = leftEval.Value .. rightEval.Value }
+            return stringValue(leftEval.Value .. rightEval.Value)
         elseif expr.Operator == ":=" then
             assert(expr.Left.Type == "Reference", "This should've been caught at compile time.")
 
@@ -1086,22 +1108,22 @@ local function eval(expr: Expression): Value?
             local right = rightEval.Value
 
             if expr.Operator == "+" then
-                return { Type = "number", Value = left + right }
+                return numberValue(left + right)
             elseif expr.Operator == "-" then
-                return { Type = "number", Value = left - right }
+                return numberValue(left - right)
             elseif expr.Operator == "*" then
-                return { Type = "number", Value = left * right }
+                return numberValue(left * right)
             elseif expr.Operator == "/" then
-                return { Type = "number", Value = left / right }
+                return numberValue(left / right)
             elseif expr.Operator == "//" then
-                return { Type = "number", Value = left // right }
+                return numberValue(left // right)
             else
                 unreachable(expr.Operator)
                 error(`Unreachable.`)
             end
         end
     elseif expr.Type == "UnaryOperation" then
-        local operandEval = eval(expr.Operand) or nilVal()
+        local operandEval = eval(expr.Operand) or nilValue()
 
         if expr.Operator == "-" then
             if operandEval.Type ~= "number" then
@@ -1109,14 +1131,14 @@ local function eval(expr: Expression): Value?
                 error(`Unreachable.`)
             end
 
-            return { Type = "number", Value = -operandEval.Value }
+            return numberValue(-operandEval.Value)
         elseif expr.Operator == "#" then
             if operandEval.Type ~= "string" then
                 fail(`Cannot get the length of a { operandEval.Type }.`)
                 error(`Unreachable.`)
             end
 
-            return { Type = "number", Value = #operandEval.Value }
+            return numberValue(#operandEval.Value)
         else
             unreachable(expr.Operator)
             error(`Unreachable.`)
@@ -1159,7 +1181,7 @@ local function eval(expr: Expression): Value?
     elseif expr.Type == "VariadicArguments" then
         return callFrames[#callFrames].VariadicArguments[1]
     elseif expr.Type == "IfCondition" then
-        local conditionResult = eval(expr.Condition) or nilVal()
+        local conditionResult = eval(expr.Condition) or nilValue()
 
         if conditionResult.Type ~= "boolean" then
             fail(`Expected boolean for condition, got { conditionResult.Type }.`)
@@ -1233,9 +1255,7 @@ end
 
 let b_hello = b_id("hello")
 
-print(a_toasting)
-print(a_toasted)
-print(b_hello)
+print(a_toasting, a_toasted, b_hello)
 
 let c_wrong = function(wrongAgain)
     let c_q = wrongAgain + 1
@@ -1292,7 +1312,7 @@ type TypeVariable = {
 
 type TypeOperator = {
     read Kind: "Operator",
-    read Name: string,
+    read Name: "*error*" | "void" | "unknown" | index<Value, "Type">,
     read Types: { read Type },
 }
 
@@ -1312,6 +1332,10 @@ local function voidType()
     return primitiveType("void")
 end
 
+local function unknownType()
+    return primitiveType("unknown")
+end
+
 local function nilType()
     return primitiveType("nil")
 end
@@ -1328,12 +1352,14 @@ local function stringType()
     return primitiveType("string")
 end
 
-local function functionType(params: { read Type }, returns: Type?): TypeOperator
-    local types = table.create<<Type>>(#params + 1)
+local function functionType(params: { read Type }, variadic: Type, returns: Type): TypeOperator
+    local types = table.create<<Type>>(#params + 2)
 
     for i, p in params do
         types[i] = p
     end
+
+    table.insert(types, variadic or voidType())
 
     if returns then
         table.insert(types, returns)
@@ -1343,7 +1369,7 @@ local function functionType(params: { read Type }, returns: Type?): TypeOperator
 
     return {
         Kind = "Operator",
-        Name = "->",
+        Name = "Function",
         Types = types,
     }
 end
@@ -1441,15 +1467,19 @@ local function typeToString(ty: Type): string
         elseif ty.Kind == "Operator" then
             if #ty.Types == 0 then
                 return ty.Name
-            elseif ty.Name == "->" then
+            elseif ty.Name == "Function" then
                 local params = table.create<<string>>(#ty.Types)
                 local ret = "void"
 
-                for i, p in ty.Types do
-                    if i == #ty.Types then
-                        ret = typeToString(p)
+                for i, t in ty.Types do
+                    if i == #ty.Types - 1 then
+                        if t.Name ~= "void" then
+                            params[i] = `...{ typeToString(t) }`
+                        end
+                    elseif i == #ty.Types then
+                        ret = typeToString(t)
                     else
-                        params[i] = typeToString(p)
+                        params[i] = typeToString(t)
                     end
                 end
 
@@ -1505,6 +1535,11 @@ function occursIn(t: Type, types: { read Type })
     end
 
     return false
+end
+
+local function isVoid(ty: Type)
+    local pr = prune(ty)
+    return pr.Kind == "Operator" and pr.Name == "void"
 end
 
 local function isGeneric(v: Type, nonGenerics: { [Type]: true? })
@@ -1588,9 +1623,38 @@ local function unify(a: Type, b: Type, expr: Expression)
         return unify(b, a, expr)
 
     elseif a.Kind == "Operator" and b.Kind == "Operator" then
-        if a.Name ~= b.Name or #a.Types ~= #b.Types then
+        -- `unknown` always unifies
+        if (a.Name ~= b.Name or #a.Types ~= #b.Types) and (a.Name ~= "unknown" and b.Name ~= "unknown") then
+            if a.Name == "Function" and b.Name == "Function" then
+                if not isVoid(a.Types[#a.Types - 1]) and #b.Types > #a.Types - 1 and b.Types[#b.Types - 1].Kind == "Variable" then
+                    -- `a` has a variadic, unify against `b` arguments
+
+                    for i, at in a.Types do
+                        if i == #a.Types - 1 then
+                            -- variadic
+
+                            for j = i, #b.Types - 2 do
+                                unify(at, b.Types[j], expr)
+                            end
+                        elseif i == #a.Types then
+                            -- return
+                            unify(at, b.Types[#b.Types], expr)
+                        else
+                            unify(at, b.Types[i], expr)
+                        end
+                    end
+
+                    return
+                elseif not isVoid(b.Types[#b.Types - 1]) then
+                    -- try swapping them
+                    unify(b, a, expr)
+
+                    return
+                end
+            end
+
             if not isErrorSuppressing(a) and not isErrorSuppressing(b) then
-                errorReport(`Mismatching types: { typeToString(a) } is not { typeToString(b) }.`, expr);
+                errorReport(`Mismatching types: { typeToString(a) } is not { typeToString(b) }.`, expr)
             end
         else
             for i, t1 in a.Types do
@@ -1603,15 +1667,15 @@ end
 local tv = typeVariable()
 
 local typeEnv: { [string]: Type? } = {
-    print = functionType({ typeVariable() }),
-    typeof = functionType({ typeVariable() }, stringType()),
-    tostring = functionType({ typeVariable() }, stringType()),
-    tonumber = functionType({ numberType() }, stringType()),
+    print = functionType({}, unknownType(), voidType()),
+    typeof = functionType({ unknownType() }, voidType(), stringType()),
+    tostring = functionType({ unknownType() }, voidType(), stringType()),
+    tonumber = functionType({ numberType() }, voidType(), stringType()),
 
-    List_get = functionType({ listType(tv), numberType() }, tv),
-    List_set = functionType({ listType(tv), numberType(), tv }),
-    List_length = functionType({ listType(tv) }, numberType()),
-    List_clear = functionType({ listType(tv), numberType() }),
+    List_get = functionType({ listType(tv), numberType() }, voidType(), tv),
+    List_set = functionType({ listType(tv), numberType(), tv }, voidType(), voidType()),
+    List_length = functionType({ listType(tv) }, voidType(), numberType()),
+    List_clear = functionType({ listType(tv), numberType() }, voidType(), voidType()),
 }
 
 local builtin = {}
@@ -1648,7 +1712,8 @@ local function infer(expr: Expression, state: InferenceState): Type
         elseif expr.Constant.Type == "string" then
             return stringType()
         else
-            return errorReport(`Unrecognized constant type '{ expr.Constant.Type }'.`, expr)
+            unreachable(expr.Constant.Type)
+            error(`Unreachable.`)
         end
     elseif expr.Type == "Reference" then
         local fromEnv = typeEnv[expr.Reference]
@@ -1692,6 +1757,7 @@ local function infer(expr: Expression, state: InferenceState): Type
                 end
 
                 local now = infer(expr.Right, state)
+
                 if now.Kind == "Operator" and now.Name == "void" then
                     return errorReport(`Tried to mutate '{ expr.Left.Reference }' to void.`, expr)
                 end
@@ -1770,7 +1836,7 @@ local function infer(expr: Expression, state: InferenceState): Type
 
         local retTy = typeVariable()
 
-        unify(functionType(argTys, retTy), fnTy, expr)
+        unify(functionType(argTys, typeVariable(), retTy), fnTy, expr)
         return retTy
 
     elseif expr.Type == "Function" then
@@ -1787,7 +1853,7 @@ local function infer(expr: Expression, state: InferenceState): Type
             typeEnv[p] = tv
         end
 
-        local fnTy = functionType(paramTys, retTy)
+        local fnTy = functionType(paramTys, voidType(), retTy)
 
         if expr.Function.Name then
             shadowed[expr.Function.Name] = typeEnv[expr.Function.Name]
@@ -1825,7 +1891,7 @@ local function infer(expr: Expression, state: InferenceState): Type
             typeEnv[expr.Function.Name] = shadowed[expr.Function.Name]
         end
 
-        fnTy = functionType(paramTys, retTy)
+        fnTy = functionType(paramTys, voidType(), retTy)
 
         if expr.Function.Name then
             typeEnv[expr.Function.Name] = fnTy
