@@ -21,7 +21,7 @@ type Value =
               },
       }
     | {
-        read Type: "VariadicArguments",
+        read Type: "Tuple",
         read Value: { read Value },
       }
 
@@ -44,7 +44,14 @@ type LiteralValue =
       }
 
 type BasicToken = {
-    read Type: "Equals" | "IsEqualTo" | "OpenParentheses" | "CloseParentheses" | "OpenCurlyBraces" | "CloseCurlyBraces" | "Comma" | "Ellipsis" | "EndOfFile",
+    read Type:
+        | "Equals"
+        | "OpenParentheses" | "CloseParentheses"
+        | "OpenCurlyBraces" | "CloseCurlyBraces"
+        | "OpenSquareBraces" | "CloseSquareBraces"
+        | "Comma"
+        | "Ellipsis"
+        | "EndOfFile",
 }
 
 type Keyword = "nil" | "true" | "false" | "let" | "function" | "return" | "end" | "if" | "else" | "then"
@@ -151,6 +158,13 @@ type ExpressionData =
         read Type: "VariadicArguments",
       }
     | {
+        read Type: "VariadicSelection",
+        read Selection: Expression,
+      }
+    | {
+        read Type: "VariadicLength",
+      }
+    | {
         read Type: "IfCondition",
         read Condition: Expression,
         read IfBody: { read Expression },
@@ -183,6 +197,8 @@ local correspond: { read [string]: index<BasicToken, "Type">? } = {
     [")"] = "CloseParentheses",
     ["{"] = "OpenCurlyBraces",
     ["}"] = "CloseCurlyBraces",
+    ["["] = "OpenSquareBraces",
+    ["]"] = "CloseSquareBraces",
     [","] = "Comma",
     ["..."] = "Ellipsis",
     [""] = "EndOfFile",
@@ -217,7 +233,9 @@ local function isEof(c: string)
 end
 
 local function isSeparator(c: string)
-    return isEof(c) or isWhitespace(c) or c == ":" or c == ";" or c == "=" or c == "(" or c == ")" or c == "{" or c == "}" or c == "," or c == "^" or c == '"' or c == "#" or operators[c]
+    return isEof(c) or isWhitespace(c) or c == ":" or c == ";" or c == "=" or c == "(" or c == ")" or c == "{" or c == "}" or c == "," or c == "^" or c == '"' or c == "#"
+        or c == "[" or c == "]"
+        or operators[c]
 end
 
 local function nextToken(state: { position: number, line: number, char: number, program: string }): Token
@@ -430,6 +448,10 @@ local function parseFunction(state: ParseState, report: (string, { position: Pos
 
     while paramTk.Type ~= "CloseParentheses" do
         if paramTk.Type == "Identifier" then
+            if table.find(parameters, paramTk.Identifier) then
+                report(`Duplicate parameter '{ paramTk.Identifier }'.`, paramTk)
+            end
+
             table.insert(parameters, paramTk.Identifier)
             paramTk = nextToken(state)
 
@@ -652,9 +674,20 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
             if nextTk.Type == "OpenParentheses" then
                 state.position = parenParseState.position
                 state.line = parenParseState.line
+                state.char = parenParseState.char
 
                 inner = parseExpression(state, report) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression after parentheses.`, report)
                 state.position += 1 -- skip closing parens
+            elseif nextTk.Type == "Ellipsis" then
+                if token.Operator == "#" then
+                    state.position = parenParseState.position
+                    state.line = parenParseState.line
+                    state.char = parenParseState.char
+
+                    return ex({
+                        Type = "VariadicLength",
+                    }, token)
+                end
             else
                 inner = parseExpression(state, report, true) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression.`, report)
             end
@@ -718,9 +751,30 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
         }, token)
 
     elseif token.Type == "Ellipsis" then
-        return ex({
-            Type = "VariadicArguments",
-        }, token)
+        local selectorParseState = table.clone(state)
+        local selectorTk = nextToken(selectorParseState)
+
+        if selectorTk.Type == "OpenSquareBraces" then
+            state.position = selectorParseState.position
+            state.line = selectorParseState.line
+            state.char = selectorParseState.char
+
+            local selector = parseExpression(state, report) or invalidExpr(state, `Reached end-of-file parsing variadic argument selector.`, report)
+            local closingTk = nextToken(state)
+
+            if closingTk.Type ~= "CloseSquareBraces" then
+                report(`Expected closing square brackets for variadic argument selector, got { closingTk.Type } instead.`, closingTk)
+            end
+
+            return ex({
+                Type = "VariadicSelection",
+                Selection = selector,
+            }, token)
+        else
+            return ex({
+                Type = "VariadicArguments",
+            }, token)
+        end
     elseif token.Type == "EndOfFile" then
         return nil
     else
@@ -802,6 +856,14 @@ local function valToString(v: Value)
         end
 
         return `\{ { table.concat(items, ", ") } \}`
+    elseif v.Type == "Tuple" then
+        local items = table.create<<string>>(#v.Value)
+
+        for i, v in v.Value do
+            items[i] = valToString(v)
+        end
+
+        return `\[ { table.concat(items, ", ") } \]`
     else
         return tostring(if v.Type == "Function" then "function" else v.Value)
     end
@@ -962,7 +1024,7 @@ local function eval(expr: Expression): Value?
             local arguments = table.create<<Value>>(#expr.Call.Arguments)
 
             for i, a in expr.Call.Arguments do
-                if a.Type == "VariadicArguments" then
+                if a.Type == "Tuple" then
                     local varargs = callFrames[#callFrames].VariadicArguments
 
                     for vi, va in varargs do
@@ -1179,7 +1241,22 @@ local function eval(expr: Expression): Value?
             Value = values,
         }
     elseif expr.Type == "VariadicArguments" then
-        return callFrames[#callFrames].VariadicArguments[1]
+        return {
+            Type = "Tuple",
+            Value = callFrames[#callFrames].VariadicArguments,
+        }
+
+    elseif expr.Type == "VariadicSelection" then
+        local varargs = callFrames[#callFrames].VariadicArguments
+        local index = eval(expr.Selection) or nilValue()
+        assert(index.Type == "number", `Variadic selection was expected to be a number, got { index.Type }.`)
+
+        return varargs[index.Value] or nilValue()
+
+    elseif expr.Type == "VariadicLength" then
+        local varargs = callFrames[#callFrames].VariadicArguments
+        return numberValue(#varargs)
+
     elseif expr.Type == "IfCondition" then
         local conditionResult = eval(expr.Condition) or nilValue()
 
@@ -1429,6 +1506,10 @@ local function exprToStringShallow(expr: Expression)
         end
     elseif expr.Type == "VariadicArguments" then
         return "..."
+    elseif expr.Type == "VariadicSelection" then
+        return `...[{ exprToStringShallow(expr.Selection) }]`
+    elseif expr.Type == "VariadicLength" then
+        return `#...`
     elseif expr.Type == "InvalidSyntax" then
         return expr.Token
     else
@@ -1442,14 +1523,14 @@ local function errorReport(msg, expr: Expression)
     return errorType()
 end
 
-local function typeToString(ty: Type): string
-    local tyVarNameIndex = 0
+local tyVarNameIndex = 0
 
+local function typeToString(ty: Type): string
     local function variableName(tyvar: TypeVariable)
         if tyvar.Name then
             return tyvar.Name
         else
-            local name = string.char(tyVarNameIndex % 26 + 84)
+            local name = string.char((tyVarNameIndex + 19) % 26 + 65)
             tyvar.Name = name
             tyVarNameIndex += 1
 
@@ -1687,6 +1768,7 @@ end
 type InferenceState = {
     nonGeneric: { [Type]: true? },
     expectingRetTy: Type?,
+    expectingVariadicTy: Type?,
 }
 
 print("\n--")
@@ -1840,7 +1922,8 @@ local function infer(expr: Expression, state: InferenceState): Type
         return retTy
 
     elseif expr.Type == "Function" then
-        local paramTys = table.create<<Type>>(#expr.Function.Parameters)
+        local paramTys = table.create<<Type>>(#expr.Function.Parameters + 1)
+        local variadic = voidType()
         local retTy = typeVariable()
 
         local shadowed = {}
@@ -1853,12 +1936,20 @@ local function infer(expr: Expression, state: InferenceState): Type
             typeEnv[p] = tv
         end
 
-        local fnTy = functionType(paramTys, voidType(), retTy)
+        if expr.Function.Variadic then
+            variadic = typeVariable()
+            state.nonGeneric[variadic] = true
+        end
+
+        local fnTy = functionType(paramTys, variadic, retTy)
 
         if expr.Function.Name then
             shadowed[expr.Function.Name] = typeEnv[expr.Function.Name]
             typeEnv[expr.Function.Name] = fnTy
         end
+
+        local prevVariTy = state.expectingVariadicTy
+        state.expectingVariadicTy = variadic
 
         local prevRetTy = state.expectingRetTy
         state.expectingRetTy = retTy
@@ -1867,6 +1958,7 @@ local function infer(expr: Expression, state: InferenceState): Type
             infer(b, state)
         end
 
+        state.expectingVariadicTy = prevVariTy
         state.expectingRetTy = prevRetTy
 
         retTy = prune(retTy)
@@ -1883,6 +1975,8 @@ local function infer(expr: Expression, state: InferenceState): Type
             end
         end
 
+        state.nonGeneric[variadic] = nil
+
         if not foundRetTyInParameters and retTy.Kind == "Variable" then
             unify(retTy, voidType(), expr)
         end
@@ -1891,7 +1985,7 @@ local function infer(expr: Expression, state: InferenceState): Type
             typeEnv[expr.Function.Name] = shadowed[expr.Function.Name]
         end
 
-        fnTy = functionType(paramTys, voidType(), retTy)
+        fnTy = functionType(paramTys, variadic, retTy)
 
         if expr.Function.Name then
             typeEnv[expr.Function.Name] = fnTy
@@ -1922,7 +2016,17 @@ local function infer(expr: Expression, state: InferenceState): Type
         }
 
     elseif expr.Type == "VariadicArguments" then
-        return nilType()
+        assert(state.expectingVariadicTy, `'...' may only be referenced within function bodies.`)
+        return state.expectingVariadicTy
+
+    elseif expr.Type == "VariadicSelection" then
+        assert(state.expectingVariadicTy, `'...' may only be referenced within function bodies.`)
+        return state.expectingVariadicTy
+
+    elseif expr.Type == "VariadicLength" then
+        assert(state.expectingVariadicTy, `'...' may only be referenced within function bodies.`)
+        return numberType()
+
     elseif expr.Type == "InvalidSyntax" then
         return errorType()
     else
