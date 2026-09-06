@@ -597,6 +597,8 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                     Arguments = args,
                 },
             }, token)
+        elseif nextTk.Type == "Identifier" then
+            return invalidExpr(state, `Cannot have two identifiers next to each other.`, report)
         else
             left = ex({
                 Type = "Reference",
@@ -900,7 +902,6 @@ type CallFrame = {
 }
 
 local callFrames: { CallFrame } = {}
-
 local runUnprotected
 
 local function eval(expr: Expression): Value?
@@ -1093,6 +1094,7 @@ local function eval(expr: Expression): Value?
                 assert(expr.Left.Type == "Reference", "This should've been caught at compile time.")
 
                 env[expr.Left.Reference] = rightEval
+                return rightEval
             else
                 unreachable(expr.Operator)
                 error(`Unreachable.`)
@@ -1165,9 +1167,9 @@ local function eval(expr: Expression): Value?
         end
 
         if conditionResult.Value == true then
-            runUnprotected(expr.IfBody)
+            conditionResult = runUnprotected(expr.IfBody)
         elseif expr.ElseBody then
-            runUnprotected(expr.ElseBody)
+            conditionResult = runUnprotected(expr.ElseBody)
         end
 
         return conditionResult
@@ -1178,15 +1180,19 @@ local function eval(expr: Expression): Value?
 end
 
 function runUnprotected(exprs: { read Expression }): Value?
+    local last = nil
+
     for _, expr in exprs do
         local result = eval(expr)
 
         if expr.Type == "Return" then
             return result
         end
+
+        last = result
     end
 
-    return nil
+    return last
 end
 
 local function run(exprs: { read Expression }): Value?
@@ -1237,15 +1243,11 @@ let c_wrong = function(wrongAgain)
 end
 
 function d_fac(n)
-    let m = 0
-
     if n > 1 then
-        m := n * d_fac(n - 1)
+        return n * d_fac(n - 1)
     else
-        m := n
+        return n
     end
-
-    return m
 end
 
 print(d_fac(5))
@@ -1263,6 +1265,8 @@ end
 let e_cool_list_full_of_cool_things = { 1, 2, true }
 let e_second = e_swap(e_cool_list_full_of_cool_things, 1, 3)
 print(e_second)
+
+let p = if true then 1 else 0 end
 
 ]]
 
@@ -1729,17 +1733,25 @@ local function infer(expr: Expression, state: InferenceState): Type
         local condition = infer(expr.Condition, state)
         unify(condition, booleanType(), expr.Condition)
 
+        local result = typeVariable()
+
         for _, v in expr.IfBody do
-            infer(v, state)
+            result = infer(v, state)
         end
 
         if expr.ElseBody then
+            local last
+
             for _, v in expr.ElseBody do
-                infer(v, state)
+                last = infer(v, state)
+            end
+
+            if last then
+                unify(last, result, expr.ElseBody[#expr.ElseBody])
             end
         end
 
-        return condition
+        return result
 
     elseif expr.Type == "Call" then
         local fnTy = typeEnv[expr.Call.Identifier]
