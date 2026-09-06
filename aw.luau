@@ -1066,6 +1066,11 @@ local function eval(expr: Expression): Value?
             end
 
             return { Type = "string", Value = leftEval.Value .. rightEval.Value }
+        elseif expr.Operator == ":=" then
+            assert(expr.Left.Type == "Reference", "This should've been caught at compile time.")
+
+            env[expr.Left.Reference] = rightEval
+            return rightEval
         else
             if leftEval.Type ~= "number" then
                 fail(`Expected LHS of '{ expr.Operator }' operation to be a number, got a { leftEval.Type } instead.`)
@@ -1090,11 +1095,6 @@ local function eval(expr: Expression): Value?
                 return { Type = "number", Value = left / right }
             elseif expr.Operator == "//" then
                 return { Type = "number", Value = left // right }
-            elseif expr.Operator == ":=" then
-                assert(expr.Left.Type == "Reference", "This should've been caught at compile time.")
-
-                env[expr.Left.Reference] = rightEval
-                return rightEval
             else
                 unreachable(expr.Operator)
                 error(`Unreachable.`)
@@ -1265,8 +1265,6 @@ end
 let e_cool_list_full_of_cool_things = { 1, 2, true }
 let e_second = e_swap(e_cool_list_full_of_cool_things, 1, 3)
 print(e_second)
-
-let p = if true then 1 else 0 end
 
 ]]
 
@@ -1694,8 +1692,11 @@ local function infer(expr: Expression, state: InferenceState): Type
                 end
 
                 local now = infer(expr.Right, state)
-                unify(now, prev, expr.Right)
+                if now.Kind == "Operator" and now.Name == "void" then
+                    return errorReport(`Tried to mutate '{ expr.Left.Reference }' to void.`, expr)
+                end
 
+                unify(now, prev, expr.Right)
                 return prev
             else
                 return errorType() -- Error would've already been reported by compiler
