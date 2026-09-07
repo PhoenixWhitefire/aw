@@ -100,8 +100,8 @@ type TokenData =
     | OperatorToken
     | BasicToken
 
-type Position = { line: number, char: number }
-type Token = TokenData & { position: Position }
+type Position = { Line: number, Character: number, Offset: number }
+type Token = TokenData & { Position: Position }
 
 type ExpressionData =
     | {
@@ -175,7 +175,7 @@ type ExpressionData =
         read Token: string,
       }
 
-type Expression = ExpressionData & { position: Position }
+type Expression = ExpressionData & { Position: Position }
 
 local keywords: { read [string]: Keyword? } = {
     ["nil"] = "nil",
@@ -238,60 +238,60 @@ local function isSeparator(c: string)
         or operators[c]
 end
 
-local function nextToken(state: { position: number, line: number, char: number, program: string }): Token
+local function nextToken(state: ParseState): Token
     local token = ""
     local c
 
     repeat
-        c, state.position = nextCharacter(state.program, state.position)
-        state.char += 1
+        c, state.Position.Offset = nextCharacter(state.Program, state.Position.Offset)
+        state.Position.Character += 1
 
         if c == "\n" then
-            state.line += 1
-            state.char = 1
+            state.Position.Line += 1
+            state.Position.Character = 1
         end
     until not isWhitespace(c)
 
-    state.char += 1
-    local start = { line = state.line, char = state.char }
+    state.Position.Character += 1
+    local start = table.clone(state.Position)
 
     local function tk(t: TokenData): Token
         local tok: Token = t :: Token
-        tok.position = start
+        tok.Position = start
 
         return tok
     end
 
     if isSeparator(c) then
-        local next, pos = nextCharacter(state.program, state.position)
+        local next, pos = nextCharacter(state.Program, state.Position.Offset)
 
         if next == "=" or next == "-" then
             token = c .. next
-            state.position = pos
+            state.Position.Offset = pos
         else
             token = c
         end
 
         if token == "--" then
             repeat
-                next, pos = nextCharacter(state.program, state.position)
-                state.position = pos
+                next, pos = nextCharacter(state.Program, state.Position.Offset)
+                state.Position.Offset = pos
             until next == "\n" or next == ""
 
-            state.char = 1
-            state.line += 1
+            state.Position.Character = 1
+            state.Position.Line += 1
             return nextToken(state)
         end
     else
-        local before = state.position
+        local before = state.Position.Offset
 
         repeat
             token ..= c
-            before = state.position
-            c, state.position = nextCharacter(state.program, state.position)
+            before = state.Position.Offset
+            c, state.Position.Offset = nextCharacter(state.Program, state.Position.Offset)
         until isSeparator(c) or (tonumber(token) and not tonumber(c) and c ~= ".")
 
-        state.position = before
+        state.Position.Offset = before
     end
 
     if tonumber((nextCharacter(token, 1))) then
@@ -311,7 +311,7 @@ local function nextToken(state: { position: number, line: number, char: number, 
     elseif token == '"' then
         local strlit = ""
         local nextC = ""
-        nextC, state.position = nextCharacter(state.program, state.position)
+        nextC, state.Position.Offset = nextCharacter(state.Program, state.Position.Offset)
 
         while nextC ~= '"' do
             if isEof(nextC) then
@@ -322,7 +322,7 @@ local function nextToken(state: { position: number, line: number, char: number, 
             end
 
             strlit ..= nextC
-            nextC, state.position = nextCharacter(state.program, state.position)
+            nextC, state.Position.Offset = nextCharacter(state.Program, state.Position.Offset)
         end
 
         return tk{
@@ -362,23 +362,32 @@ local function nextToken(state: { position: number, line: number, char: number, 
     }
 end
 
+local function peekNextToken(state: ParseState): (Token, () -> ())
+    local peekState = table.clone(state)
+    peekState.Position = table.clone(peekState.Position)
+
+    return nextToken(peekState), function()
+        state.Position = peekState.Position
+    end
+end
+
 type ParseState = {
-    program: string,
-    position: number,
-    line: number,
-    char: number,
-    functionDepth: number,
+    Program: string,
+    Position: Position,
+    FunctionDepth: number,
 }
 
-local function ex(expr: ExpressionData, t: { position: Position }): Expression
+type Report = (string, { Position: Position }) -> ()
+
+local function ex(expr: ExpressionData, t: { Position: Position }): Expression
     local x: Expression = expr :: Expression
-    x.position = t.position
+    x.Position = table.clone(t.Position)
 
     return x
 end
 
 local function invalidExpr(state, msg, report): Expression
-    local withPos = { position = { line = state.line, char = state.char } }
+    local withPos = { Position = table.clone(state.Position) }
     report(msg, withPos)
 
     return ex({
@@ -389,10 +398,9 @@ end
 
 local parseExpression
 
-local function parseBody(state: ParseState, report: (string, { position: Position }) -> (), stopAtElse: boolean?): ({ Expression }, Token)
+local function parseBody(state: ParseState, report: Report, stopAtElse: boolean?): ({ Expression }, Token)
     local body: { Expression } = {}
-    local endTkParseState = table.clone(state)
-    local endTk = nextToken(endTkParseState)
+    local endTk, consumeEnd = peekNextToken(state)
 
     while endTk.Type ~= "Keyword" or (endTk.Keyword ~= "end" and (not stopAtElse or endTk.Keyword ~= "else")) do
         if endTk.Type == "EndOfFile" then
@@ -406,17 +414,14 @@ local function parseBody(state: ParseState, report: (string, { position: Positio
         end
 
         table.insert(body, expr)
-        endTkParseState = table.clone(state)
-        endTk = nextToken(endTkParseState)
+        endTk, consumeEnd = peekNextToken(state)
     end
 
-    state.position = endTkParseState.position
-    state.line = endTkParseState.line
-    state.char = endTkParseState.char
+    consumeEnd()
     return body, endTk
 end
 
-local function parseBinaryOperation(state: ParseState, report: (string, { position: Position }) -> (), left: Expression, opTk: OperatorToken): Expression
+local function parseBinaryOperation(state: ParseState, report: Report, left: Expression, opTk: OperatorToken): Expression
     if opTk.Operator == ":=" and left.Type ~= "Reference" then
         report(`Mutation operator expects LHS to be a reference, got a { left.Type } instead.`, left)
     end
@@ -429,7 +434,7 @@ local function parseBinaryOperation(state: ParseState, report: (string, { positi
     }, left)
 end
 
-local function parseFunction(state: ParseState, report: (string, { position: Position }) -> (), token: Token): Expression
+local function parseFunction(state: ParseState, report: Report, token: Token): Expression
     local name = nil
     local openParenTk = nextToken(state)
 
@@ -474,11 +479,11 @@ local function parseFunction(state: ParseState, report: (string, { position: Pos
         end
     end
 
-    state.functionDepth += 1
+    state.FunctionDepth += 1
 
     local body = parseBody(state, report)
 
-    state.functionDepth -= 1
+    state.FunctionDepth -= 1
 
     return ex({
         Type = "Function",
@@ -491,7 +496,7 @@ local function parseFunction(state: ParseState, report: (string, { position: Pos
     }, token)
 end
 
-function parseExpression(state: ParseState, report: (string, { position: Position }) -> (), shallow: boolean?): Expression?
+function parseExpression(state: ParseState, report: Report, shallow: boolean?): Expression?
     local token = nextToken(state)
 
     if token.Type == "InvalidSyntax" then
@@ -550,10 +555,11 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
         elseif token.Keyword == "function" then
             return parseFunction(state, report, token)
         elseif token.Keyword == "return" then
-            if state.functionDepth == 0 then
+            if state.FunctionDepth == 0 then
                 return invalidExpr(state, "Cannot 'return' outside of functions.", report)
             else
-                local nextTk = nextToken(table.clone(state))
+                -- TODO not consuming it?
+                local nextTk, _ = peekNextToken(state)
                 local expr = if nextTk.Type == "Keyword" and nextTk.Keyword == "end" then nil else parseExpression(state, report)
 
                 return ex({
@@ -598,14 +604,12 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
     elseif token.Type == "Identifier" then
         local left: Expression
 
-        local callParseState = table.clone(state)
-        local nextTk = nextToken(callParseState)
+        local nextTk, consumeNext = peekNextToken(state)
 
         if nextTk.Type == "OpenParentheses" then
-            state.position = callParseState.position
-            state.line = callParseState.line
+            consumeNext()
 
-            local argC = nextCharacter(state.program, state.position)
+            local argC = nextCharacter(state.Program, state.Position.Offset)
             local args = {}
 
             while argC ~= ")" do
@@ -615,10 +619,10 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 end
 
                 table.insert(args, arg)
-                argC = nextCharacter(state.program, state.position)
+                argC = nextCharacter(state.Program, state.Position.Offset)
             end
 
-            state.position += 1 -- skip parens
+            state.Position.Offset += 1 -- skip parens
 
             left = ex({
                 Type = "Call",
@@ -635,9 +639,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
         end
 
         if not shallow and nextTk.Type == "Operator" then
-            state.position = callParseState.position
-            state.line = callParseState.line
-
+            consumeNext()
             return parseBinaryOperation(state, report, left, nextTk)
         else
             return left
@@ -649,40 +651,33 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
             Constant = token.Literal,
         }, token)
 
-        local operatorParseState = table.clone(state)
-        local nextTk = nextToken(operatorParseState)
+        local nextTk, consumeOperator = peekNextToken(state)
 
         if not shallow and nextTk.Type == "Operator" then
-            state.position = operatorParseState.position
-            state.line = operatorParseState.line
-
+            consumeOperator()
             return parseBinaryOperation(state, report, constant, nextTk)
         else
             return constant
         end
     elseif token.Type == "Comma" then
         -- TODO check
-        state.position += 1
+        state.Position.Offset += 1
         return parseExpression(state, report)
     elseif token.Type == "Operator" then
         if token.Operator == "-" or token.Operator == "#" then
             local inner: Expression
 
-            local parenParseState = table.clone(state)
-            local nextTk = nextToken(parenParseState)
+            local nextTk, consumeNext = peekNextToken(state)
 
             if nextTk.Type == "OpenParentheses" then
-                state.position = parenParseState.position
-                state.line = parenParseState.line
-                state.char = parenParseState.char
+                consumeNext()
 
                 inner = parseExpression(state, report) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression after parentheses.`, report)
-                state.position += 1 -- skip closing parens
+                state.Position.Offset += 1 -- skip closing parens
+                state.Position.Character += 1
             elseif nextTk.Type == "Ellipsis" then
                 if token.Operator == "#" then
-                    state.position = parenParseState.position
-                    state.line = parenParseState.line
-                    state.char = parenParseState.char
+                    consumeNext()
 
                     return ex({
                         Type = "VariadicLength",
@@ -698,13 +693,10 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 Operand = inner,
             }, token)
 
-            local maybeOpParseState = table.clone(state)
-            local maybeOpTk = nextToken(maybeOpParseState)
+            local maybeOpTk, consumeOperator = peekNextToken(state)
 
             if not shallow and maybeOpTk.Type == "Operator" then
-                state.position = maybeOpParseState.position
-                state.line = maybeOpParseState.line
-
+                consumeOperator()
                 return parseBinaryOperation(state, report, negation, maybeOpTk)
             else
                 return negation
@@ -719,8 +711,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
         end
     elseif token.Type == "OpenCurlyBraces" then
         local items: { Expression } = {}
-        local itemParseState = table.clone(state)
-        local itemTk = nextToken(itemParseState)
+        local itemTk, consumeClosingParentheses = peekNextToken(state)
 
         while itemTk.Type ~= "CloseCurlyBraces" do
             local item = parseExpression(state, report)
@@ -731,8 +722,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
                 return invalidExpr(state, `Reached end-of-file parsing list items.`, report)
             end
 
-            itemParseState = table.clone(state)
-            itemTk = nextToken(itemParseState)
+            itemTk, consumeClosingParentheses = peekNextToken(state)
 
             if itemTk.Type ~= "CloseCurlyBraces" then
                 if itemTk.Type ~= "Comma" then
@@ -741,9 +731,7 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
             end
         end
 
-        state.position = itemParseState.position
-        state.line = itemParseState.line
-        state.char = itemParseState.char
+        consumeClosingParentheses()
 
         return ex({
             Type = "List",
@@ -751,13 +739,10 @@ function parseExpression(state: ParseState, report: (string, { position: Positio
         }, token)
 
     elseif token.Type == "Ellipsis" then
-        local selectorParseState = table.clone(state)
-        local selectorTk = nextToken(selectorParseState)
+        local selectorTk, consumeSelector = peekNextToken(state)
 
         if selectorTk.Type == "OpenSquareBraces" then
-            state.position = selectorParseState.position
-            state.line = selectorParseState.line
-            state.char = selectorParseState.char
+            consumeSelector()
 
             local selector = parseExpression(state, report) or invalidExpr(state, `Reached end-of-file parsing variadic argument selector.`, report)
             local closingTk = nextToken(state)
@@ -806,27 +791,29 @@ end
 
 local function parse(program: string): { Success: boolean, Expressions: { Expression } }
     local state: ParseState = {
-        program = program,
-        position = 1,
-        line = 1,
-        char = 1,
-        functionDepth = 0,
+        Program = program,
+        Position = {
+            Line = 1,
+            Character = 1,
+            Offset = 1,
+        },
+        FunctionDepth = 0,
     }
 
     -- TODO luau extraneous annotation
     local exprs: { Expression } = {}
     local success = true
-    local tk = nextToken(table.clone(state))
+    local tk = peekNextToken(state)
 
     while tk.Type ~= "EndOfFile" do
         local expr = parseExpression(state, function(s, e)
             success = false
-            print(`{ e.position.line }:{ e.position.char }: { s }`)
+            print(`{ e.Position.Line }:{ e.Position.Character }: { s }`)
         end)
         assert(expr)
 
         table.insert(exprs, expr)
-        tk = nextToken(table.clone(state))
+        tk = peekNextToken(state)
     end
 
     return { Success = success, Expressions = exprs }
@@ -842,14 +829,14 @@ local function makeLuauFuncValue(fn: ({ Value }) -> Value?): Value
     }
 end
 
-local function valToString(v: Value)
+local function valueToString(v: Value)
     if v.Type == "Function" then
         return "function"
     elseif v.Type == "List" then
         local items = table.create<<string>>(#v.Value)
 
         for i, v in v.Value do
-            items[i] = valToString(v)
+            items[i] = valueToString(v)
         end
 
         return `\{ { table.concat(items, ", ") } \}`
@@ -857,7 +844,7 @@ local function valToString(v: Value)
         local items = table.create<<string>>(#v.Value)
 
         for i, v in v.Value do
-            items[i] = valToString(v)
+            items[i] = valueToString(v)
         end
 
         return `\[ { table.concat(items, ", ") } \]`
@@ -887,7 +874,7 @@ local env: { [string]: Value? } = {
         local str = ""
 
         for _, a in args do
-            str ..= valToString(a) .. " "
+            str ..= valueToString(a) .. " "
         end
 
         str = string.sub(str, 1, #str - 1)
@@ -905,7 +892,7 @@ local env: { [string]: Value? } = {
     tostring = makeLuauFuncValue(function(args)
         assert(#args == 1, `'tostring' requires 1 argument.`)
 
-        return stringValue(valToString(args[1]))
+        return stringValue(valueToString(args[1]))
     end),
 
     tonumber = makeLuauFuncValue(function(args)
@@ -993,7 +980,7 @@ local function eval(expr: Expression): Value?
     assert(expr.Type ~= "InvalidSyntax")
 
     local function fail(msg): never
-        error(`{ expr.position.line }:{ expr.position.char }: { msg }`)
+        error(`{ expr.Position.Line }:{ expr.Position.Character }: { msg }`)
     end
 
     if expr.Type == "Declaration" then
@@ -1405,7 +1392,7 @@ if result.Success then
     local returned = run(result.Expressions)
 
     if returned then
-        print(`= { returned.Value }`)
+        print(`= { valueToString(returned.Value) }`)
     end
 else
     print("Compilation failed.")
@@ -1551,7 +1538,7 @@ local function exprToStringShallow(expr: Expression)
 end
 
 local function errorReport(msg, expr: Expression)
-    print(`{ expr.position.line }:{ expr.position.char } - { exprToStringShallow(expr) }: { msg }`)
+    print(`{ expr.Position.Line }:{ expr.Position.Character } - { exprToStringShallow(expr) }: { msg }`)
     return errorType()
 end
 
@@ -1566,16 +1553,21 @@ local function prune(ty: Type): Type
     end
 end
 
-local tyVarNameIndex = 0
+local typeVariableNameCount = 0
 
 local function typeToString(ty: Type): string
     local function variableName(tyvar: TypeVariable)
         if tyvar.Name then
             return tyvar.Name
         else
-            local name = string.char((tyVarNameIndex + 19) % 26 + 65)
+            local name = string.char((typeVariableNameCount + 19) % 26 + 65)
+
+            if typeVariableNameCount > 25 then
+                name ..= typeVariableNameCount // 25 + 1
+            end
+
             tyvar.Name = name
-            tyVarNameIndex += 1
+            typeVariableNameCount += 1
 
             return name
         end
@@ -1584,7 +1576,13 @@ local function typeToString(ty: Type): string
     local function toString(ty: Type)
         if ty.Kind == "Variable" then
             if ty.Instance then
-                return typeToString(ty.Instance)
+                local str = typeToString(ty.Instance)
+
+                if logInference and ty.Instance.Kind == "Variable" then
+                    return `'{str}`
+                else
+                    return str
+                end
             else
                 return variableName(ty)
             end
@@ -1719,6 +1717,20 @@ local function isErrorSuppressing(ty: Type)
     return false
 end
 
+local function deepCopy(tab)
+    local t = table.clone(tab)
+
+    for k, v in t do
+        if typeof(v) == "table" then
+            t[k] = deepCopy(v)
+        else
+            t[k] = v
+        end
+    end
+
+    return t
+end
+
 type UnificationStep = {
     read A: Type,
     read B: Type,
@@ -1730,7 +1742,7 @@ type UnificationStep = {
 type InferenceStep = {
     read Source: Expression,
     read Unifications: { UnificationStep },
-    read Children: { InferenceStep }
+    read Children: { InferenceStep },
 }
 
 local totalUnificationSteps = 0
@@ -1743,9 +1755,13 @@ local function unify_(a: Type, b: Type, expr: Expression, depth: number): boolea
     if logInference then
         totalUnificationSteps += 1
 
+        -- Ensure type variable names are generated.
+        typeToString(a)
+        typeToString(b)
+
         local step: UnificationStep = {
-            A = a,
-            B = b,
+            A = deepCopy(a),
+            B = deepCopy(b),
             Source = expr,
             Succeeded = true,
             Children = {}
@@ -1777,7 +1793,7 @@ local function unify_(a: Type, b: Type, expr: Expression, depth: number): boolea
         end
 
     elseif a.Kind == "Operator" and b.Kind == "Variable" then
-        return unify(b, a, expr, depth + 1)
+        success = unify(b, a, expr, depth + 1)
 
     elseif a.Kind == "Operator" and b.Kind == "Operator" then
         -- `unknown` always unifies
@@ -1831,7 +1847,7 @@ local function unify_(a: Type, b: Type, expr: Expression, depth: number): boolea
     return success
 end
 
-function unify(a, b, expr, depth: number?)
+function unify(a: Type, b: Type, expr: Expression, depth: number?)
     depth = depth or 1
     local prevStep = unificationStep
 
@@ -1846,9 +1862,9 @@ function unify(a, b, expr, depth: number?)
 
     if not success then
         if depth > 1 then
-            print(`{ expr.position.line }:{ expr.position.char }: { typeToString(a) } is not { typeToString(b) }, so`)
+            print(`{ expr.Position.Line }:{ expr.Position.Character }: { typeToString(a) } is not { typeToString(b) }, so`)
         else
-            print(`{ expr.position.line }:{ expr.position.char }: { typeToString(a) } is not { typeToString(b) }.`)
+            print(`{ expr.Position.Line }:{ expr.Position.Character }: { typeToString(a) } is not { typeToString(b) }.`)
         end
     end
 
@@ -1975,6 +1991,7 @@ local function infer_(expr: Expression, state: InferenceState): Type
                     return errorReport(`Tried to mutate '{ expr.Left.Reference }' to void.`, expr)
                 end
 
+                -- TODO luau, soundness bug?
                 unify(now, prev, expr.Right)
                 return prev
             else
@@ -2199,6 +2216,7 @@ function infer(expr, state)
 end
 
 for _, v in result.Expressions do
+    inferenceStep = nil
     infer(v, { nonGeneric = {} })
 
     if logInference then
@@ -2237,7 +2255,7 @@ if logInference then
 
     local function logInferenceStep(step: InferenceStep, indent: string?)
         indent = indent or ""
-        print(`{ indent }Infer { step.Source.position.line }:{ step.Source.position.char }:{ exprToStringShallow(step.Source) }.`)
+        print(`{ indent }Infer { step.Source.Position.Line }:{ step.Source.Position.Character }:{ exprToStringShallow(step.Source) }.`)
 
         for _, unification in step.Unifications do
             logUnificationStep(unification, indent .. "  ")
