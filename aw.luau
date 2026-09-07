@@ -1908,7 +1908,7 @@ local function infer_(expr: Expression, state: InferenceState): Type
     if expr.Type == "Declaration" then
         local ty = infer(expr.Declaration.Value, state)
 
-        if ty.Kind == "Operator" and ty.Name == "void" then
+        if isVoid(ty) then
             ty = errorReport(`Tried to assign '{ expr.Declaration.Name }' to an expression that returns 'void'.`, expr)
         end
 
