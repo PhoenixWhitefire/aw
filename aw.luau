@@ -2004,9 +2004,17 @@ local function infer_(expr: Expression, state: InferenceState): Type
             return errorReport(`Unexpected 'return' outside of function body.`, expr)
         end
 
-        local here = if expr.Return then infer(expr.Return, state) else voidType()
-        unify(here, state.expectingRetTy, expr)
+        local here = voidType()
 
+        if expr.Return then
+            here = infer(expr.Return, state)
+
+            if isVoid(here) then
+                here = errorReport(`Trying to return a 'void' value.`, expr)
+            end
+        end
+
+        unify(here, state.expectingRetTy, expr)
         return voidType()
 
     elseif expr.Type == "IfCondition" then
