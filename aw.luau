@@ -434,6 +434,21 @@ local function parseBinaryOperation(state: ParseState, report: Report, left: Exp
     }, left)
 end
 
+local function maybeCombineWithBinaryOperation(state: ParseState, report: Report, left: Expression, shallow: boolean?)
+    if shallow then
+        return left
+    else
+        local maybeOperator, consumeOperator = peekNextToken(state)
+
+        if maybeOperator.Type == "Operator" then
+            consumeOperator()
+            return parseBinaryOperation(state, report, left, maybeOperator)
+        else
+            return left
+        end
+    end
+end
+
 local function parseFunction(state: ParseState, report: Report, token: Token): Expression
     local name = nil
     local openParenTk = nextToken(state)
@@ -603,7 +618,6 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
         end
     elseif token.Type == "Identifier" then
         local left: Expression
-
         local nextTk, consumeNext = peekNextToken(state)
 
         if nextTk.Type == "OpenParentheses" then
@@ -638,12 +652,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
             }, token)
         end
 
-        if not shallow and nextTk.Type == "Operator" then
-            consumeNext()
-            return parseBinaryOperation(state, report, left, nextTk)
-        else
-            return left
-        end
+        return maybeCombineWithBinaryOperation(state, report, left, shallow)
     elseif token.Type == "Literal" then
         -- TODO luau does not report error when `position` is not attached even though the annotation is explicit
         local constant: Expression = ex({
@@ -651,14 +660,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
             Constant = token.Literal,
         }, token)
 
-        local nextTk, consumeOperator = peekNextToken(state)
-
-        if not shallow and nextTk.Type == "Operator" then
-            consumeOperator()
-            return parseBinaryOperation(state, report, constant, nextTk)
-        else
-            return constant
-        end
+        return maybeCombineWithBinaryOperation(state, report, constant)
     elseif token.Type == "Comma" then
         -- TODO check
         state.Position.Offset += 1
@@ -693,14 +695,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
                 Operand = inner,
             }, token)
 
-            local maybeOpTk, consumeOperator = peekNextToken(state)
-
-            if not shallow and maybeOpTk.Type == "Operator" then
-                consumeOperator()
-                return parseBinaryOperation(state, report, negation, maybeOpTk)
-            else
-                return negation
-            end
+            return maybeCombineWithBinaryOperation(state, report, negation)
         else
             report(`Unexpected '{ token.Operator }' operator.`, token)
 
@@ -751,10 +746,10 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
                 report(`Expected closing square brackets for variadic argument selector, got { closingTk.Type } instead.`, closingTk)
             end
 
-            return ex({
+            return maybeCombineWithBinaryOperation(state, report, ex({
                 Type = "VariadicSelection",
                 Selection = selector,
-            }, token)
+            }, token))
         else
             return ex({
                 Type = "VariadicArguments",
@@ -976,7 +971,7 @@ type CallFrame = {
 local callFrames: { CallFrame } = {}
 local runUnprotected
 
-local function eval(expr: Expression): Value?
+local function evaluate(expr: Expression): Value?
     assert(expr.Type ~= "InvalidSyntax")
 
     local function fail(msg): never
@@ -986,7 +981,7 @@ local function eval(expr: Expression): Value?
     if expr.Type == "Declaration" then
         local name = expr.Declaration.Name
 
-        local v = eval(expr.Declaration.Value)
+        local v = evaluate(expr.Declaration.Value)
         env[name] = v or nilValue()
 
         return v
@@ -1015,7 +1010,7 @@ local function eval(expr: Expression): Value?
                         arguments[i + vi - 1] = va
                     end
                 else
-                    arguments[i] = eval(a)
+                    arguments[i] = evaluate(a)
                 end
             end
 
@@ -1027,10 +1022,7 @@ local function eval(expr: Expression): Value?
                 table.remove(callFrames)
                 return returned
             else
-                local shadowed = {}
-
                 for i, p in fn.Value.Parameters do
-                    shadowed[p] = env[p]
                     env[p] = arguments[i]
                 end
 
@@ -1038,7 +1030,7 @@ local function eval(expr: Expression): Value?
 
                 if #fn.Value.Parameters < #expr.Call.Arguments and fn.Value.Variadic then
                     for i = #fn.Value.Parameters + 1, #expr.Call.Arguments do
-                        table.insert(variadicArgs, eval(expr.Call.Arguments[i]))
+                        table.insert(variadicArgs, evaluate(expr.Call.Arguments[i]))
                     end
                 end
 
@@ -1056,10 +1048,6 @@ local function eval(expr: Expression): Value?
                     returned = (data :: any).NormalReturnValue
                 else
                     error(data)
-                end
-
-                for _, p in fn.Value.Parameters do
-                    env[p] = shadowed[p]
                 end
 
                 return returned
@@ -1081,8 +1069,8 @@ local function eval(expr: Expression): Value?
         end
 
     elseif expr.Type == "BinaryOperation" then
-        local leftEval = eval(expr.Left) or nilValue()
-        local rightEval = eval(expr.Right) or nilValue()
+        local leftEval = evaluate(expr.Left) or nilValue()
+        local rightEval = evaluate(expr.Right) or nilValue()
 
         if expr.Operator == "==" or expr.Operator == "~=" or expr.Operator == ">" or expr.Operator == ">="
             or expr.Operator == "<" or expr.Operator == "<="
@@ -1169,7 +1157,7 @@ local function eval(expr: Expression): Value?
             end
         end
     elseif expr.Type == "UnaryOperation" then
-        local operandEval = eval(expr.Operand) or nilValue()
+        local operandEval = evaluate(expr.Operand) or nilValue()
 
         if expr.Operator == "-" then
             if operandEval.Type ~= "number" then
@@ -1211,13 +1199,13 @@ local function eval(expr: Expression): Value?
 
         error({
             NormalReturn = true,
-            NormalReturnValue = if expr.Return then eval(expr.Return) else nil,
+            NormalReturnValue = if expr.Return then evaluate(expr.Return) else nil,
         })
     elseif expr.Type == "List" then
         local values = table.create<<Value>>(#expr.List)
 
         for i, v in expr.List do
-            values[i] = eval(v)
+            values[i] = evaluate(v)
         end
 
         return {
@@ -1225,14 +1213,11 @@ local function eval(expr: Expression): Value?
             Value = values,
         }
     elseif expr.Type == "VariadicArguments" then
-        return {
-            Type = "Tuple",
-            Value = callFrames[#callFrames].VariadicArguments,
-        }
+        return callFrames[#callFrames].VariadicArguments[1] or nilValue()
 
     elseif expr.Type == "VariadicSelection" then
         local varargs = callFrames[#callFrames].VariadicArguments
-        local index = eval(expr.Selection) or nilValue()
+        local index = evaluate(expr.Selection) or nilValue()
         assert(index.Type == "number", `Variadic selection was expected to be a number, got { index.Type }.`)
 
         return varargs[index.Value] or nilValue()
@@ -1242,7 +1227,7 @@ local function eval(expr: Expression): Value?
         return numberValue(#varargs)
 
     elseif expr.Type == "IfCondition" then
-        local conditionResult = eval(expr.Condition) or nilValue()
+        local conditionResult = evaluate(expr.Condition) or nilValue()
 
         if conditionResult.Type ~= "boolean" then
             fail(`Expected boolean for condition, got { conditionResult.Type }.`)
@@ -1266,7 +1251,7 @@ function runUnprotected(exprs: { read Expression }): Value?
     local last = nil
 
     for _, expr in exprs do
-        local result = eval(expr)
+        local result = evaluate(expr)
 
         if expr.Type == "Return" then
             return result
@@ -1347,6 +1332,24 @@ let e_cool_list_full_of_cool_things = { 1, 2, true }
 let e_second = e_swap(e_cool_list_full_of_cool_things, 1, 3)
 print(e_second)
 
+function f_compose(f, g)
+    return function(h)
+        return g(f(h))
+    end
+end
+
+let f_add = function(x)
+    return x + 1
+end
+
+let f_mul = function(x)
+    return x * 2
+end
+
+let f_addmul = f_compose(f_add, f_mul)
+let f_result = f_addmul(2)
+print(f_result)
+
 ]]
 
 local logInference = false
@@ -1392,7 +1395,7 @@ if result.Success then
     local returned = run(result.Expressions)
 
     if returned then
-        print(`= { valueToString(returned.Value) }`)
+        print(`= { valueToString(returned) }`)
     end
 else
     print("Compilation failed.")
@@ -1591,7 +1594,7 @@ local function typeToString(ty: Type): string
                 return ty.Name
             elseif ty.Name == "Function" then
                 local params = table.create<<string>>(#ty.Types)
-                local ret = "void"
+                local ret = nil
 
                 for i, t in ty.Types do
                     if i == #ty.Types - 1 then
@@ -1605,6 +1608,7 @@ local function typeToString(ty: Type): string
                     end
                 end
 
+                assert(ret)
                 return `({ table.concat(params, ", ") }) -> { ret }`
             else
                 local stringified = table.create<<string>>(#ty.Types)
@@ -1651,6 +1655,11 @@ end
 local function isVoid(ty: Type)
     local pr = prune(ty)
     return pr.Kind == "Operator" and pr.Name == "void"
+end
+
+local function isUnknown(ty: Type)
+    local pr = prune(ty)
+    return pr.Kind == "Operator" and pr.Name == "unknown"
 end
 
 local function isGeneric(v: Type, nonGenerics: { [Type]: true? })
@@ -1749,9 +1758,10 @@ local totalUnificationSteps = 0
 local inferenceStep: InferenceStep? = nil
 local unificationStep: UnificationStep? = nil
 
-local unify
+local function unify(a: Type, b: Type, expr: Expression, depth: number?): boolean
+    depth = depth or 1
+    local prevStep = unificationStep
 
-local function unify_(a: Type, b: Type, expr: Expression, depth: number): boolean
     if logInference then
         totalUnificationSteps += 1
 
@@ -1787,7 +1797,7 @@ local function unify_(a: Type, b: Type, expr: Expression, depth: number): boolea
             if occursInType(a, b) then
                 a.Instance = errorReport(`Recursive unification, { typeToString(b) } contains { typeToString(a) }.`, expr)
                 success = false
-            else
+            elseif not isUnknown(b) then -- `unknown` *always* "succeeds" in unification, but it should never actually instantiate.
                 a.Instance = b
             end
         end
@@ -1799,6 +1809,7 @@ local function unify_(a: Type, b: Type, expr: Expression, depth: number): boolea
         -- `unknown` always unifies
         if (a.Name ~= b.Name or #a.Types ~= #b.Types) and (a.Name ~= "unknown" and b.Name ~= "unknown") then
             success = false
+            local reportMismatch = true
 
             if a.Name == "Function" and b.Name == "Function" then
                 if not isVoid(a.Types[#a.Types - 1]) and #b.Types > #a.Types - 1 and b.Types[#b.Types - 1].Kind == "Variable" then
@@ -1818,15 +1829,20 @@ local function unify_(a: Type, b: Type, expr: Expression, depth: number): boolea
                         else
                             success = success and unify(at, b.Types[i], expr, depth + 1)
                         end
+
+                        if not success then
+                            break
+                        end
                     end
 
                 elseif not isVoid(b.Types[#b.Types - 1]) then
                     -- try swapping them
                     success = unify(b, a, expr, depth + 1)
+                    reportMismatch = false -- inner expr already reported mismatch
                 end
             end
 
-            if not success then
+            if not success and reportMismatch then
                 if not isErrorSuppressing(a) and not isErrorSuppressing(b) then
                     errorReport(`Mismatching types.`, expr)
                 else
@@ -1835,32 +1851,24 @@ local function unify_(a: Type, b: Type, expr: Expression, depth: number): boolea
             end
         else
             for i, t1 in a.Types do
-                success = success and unify(t1, b.Types[i], expr, depth + 1)
+                if not unify(t1, b.Types[i], expr, depth + 1) then
+                    success = false
+                    break
+                end
             end
         end
     end
 
     if logInference then
-        assert(unificationStep).Succeeded = success
-    end
-
-    return success
-end
-
-function unify(a: Type, b: Type, expr: Expression, depth: number?)
-    depth = depth or 1
-    local prevStep = unificationStep
-
-    local success = unify_(a, b, expr, depth or 0)
-
-    if logInference then
         assert(inferenceStep, "inferenceStep is nil.")
         assert(unificationStep, "unificationStep is nil")
 
+        unificationStep.Succeeded = success
         unificationStep = prevStep
     end
 
     if not success then
+        -- Leaving the unification trail as diagnostics is bad.
         if depth > 1 then
             print(`{ expr.Position.Line }:{ expr.Position.Character }: { typeToString(a) } is not { typeToString(b) }, so`)
         else
@@ -1893,7 +1901,7 @@ end
 
 type InferenceState = {
     nonGeneric: { [Type]: true? },
-    expectingRetTy: Type?,
+    expectingRetTy: Type? | false,
     expectingVariadicTy: Type?,
 }
 
@@ -2017,18 +2025,18 @@ local function infer_(expr: Expression, state: InferenceState): Type
             error(`Unreachable.`)
         end
     elseif expr.Type == "Return" then
-        if not state.expectingRetTy then
+        if state.expectingRetTy == nil then
             return errorReport(`Unexpected 'return' outside of function body.`, expr)
+        elseif state.expectingRetTy == false then
+            state.expectingRetTy = typeVariable()
         end
+
+        assert(state.expectingRetTy)
 
         local here = voidType()
 
         if expr.Return then
             here = infer(expr.Return, state)
-
-            if isVoid(here) then
-                here = errorReport(`Trying to return a 'void' value.`, expr)
-            end
         end
 
         unify(here, state.expectingRetTy, expr)
@@ -2083,7 +2091,6 @@ local function infer_(expr: Expression, state: InferenceState): Type
     elseif expr.Type == "Function" then
         local paramTys = table.create<<Type>>(#expr.Function.Parameters + 1)
         local variadic = voidType()
-        local retTy = typeVariable()
 
         local shadowed = {}
 
@@ -2100,7 +2107,7 @@ local function infer_(expr: Expression, state: InferenceState): Type
             state.nonGeneric[variadic] = true
         end
 
-        local fnTy = functionType(paramTys, variadic, retTy)
+        local fnTy = functionType(paramTys, variadic, typeVariable())
 
         if expr.Function.Name then
             shadowed[expr.Function.Name] = typeEnv[expr.Function.Name]
@@ -2111,34 +2118,29 @@ local function infer_(expr: Expression, state: InferenceState): Type
         state.expectingVariadicTy = variadic
 
         local prevRetTy = state.expectingRetTy
-        state.expectingRetTy = retTy
+        state.expectingRetTy = false
 
         for _, b in expr.Function.Body do
             infer(b, state)
         end
 
+        local retTy = voidType()
+
+        if state.expectingRetTy ~= false then
+            retTy = state.expectingRetTy
+        end
+
         state.expectingVariadicTy = prevVariTy
         state.expectingRetTy = prevRetTy
-
-        retTy = prune(retTy)
-        local foundRetTyInParameters = false
 
         for i, p in paramTys do
             state.nonGeneric[p] = nil
 
             local param = expr.Function.Parameters[i]
             typeEnv[param] = shadowed[param]
-
-            if occursInType(retTy, p) then
-                foundRetTyInParameters = true
-            end
         end
 
         state.nonGeneric[variadic] = nil
-
-        if not foundRetTyInParameters and retTy.Kind == "Variable" then
-            unify(retTy, voidType(), expr)
-        end
 
         if expr.Function.Name then
             typeEnv[expr.Function.Name] = shadowed[expr.Function.Name]
