@@ -829,9 +829,6 @@ local function parse(program: string): { Success: boolean, Expressions: { Expres
         tk = nextToken(table.clone(state))
     end
 
-    -- print(prettyPrint(exprs))
-    -- print("\n-->\n")
-
     return { Success = success, Expressions = exprs }
 end
 
@@ -1365,11 +1362,46 @@ print(e_second)
 
 ]]
 
-print("Output:\n")
+local logInference = false
+local printAst = false
+
+if select("#", ...) > 0 then
+    for i = 1, select("#", ...) do
+        local arg = select(i, ...)
+
+        if arg == "--program" then
+            program = select(i + 1, ...)
+        elseif arg == "--log-inference" then
+            logInference = true
+        elseif arg == "--ast" then
+            printAst = true
+        elseif arg == "--help" then
+            print([[
+
+aw.luau - erin5/@PhoenixWhitefire.
+
+Arguments:
+    --program <A>    - Provide a string to parse, evaluate, and infer.
+    -- log-inference - Enable logging for the inference algorithm.
+    --ast            - Dump the generated AST of the program.
+    --help           - Show this help message and exit.
+            ]])
+
+            return
+        end
+    end
+end
 
 local result = parse(program)
 
+if printAst then
+    print("AST:\n")
+    print(prettyPrint(result.Expressions))
+    print("")
+end
+
 if result.Success then
+    print("Output:")
     local returned = run(result.Expressions)
 
     if returned then
@@ -1523,6 +1555,17 @@ local function errorReport(msg, expr: Expression)
     return errorType()
 end
 
+local function prune(ty: Type): Type
+    if ty.Kind == "Variable" and ty.Instance then
+        local newInstance = prune(ty.Instance)
+        ty.Instance = newInstance -- TODO luau this assignment makes `newInstance` be inferred optional without the return annotation?
+
+        return newInstance
+    else
+        return ty
+    end
+end
+
 local tyVarNameIndex = 0
 
 local function typeToString(ty: Type): string
@@ -1554,7 +1597,7 @@ local function typeToString(ty: Type): string
 
                 for i, t in ty.Types do
                     if i == #ty.Types - 1 then
-                        if t.Name ~= "void" then
+                        if prune(t).Name ~= "void" then
                             params[i] = `...{ typeToString(t) }`
                         end
                     elseif i == #ty.Types then
@@ -1581,17 +1624,6 @@ local function typeToString(ty: Type): string
     end
 
     return toString(ty)
-end
-
-local function prune(ty: Type): Type
-    if ty.Kind == "Variable" and ty.Instance then
-        local newInstance = prune(ty.Instance)
-        ty.Instance = newInstance -- TODO luau this assignment makes `newInstance` be inferred optional without the return annotation?
-
-        return newInstance
-    else
-        return ty
-    end
 end
 
 local occursIn
@@ -1687,7 +1719,45 @@ local function isErrorSuppressing(ty: Type)
     return false
 end
 
-local function unify(a: Type, b: Type, expr: Expression)
+type UnificationStep = {
+    read A: Type,
+    read B: Type,
+    read Source: Expression,
+    read Children: { UnificationStep },
+}
+
+type InferenceStep = {
+    read Source: Expression,
+    read Unifications: { UnificationStep },
+    read Children: { InferenceStep }
+}
+
+local totalUnificationSteps = 0
+local inferenceStep: InferenceStep? = nil
+local unificationStep: UnificationStep? = nil
+
+local unify
+
+local function unify_(a: Type, b: Type, expr: Expression)
+    local prevStep = unificationStep
+
+    if logInference then
+        totalUnificationSteps += 1
+
+        local step: UnificationStep = {
+            A = a,
+            B = b,
+            Source = expr,
+            Children = {}
+        }
+
+        if unificationStep then
+            table.insert(unificationStep.Children, step)
+        end
+
+        unificationStep = step
+    end
+
     a = prune(a)
     b = prune(b)
 
@@ -1701,7 +1771,7 @@ local function unify(a: Type, b: Type, expr: Expression)
         end
 
     elseif a.Kind == "Operator" and b.Kind == "Variable" then
-        return unify(b, a, expr)
+        unify_(b, a, expr)
 
     elseif a.Kind == "Operator" and b.Kind == "Operator" then
         -- `unknown` always unifies
@@ -1715,21 +1785,23 @@ local function unify(a: Type, b: Type, expr: Expression)
                             -- variadic
 
                             for j = i, #b.Types - 2 do
-                                unify(at, b.Types[j], expr)
+                                unify_(at, b.Types[j], expr)
                             end
                         elseif i == #a.Types then
                             -- return
-                            unify(at, b.Types[#b.Types], expr)
+                            unify_(at, b.Types[#b.Types], expr)
                         else
-                            unify(at, b.Types[i], expr)
+                            unify_(at, b.Types[i], expr)
                         end
                     end
 
+                    --unificationStep = prevStep
                     return
                 elseif not isVoid(b.Types[#b.Types - 1]) then
                     -- try swapping them
-                    unify(b, a, expr)
+                    unify_(b, a, expr)
 
+                    --unificationStep = prevStep
                     return
                 end
             end
@@ -1739,9 +1811,22 @@ local function unify(a: Type, b: Type, expr: Expression)
             end
         else
             for i, t1 in a.Types do
-                unify(t1, b.Types[i], expr)
+                unify_(t1, b.Types[i], expr)
             end
         end
+    end
+
+    --unificationStep = prevStep
+end
+
+function unify(a, b, expr)
+    local prevStep = unificationStep
+
+    unify_(a, b, expr)
+
+    if logInference then
+        table.insert(assert(inferenceStep).Unifications, assert(unificationStep))
+        unificationStep = prevStep
     end
 end
 
@@ -1771,9 +1856,30 @@ type InferenceState = {
     expectingVariadicTy: Type?,
 }
 
+local totalInferenceSteps = 0
+local rootInferenceSteps: { InferenceStep } = {}
+
 print("\n--")
 
-local function infer(expr: Expression, state: InferenceState): Type
+local infer
+
+local function infer_(expr: Expression, state: InferenceState): Type
+    if logInference then
+        totalInferenceSteps += 1
+
+        local step: InferenceStep = {
+            Source = expr,
+            Unifications = {},
+            Children = {},
+        }
+
+        if inferenceStep then
+            table.insert(inferenceStep.Children, step)
+        end
+
+        inferenceStep = step
+    end
+
     if expr.Type == "Declaration" then
         local ty = infer(expr.Declaration.Value, state)
 
@@ -2044,8 +2150,24 @@ local function infer(expr: Expression, state: InferenceState): Type
     end
 end
 
+function infer(expr, state)
+    local prevStep = inferenceStep
+
+    local result = infer_(expr, state)
+
+    if logInference and prevStep then
+        inferenceStep = prevStep
+    end
+
+    return result
+end
+
 for _, v in result.Expressions do
     infer(v, { nonGeneric = {} })
+
+    if logInference then
+        table.insert(rootInferenceSteps, assert(inferenceStep))
+    end
 end
 
 print("\nInferred types:\n")
@@ -2063,5 +2185,34 @@ for _, k in orderedInferences do
         local v = assert(typeEnv[k])
 
         print(`{ k }: { typeToString(v) }`)
+    end
+end
+
+if logInference then
+    print(`\nInference took { totalInferenceSteps } steps with { totalUnificationSteps } unifications.\n`)
+
+    local function logUnificationStep(step: UnificationStep, indent: string)
+        print(`{ indent }Unify { exprToStringShallow(step.Source) } ==> { typeToString(step.A) } = { typeToString(step.B) }.`)
+
+        for _, child in step.Children do
+            logUnificationStep(child, indent .. "  ")
+        end
+    end
+
+    local function logInferenceStep(step: InferenceStep, indent: string?)
+        indent = indent or ""
+        print(`{ indent }Infer { step.Source.position.line }:{ step.Source.position.char }:{ exprToStringShallow(step.Source) }.`)
+
+        for _, unification in step.Unifications do
+            logUnificationStep(unification, indent .. "  ")
+        end
+
+        for _, inference in step.Children do
+            logInferenceStep(inference, indent .. "  ")
+        end
+    end
+
+    for _, step in rootInferenceSteps do
+        logInferenceStep(step)
     end
 end
