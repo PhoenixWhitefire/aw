@@ -1000,7 +1000,7 @@ local function eval(expr: Expression): Value?
         local name = expr.Declaration.Name
 
         local v = eval(expr.Declaration.Value)
-        env[name] = v
+        env[name] = v or nilValue()
 
         return v
     elseif expr.Type == "Call" then
@@ -1723,6 +1723,7 @@ type UnificationStep = {
     read A: Type,
     read B: Type,
     read Source: Expression,
+    Succeeded: boolean,
     read Children: { UnificationStep },
 }
 
@@ -1738,9 +1739,7 @@ local unificationStep: UnificationStep? = nil
 
 local unify
 
-local function unify_(a: Type, b: Type, expr: Expression)
-    local prevStep = unificationStep
-
+local function unify_(a: Type, b: Type, expr: Expression, depth: number): boolean
     if logInference then
         totalUnificationSteps += 1
 
@@ -1748,15 +1747,21 @@ local function unify_(a: Type, b: Type, expr: Expression)
             A = a,
             B = b,
             Source = expr,
+            Succeeded = true,
             Children = {}
         }
 
         if unificationStep then
             table.insert(unificationStep.Children, step)
+        else
+            assert(inferenceStep)
+            table.insert(inferenceStep.Unifications, step)
         end
 
         unificationStep = step
     end
+
+    local success = true
 
     a = prune(a)
     b = prune(b)
@@ -1765,69 +1770,89 @@ local function unify_(a: Type, b: Type, expr: Expression)
         if a ~= b then
             if occursInType(a, b) then
                 a.Instance = errorReport(`Recursive unification, { typeToString(b) } contains { typeToString(a) }.`, expr)
+                success = false
             else
                 a.Instance = b
             end
         end
 
     elseif a.Kind == "Operator" and b.Kind == "Variable" then
-        unify_(b, a, expr)
+        return unify(b, a, expr, depth + 1)
 
     elseif a.Kind == "Operator" and b.Kind == "Operator" then
         -- `unknown` always unifies
         if (a.Name ~= b.Name or #a.Types ~= #b.Types) and (a.Name ~= "unknown" and b.Name ~= "unknown") then
+            success = false
+
             if a.Name == "Function" and b.Name == "Function" then
                 if not isVoid(a.Types[#a.Types - 1]) and #b.Types > #a.Types - 1 and b.Types[#b.Types - 1].Kind == "Variable" then
-                    -- `a` has a variadic, unify against `b` arguments
+                    success = true
 
+                    -- `a` has a variadic, unify against `b` arguments
                     for i, at in a.Types do
                         if i == #a.Types - 1 then
                             -- variadic
 
                             for j = i, #b.Types - 2 do
-                                unify_(at, b.Types[j], expr)
+                                success = success and unify(at, b.Types[j], expr, depth + 1)
                             end
                         elseif i == #a.Types then
                             -- return
-                            unify_(at, b.Types[#b.Types], expr)
+                            success = success and unify(at, b.Types[#b.Types], expr, depth + 1)
                         else
-                            unify_(at, b.Types[i], expr)
+                            success = success and unify(at, b.Types[i], expr, depth + 1)
                         end
                     end
 
-                    --unificationStep = prevStep
-                    return
                 elseif not isVoid(b.Types[#b.Types - 1]) then
                     -- try swapping them
-                    unify_(b, a, expr)
-
-                    --unificationStep = prevStep
-                    return
+                    success = unify(b, a, expr, depth + 1)
                 end
             end
 
-            if not isErrorSuppressing(a) and not isErrorSuppressing(b) then
-                errorReport(`Mismatching types: { typeToString(a) } is not { typeToString(b) }.`, expr)
+            if not success then
+                if not isErrorSuppressing(a) and not isErrorSuppressing(b) then
+                    errorReport(`Mismatching types.`, expr)
+                else
+                    success = true
+                end
             end
         else
             for i, t1 in a.Types do
-                unify_(t1, b.Types[i], expr)
+                success = success and unify(t1, b.Types[i], expr, depth + 1)
             end
         end
     end
 
-    --unificationStep = prevStep
+    if logInference then
+        assert(unificationStep).Succeeded = success
+    end
+
+    return success
 end
 
-function unify(a, b, expr)
+function unify(a, b, expr, depth: number?)
+    depth = depth or 1
     local prevStep = unificationStep
 
-    unify_(a, b, expr)
+    local success = unify_(a, b, expr, depth or 0)
 
     if logInference then
-        table.insert(assert(inferenceStep).Unifications, assert(unificationStep))
+        assert(inferenceStep, "inferenceStep is nil.")
+        assert(unificationStep, "unificationStep is nil")
+
         unificationStep = prevStep
     end
+
+    if not success then
+        if depth > 1 then
+            print(`{ expr.position.line }:{ expr.position.char }: { typeToString(a) } is not { typeToString(b) }, so`)
+        else
+            print(`{ expr.position.line }:{ expr.position.char }: { typeToString(a) } is not { typeToString(b) }.`)
+        end
+    end
+
+    return success
 end
 
 local tv = typeVariable()
@@ -2024,7 +2049,10 @@ local function infer_(expr: Expression, state: InferenceState): Type
 
         local retTy = typeVariable()
 
-        unify(functionType(argTys, typeVariable(), retTy), fnTy, expr)
+        if not unify(functionType(argTys, typeVariable(), retTy), fnTy, expr) then
+            retTy = errorType() -- Do not leak the type variable.
+        end
+
         return retTy
 
     elseif expr.Type == "Function" then
@@ -2192,7 +2220,7 @@ if logInference then
     print(`\nInference took { totalInferenceSteps } steps with { totalUnificationSteps } unifications.\n`)
 
     local function logUnificationStep(step: UnificationStep, indent: string)
-        print(`{ indent }Unify { exprToStringShallow(step.Source) } ==> { typeToString(step.A) } = { typeToString(step.B) }.`)
+        print(`{ indent }Unify { exprToStringShallow(step.Source) } ==> { typeToString(step.A) } = { typeToString(step.B) }{ if step.Succeeded then "" else " - Failed" }.`)
 
         for _, child in step.Children do
             logUnificationStep(child, indent .. "  ")
