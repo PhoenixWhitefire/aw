@@ -45,9 +45,8 @@ type LiteralValue =
 
 type BasicToken = {
     read Type:
-        | "Equals"
-        | "OpenParentheses" | "CloseParentheses"
-        | "OpenCurlyBraces" | "CloseCurlyBraces"
+        | "OpenParentheses"  | "CloseParentheses"
+        | "OpenCurlyBraces"  | "CloseCurlyBraces"
         | "OpenSquareBraces" | "CloseSquareBraces"
         | "Comma"
         | "Ellipsis"
@@ -69,7 +68,7 @@ local operators = {
     [">="] = true,
     ["<"] = true,
     ["<="] = true,
-    [":="] = true,
+    ["="] = true,
 }
 
 type Operator = keyof<typeof(operators)>
@@ -138,6 +137,17 @@ type ExpressionData =
         read Operand: Expression,
       }
     | {
+        read Type: "ReadIndex",
+        read List: Expression,
+        read Index: Expression,
+      }
+    | {
+        read Type: "WriteIndex",
+        read List: Expression,
+        read Index: Expression,
+        read Value: Expression,
+      }
+    | {
         read Type: "Function",
         read Function: {
             read Name: string?,
@@ -192,7 +202,6 @@ local keywords: { read [string]: Keyword? } = {
 
 -- TODO luau
 local correspond: { read [string]: index<BasicToken, "Type">? } = {
-    ["="] = "Equals",
     ["("] = "OpenParentheses",
     [")"] = "CloseParentheses",
     ["{"] = "OpenCurlyBraces",
@@ -233,7 +242,7 @@ local function isEof(c: string)
 end
 
 local function isSeparator(c: string)
-    return isEof(c) or isWhitespace(c) or c == ":" or c == ";" or c == "=" or c == "(" or c == ")" or c == "{" or c == "}" or c == "," or c == "^" or c == '"' or c == "#"
+    return isEof(c) or isWhitespace(c) or c == ":" or c == ";" or c == "(" or c == ")" or c == "{" or c == "}" or c == "," or c == "^" or c == '"' or c == "#"
         or c == "[" or c == "]"
         or operators[c]
 end
@@ -422,7 +431,7 @@ local function parseBody(state: ParseState, report: Report, stopAtElse: boolean?
 end
 
 local function parseBinaryOperation(state: ParseState, report: Report, left: Expression, opTk: OperatorToken): Expression
-    if opTk.Operator == ":=" and left.Type ~= "Reference" then
+    if opTk.Operator == "=" and left.Type ~= "Reference" then
         report(`Mutation operator expects LHS to be a reference, got a { left.Type } instead.`, left)
     end
 
@@ -539,7 +548,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
 
             local equalsTk = nextToken(state)
 
-            if equalsTk.Type ~= "Equals" then
+            if equalsTk.Type ~= "Operator" or equalsTk.Operator ~= "=" then
                 report(`Expected an '=' to follow declaration identifier, got a { equalsTk.Type }.`, equalsTk)
 
                 return ex({
@@ -618,10 +627,10 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
         end
     elseif token.Type == "Identifier" then
         local left: Expression
-        local nextTk, consumeNext = peekNextToken(state)
+        local maybeParenthesesTk, consumeParentheses = peekNextToken(state)
 
-        if nextTk.Type == "OpenParentheses" then
-            consumeNext()
+        if maybeParenthesesTk.Type == "OpenParentheses" then
+            consumeParentheses()
 
             local argC = nextCharacter(state.Program, state.Position.Offset)
             local args = {}
@@ -650,6 +659,39 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
                 Type = "Reference",
                 Reference = token.Identifier,
             }, token)
+        end
+
+        local maybeSquareBracketTk, consumeSquareBracket = peekNextToken(state)
+
+        if maybeSquareBracketTk.Type == "OpenSquareBraces" then
+            consumeSquareBracket()
+
+            local index = parseExpression(state, report) or invalidExpr(state, `Reached end-of-file trying to parse index expression.`, report)
+            local closeBrackets = nextToken(state)
+
+            if closeBrackets.Type ~= "CloseSquareBraces" then
+                return invalidExpr(state, `Expected closing square brackets, got end-of-file.`, report)
+            end
+
+            local maybeEqualsTk, consumeEquals = peekNextToken(state)
+
+            if maybeEqualsTk.Type == "Operator" and maybeEqualsTk.Operator == "=" then
+                consumeEquals()
+
+                local value = parseExpression(state, report) or invalidExpr(state, `Reached end-of-file trying to parse index assignment.`, report)
+                return ex({
+                    Type = "WriteIndex",
+                    List = left,
+                    Index = index,
+                    Value = value,
+                }, token)
+            else
+                left = ex({
+                    Type = "ReadIndex",
+                    List = left,
+                    Index = index,
+                }, token)
+            end
         end
 
         return maybeCombineWithBinaryOperation(state, report, left, shallow)
@@ -905,44 +947,6 @@ local env: { [string]: Value? } = {
         end
     end),
 
-    List_get = makeLuauFuncValue(function(args)
-        assert(#args == 2, `'List_get' requires 2 arguments.`)
-
-        local l = args[1]
-        assert(l.Type == "List", `'List_get' expects a List as the first argument.'`)
-
-        local i = args[2]
-        assert(i.Type == "number", `'List_get' expects a number as the second argument.`)
-        assert(i.Value > 0 and i.Value <= #l.Value, `'List_get' received an out-of-bounds index.`)
-
-        return l.Value[i.Value]
-    end),
-
-    List_set = makeLuauFuncValue(function(args)
-        assert(#args == 3, `'List_set' requires 3 arguments.`)
-
-        local l = args[1]
-        assert(l.Type == "List", `'List_set' expects a List as the first argument.`)
-
-        local i = args[2]
-        assert(i.Type == "number", `'List_set' expects a number as the second argument.`)
-        assert(i.Value > 0 and i.Value <= #l.Value, `'List_set' received an out-of-bounds index.`)
-
-        local v = args[3]
-
-        l.Value[i.Value] = v
-        return nil
-    end),
-
-    List_length = makeLuauFuncValue(function(args)
-        assert(#args == 1, `'List_length' requires 1 arguments.`)
-
-        local l = args[1]
-        assert(l.Type == "List", `'List_length' expects a List as the first argument.`)
-
-        return numberValue(#l.Value)
-    end),
-
     List_clear = makeLuauFuncValue(function(args)
         assert(#args == 2, `'List_clear' requires 3 arguments.`)
 
@@ -1122,8 +1126,8 @@ local function evaluate(expr: Expression): Value?
             end
 
             return stringValue(leftEval.Value .. rightEval.Value)
-        elseif expr.Operator == ":=" then
-            assert(expr.Left.Type == "Reference", "This should've been caught at compile time.")
+        elseif expr.Operator == "=" then
+            assert(expr.Left.Type == "Reference", "This should've been caught by the parser.")
 
             env[expr.Left.Reference] = rightEval
             return rightEval
@@ -1167,12 +1171,12 @@ local function evaluate(expr: Expression): Value?
 
             return numberValue(-operandEval.Value)
         elseif expr.Operator == "#" then
-            if operandEval.Type ~= "string" then
+            if operandEval.Type == "string" or operandEval.Type == "List" then
+                return numberValue(#operandEval.Value)
+            else
                 fail(`Cannot get the length of a { operandEval.Type }.`)
                 error(`Unreachable.`)
             end
-
-            return numberValue(#operandEval.Value)
         else
             unreachable(expr.Operator)
             error(`Unreachable.`)
@@ -1195,7 +1199,7 @@ local function evaluate(expr: Expression): Value?
 
         return f
     elseif expr.Type == "Return" then
-        assert(#callFrames > 1, "'return' expression appeared outside of a function call frame, this should've failed to compile.")
+        assert(#callFrames > 1, "'return' expression appeared outside of a function call frame, this should've failed to parse.")
 
         error({
             NormalReturn = true,
@@ -1241,6 +1245,25 @@ local function evaluate(expr: Expression): Value?
         end
 
         return conditionResult
+    elseif expr.Type == "ReadIndex" then
+        local list = evaluate(expr.List) or nilValue()
+        assert(list.Type == "List", `Expected a list as the indexed value, got { list.Type }.`)
+
+        local index = evaluate(expr.Index) or nilValue()
+        assert(index.Type == "number", `Expected a number as the index value, got { index.Type }.`)
+
+        return list.Value[index.Value]
+    elseif expr.Type == "WriteIndex" then
+        local list = evaluate(expr.List) or nilValue()
+        assert(list.Type == "List", `Expected a list as the indexed value, got { list.Type }.`)
+
+        local index = evaluate(expr.Index) or nilValue()
+        assert(index.Type == "number", `Expected a number as the index value, got { index.Type }.`)
+
+        local value = evaluate(expr.Value) or nilValue()
+        list.Value[index.Value] = value
+
+        return value
     else
         unreachable(expr.Type)
         error(`Unreachable.`)
@@ -1295,13 +1318,15 @@ end
 
 let a_toasted = a_toasting(42)
 
+print(tostring(a_toasting), tostring(a_toasted))
+
 let b_id = function(x)
     return x
 end
 
 let b_hello = b_id("hello")
 
-print(a_toasting, a_toasted, b_hello)
+print(b_hello)
 
 let c_wrong = function(wrongAgain)
     let c_q = wrongAgain + 1
@@ -1319,11 +1344,11 @@ end
 print(d_fac(5))
 
 let e_swap = function(lis, in, jn)
-    let e_vi = List_get(lis, in)
-    let e_vj = List_get(lis, jn)
+    let e_vi = lis[in]
+    let e_vj = lis[jn]
 
-    List_set(lis, in, e_vj)
-    List_set(lis, jn, e_vi)
+    lis[in] = e_vj
+    lis[jn] = e_vi
 
     return e_vj
 end
@@ -1349,6 +1374,10 @@ end
 let f_addmul = f_compose(f_add, f_mul)
 let f_result = f_addmul(2)
 print(f_result)
+
+let q = 5
+q = "hello"
+print(q)
 
 ]]
 
@@ -1398,7 +1427,7 @@ if result.Success then
         print(`= { valueToString(returned) }`)
     end
 else
-    print("Compilation failed.")
+    print("Parse failed.")
 end
 
 -- https://github.com/7sharp9/write-you-an-inference-in-fsharp/blob/master/HMBasic/HMBasic.fs
@@ -1411,7 +1440,7 @@ type TypeVariable = {
 
 type TypeOperator = {
     read Kind: "Operator",
-    read Name: "*error*" | "void" | "unknown" | index<Value, "Type">,
+    read Name: "*error*" | "void" | index<Value, "Type">,
     read Types: { read Type },
 }
 
@@ -1429,10 +1458,6 @@ end
 
 local function voidType()
     return primitiveType("void")
-end
-
-local function unknownType()
-    return primitiveType("unknown")
 end
 
 local function nilType()
@@ -1526,6 +1551,10 @@ local function exprToStringShallow(expr: Expression)
         else
             return "{}"
         end
+    elseif expr.Type == "ReadIndex" then
+        return `{ exprToStringShallow(expr.List) }[{ exprToStringShallow(expr.Index) }] }`
+    elseif expr.Type == "WriteIndex" then
+        return `{ exprToStringShallow(expr.List) }[{ exprToStringShallow(expr.Index) }] } = { exprToStringShallow(expr.Value) }`
     elseif expr.Type == "VariadicArguments" then
         return "..."
     elseif expr.Type == "VariadicSelection" then
@@ -1655,11 +1684,6 @@ end
 local function isVoid(ty: Type)
     local pr = prune(ty)
     return pr.Kind == "Operator" and pr.Name == "void"
-end
-
-local function isUnknown(ty: Type)
-    local pr = prune(ty)
-    return pr.Kind == "Operator" and pr.Name == "unknown"
 end
 
 local function isGeneric(v: Type, nonGenerics: { [Type]: true? })
@@ -1797,7 +1821,7 @@ local function unify(a: Type, b: Type, expr: Expression, depth: number?): boolea
             if occursInType(a, b) then
                 a.Instance = errorReport(`Recursive unification, { typeToString(b) } contains { typeToString(a) }.`, expr)
                 success = false
-            elseif not isUnknown(b) then -- `unknown` *always* "succeeds" in unification, but it should never actually instantiate.
+            else
                 a.Instance = b
             end
         end
@@ -1807,7 +1831,7 @@ local function unify(a: Type, b: Type, expr: Expression, depth: number?): boolea
 
     elseif a.Kind == "Operator" and b.Kind == "Operator" then
         -- `unknown` always unifies
-        if (a.Name ~= b.Name or #a.Types ~= #b.Types) and (a.Name ~= "unknown" and b.Name ~= "unknown") then
+        if a.Name ~= b.Name or #a.Types ~= #b.Types then
             success = false
             local reportMismatch = true
 
@@ -1879,18 +1903,17 @@ local function unify(a: Type, b: Type, expr: Expression, depth: number?): boolea
     return success
 end
 
-local tv = typeVariable()
+local genericT = typeVariable()
 
 local typeEnv: { [string]: Type? } = {
-    print = functionType({}, unknownType(), voidType()),
-    typeof = functionType({ unknownType() }, voidType(), stringType()),
-    tostring = functionType({ unknownType() }, voidType(), stringType()),
+    -- HMLIMIT: The type of `print`, `(...unknown) -> void`, is inexpressible, because `unknown` would have to be a "top type" that
+    -- "unifies" "successfully" against everything, and does not instantiate.
+    print = functionType({}, genericT, voidType()),
+    typeof = functionType({ genericT }, voidType(), stringType()),
+    tostring = functionType({ genericT }, voidType(), stringType()),
     tonumber = functionType({ numberType() }, voidType(), stringType()),
 
-    List_get = functionType({ listType(tv), numberType() }, voidType(), tv),
-    List_set = functionType({ listType(tv), numberType(), tv }, voidType(), voidType()),
-    List_length = functionType({ listType(tv) }, voidType(), numberType()),
-    List_clear = functionType({ listType(tv), numberType() }, voidType(), voidType()),
+    List_clear = functionType({ listType(genericT), numberType(), genericT }, voidType(), voidType()),
 }
 
 local builtin = {}
@@ -1985,7 +2008,7 @@ local function infer_(expr: Expression, state: InferenceState): Type
             return stringType()
         elseif expr.Operator == "==" or expr.Operator == "~=" then
             return booleanType()
-        elseif expr.Operator == ":=" then
+        elseif expr.Operator == "=" then
             if expr.Left.Type == "Reference" then
                 local prev = typeEnv[expr.Left.Reference]
 
@@ -2003,7 +2026,7 @@ local function infer_(expr: Expression, state: InferenceState): Type
                 unify(now, prev, expr.Right)
                 return prev
             else
-                return errorType() -- Error would've already been reported by compiler
+                return errorType() -- Error would've already been reported by parser
             end
         else
             unreachable(expr.Operator)
@@ -2017,8 +2040,7 @@ local function infer_(expr: Expression, state: InferenceState): Type
 
             return numberType()
         elseif expr.Operator == "#" then
-            unify(operand, stringType(), expr.Operand)
-
+            -- HMLIMIT: The constraint on the type would be that it's either `string` or `List<T>`, which HM cannot express.
             return numberType()
         else
             unreachable(expr.Operator)
@@ -2126,7 +2148,7 @@ local function infer_(expr: Expression, state: InferenceState): Type
 
         local retTy = voidType()
 
-        if state.expectingRetTy ~= false then
+        if state.expectingRetTy then
             retTy = state.expectingRetTy
         end
 
@@ -2175,6 +2197,31 @@ local function infer_(expr: Expression, state: InferenceState): Type
             Name = "List",
             Types = { itemTy },
         }
+
+    elseif expr.Type == "ReadIndex" then
+        local valueTy = typeVariable()
+
+        local listTy = infer(expr.List, state)
+        unify(listTy, listType(valueTy), expr.List)
+
+        local indexTy = infer(expr.Index, state)
+        unify(indexTy, numberType(), expr.Index)
+
+        return valueTy
+
+    elseif expr.Type == "WriteIndex" then
+        local valueTy = typeVariable()
+
+        local listTy = infer(expr.List, state)
+        unify(listTy, listType(valueTy), expr.List)
+
+        local indexTy = infer(expr.Index, state)
+        unify(indexTy, numberType(), expr.Index)
+
+        local writeValueTy = infer(expr.Value, state)
+        unify(valueTy, writeValueTy, expr.Value)
+
+        return valueTy
 
     elseif expr.Type == "VariadicArguments" then
         if state.expectingVariadicTy then
