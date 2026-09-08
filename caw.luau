@@ -433,17 +433,41 @@ local function parseBody(state: ParseState, report: Report, stopAtElse: boolean?
     return body, endTk
 end
 
+local function operatorHasPrecendence(operatorTk: OperatorToken)
+    local operatorsWithPrecedence = {
+        ["*"] = true,
+        ["/"] = true,
+        ["//"] = true,
+    }
+
+    return operatorsWithPrecedence[operatorTk.Operator] == true
+end
+
 local function parseBinaryOperation(state: ParseState, report: Report, left: Expression, opTk: OperatorToken): Expression
     if opTk.Operator == "=" and left.Type ~= "Reference" then
         report(`Mutation operator expects LHS to be a reference, got a { left.Type } instead.`, left)
     end
 
-    return ex({
+    local hasPrecendence = operatorHasPrecendence(opTk)
+
+    local op = ex({
         Type = "BinaryOperation",
         Operator = opTk.Operator,
         Left = left,
-        Right = parseExpression(state, report) or invalidExpr(state, `Got end-of-file trying to parse '{ opTk.Operator }' expression.`, report),
+        Right = parseExpression(state, report, hasPrecendence) or invalidExpr(state, `Got end-of-file trying to parse '{ opTk.Operator }' expression.`, report),
     }, left)
+
+    if hasPrecendence then
+        local maybeOperator, consumeOperator = peekNextToken(state)
+
+        if maybeOperator.Type == "Operator" then
+            consumeOperator()
+
+            return parseBinaryOperation(state, report, op, maybeOperator)
+        end
+    end
+
+    return op
 end
 
 local function maybeCombineWithBinaryOperation(state: ParseState, report: Report, left: Expression, shallow: boolean?)
@@ -705,7 +729,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
             Constant = token.Literal,
         }, token)
 
-        return maybeCombineWithBinaryOperation(state, report, constant)
+        return maybeCombineWithBinaryOperation(state, report, constant, shallow)
     elseif token.Type == "Comma" then
         -- TODO check
         state.Position.Offset += 1
@@ -740,7 +764,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
                 Operand = inner,
             }, token)
 
-            return maybeCombineWithBinaryOperation(state, report, negation)
+            return maybeCombineWithBinaryOperation(state, report, negation, true)
         else
             report(`Unexpected '{ token.Operator }' operator.`, token)
 
@@ -794,7 +818,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
             return maybeCombineWithBinaryOperation(state, report, ex({
                 Type = "VariadicSelection",
                 Selection = selector,
-            }, token))
+            }, token), shallow)
         else
             return ex({
                 Type = "VariadicArguments",
