@@ -438,6 +438,7 @@ local function operatorHasPrecendence(operatorTk: OperatorToken)
         ["*"] = true,
         ["/"] = true,
         ["//"] = true,
+        ["-"] = true, -- Probably wrong. `1 - 2 - 3`.
     }
 
     return operatorsWithPrecedence[operatorTk.Operator] == true
@@ -958,7 +959,7 @@ local env: { [string]: Value? } = {
     end),
 
     List_clear = makeLuauFuncValue(function(args)
-        assert(#args == 2, `'List_clear' requires 3 arguments.`)
+        assert(#args == 3, `'List_clear' requires 3 arguments.`)
 
         local l = args[1]
         assert(l.Type == "List", `'List_clear' expects a List as the first argument.`)
