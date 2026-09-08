@@ -328,10 +328,11 @@ local function isErrorSuppressing(ty: Type)
     return false
 end
 
-local function deepCopy(tab)
+local function deepCopy<T>(tab: T & {}): T
+    assert(typeof(tab) == "table")
     local t = table.clone(tab)
 
-    for k, v in t do
+    for k, v in t do -- TODO luau, `intersect<>` should always reduce methinks?
         if typeof(v) == "table" then
             t[k] = deepCopy(v)
         else
@@ -446,7 +447,7 @@ local function unify(a: Type, b: Type, expr: caw.Expression, depth: number?): bo
 
             if not success and reportMismatch then
                 if not isErrorSuppressing(a) and not isErrorSuppressing(b) then
-                    errorReport(`Mismatching types.`, expr)
+                    errorReport(`Mismatching types:`, expr)
                 else
                     success = true
                 end

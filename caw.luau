@@ -971,6 +971,10 @@ local function evaluate(expr: Expression): Value?
     if expr.Type == "Declaration" then
         local name = expr.Declaration.Name
 
+        if env[name] then
+            fail(`A binding with the name '{ name }' already exists.`)
+        end
+
         local v = evaluate(expr.Declaration.Value)
         env[name] = v or nilValue()
 
@@ -1285,8 +1289,9 @@ function caw.run(exprs: { read Expression }): Value?
         local msg = tostring(data)
         local _, p = string.find(msg, ".luau:%d+:")
 
-        if p then
+        while p do
             msg = string.sub(msg, p + 2, #msg)
+            _, p = string.find(msg, ".luau:%d+:")
         end
 
         print(`Protected error: { msg }`)

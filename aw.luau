@@ -11,7 +11,7 @@ end
 
 let a_toasted = a_toasting(42)
 
-print(tostring(a_toasting), tostring(a_toasted))
+print(a_toasting, a_toasted) -- HMLIMIT: This is variadic, but there's no way to express that it takes any number of *unique* arguments.
 
 let b_id = function(x)
     return x
@@ -51,8 +51,8 @@ let e_second = e_swap(e_cool_list_full_of_cool_things, 1, 3)
 print(e_second)
 
 function f_compose(f, g)
-    return function(h)
-        return g(f(h))
+    return function(...)
+        return g(f(...))
     end
 end
 
@@ -64,7 +64,7 @@ let f_mul = function(x)
     return x * 2
 end
 
-let f_addmul = f_compose(f_add, f_mul)
+let f_addmul = f_compose(f_add, f_mul) -- HMLIMIT: `f_addmul` is inferred as `(...number) -> number` when it should actually be `(number) -> number`.
 let f_result = f_addmul(2)
 print(f_result)
 
@@ -89,16 +89,6 @@ local function prettyPrint(t, indent: string?)
 
     s ..= `{ initdent }}`
     return s
-end
-
-local function keysOf(t)
-    local vs = {}
-
-    for k, v in t do
-        table.insert(vs, k)
-    end
-
-    return vs
 end
 
 local inferers = {
