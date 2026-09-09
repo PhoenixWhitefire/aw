@@ -5,11 +5,11 @@ local caw = {}
 export type Value =
     | LiteralValue
     | {
-        read Type: "List",
+        read Type: "list",
         read Value: { Value },
       }
     | {
-        read Type: "Function",
+        read Type: "function",
         read Value:
             | {
                 read IsLuau: true,
@@ -23,7 +23,7 @@ export type Value =
               },
       }
     | {
-        read Type: "Tuple",
+        read Type: "tuple",
         read Value: { read Value },
       }
 
@@ -871,7 +871,7 @@ end
 
 local function makeLuauFuncValue(fn: ({ Value }) -> Value?): Value
     return {
-        Type = "Function",
+        Type = "function",
         Value = {
             IsLuau = true,
             Function = fn,
@@ -880,9 +880,9 @@ local function makeLuauFuncValue(fn: ({ Value }) -> Value?): Value
 end
 
 function caw.valueToString(v: Value)
-    if v.Type == "Function" then
+    if v.Type == "function" then
         return "function"
-    elseif v.Type == "List" then
+    elseif v.Type == "list" then
         local items = table.create<<string>>(#v.Value)
 
         for i, v in v.Value do
@@ -960,14 +960,14 @@ local env: { [string]: Value? } = {
         end
     end),
 
-    List_clear = makeLuauFuncValue(function(args)
-        assert(#args == 3, `'List_clear' requires 3 arguments.`)
+    list_clear = makeLuauFuncValue(function(args)
+        assert(#args == 3, `'list_clear' requires 3 arguments.`)
 
         local l = args[1]
-        assert(l.Type == "List", `'List_clear' expects a List as the first argument.`)
+        assert(l.Type == "list", `'list_clear' expects a list as the first argument.`)
 
         local n = args[2]
-        assert(n.Type == "number", `'List_clear' expects a number as the second argument.`)
+        assert(n.Type == "number", `'list_clear' expects a number as the second argument.`)
 
         local init = args[3]
 
@@ -1011,7 +1011,7 @@ local function evaluate(expr: Expression): Value?
         local fn = env[id]
 
         if fn then
-            if fn.Type ~= "Function" then
+            if fn.Type ~= "function" then
                 fail(`Cannot call a { fn.Type }.`)
                 error(`Unreachable.`)
             end
@@ -1188,7 +1188,7 @@ local function evaluate(expr: Expression): Value?
 
             return numberValue(-operandEval.Value)
         elseif expr.Operator == "#" then
-            if operandEval.Type == "string" or operandEval.Type == "List" then
+            if operandEval.Type == "string" or operandEval.Type == "list" then
                 return numberValue(#operandEval.Value)
             else
                 fail(`Cannot get the length of a { operandEval.Type }.`)
@@ -1201,7 +1201,7 @@ local function evaluate(expr: Expression): Value?
     elseif expr.Type == "Function" then
         -- TODO luau extraneous annotation
         local f: Value = {
-            Type = "Function",
+            Type = "function",
             Value = {
                 IsLuau = false,
                 Parameters = expr.Function.Parameters,
@@ -1230,7 +1230,7 @@ local function evaluate(expr: Expression): Value?
         end
 
         return {
-            Type = "List",
+            Type = "list",
             Value = values,
         }
     elseif expr.Type == "VariadicArguments" then
@@ -1264,7 +1264,7 @@ local function evaluate(expr: Expression): Value?
         return conditionResult
     elseif expr.Type == "ReadIndex" then
         local list = evaluate(expr.List) or nilValue()
-        assert(list.Type == "List", `Expected a list as the indexed value, got { list.Type }.`)
+        assert(list.Type == "list", `Expected a list as the indexed value, got { list.Type }.`)
 
         local index = evaluate(expr.Index) or nilValue()
         assert(index.Type == "number", `Expected a number as the index value, got { index.Type }.`)
@@ -1272,7 +1272,7 @@ local function evaluate(expr: Expression): Value?
         return list.Value[index.Value]
     elseif expr.Type == "WriteIndex" then
         local list = evaluate(expr.List) or nilValue()
-        assert(list.Type == "List", `Expected a list as the indexed value, got { list.Type }.`)
+        assert(list.Type == "list", `Expected a list as the indexed value, got { list.Type }.`)
 
         local index = evaluate(expr.Index) or nilValue()
         assert(index.Type == "number", `Expected a number as the index value, got { index.Type }.`)

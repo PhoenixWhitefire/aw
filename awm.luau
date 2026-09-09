@@ -71,7 +71,7 @@ local function functionType(params: { read Type }, variadic: Type, returns: Type
 
     return {
         Kind = "Operator",
-        Name = "Function",
+        Name = "function",
         Types = types,
     }
 end
@@ -79,7 +79,7 @@ end
 local function listType(contains: Type): Type
     return {
         Kind = "Operator",
-        Name = "List",
+        Name = "list",
         Types = { contains },
     }
 end
@@ -199,7 +199,7 @@ local function typeToString(ty: Type): string
         elseif ty.Kind == "Operator" then
             if #ty.Types == 0 then
                 return ty.Name
-            elseif ty.Name == "Function" then
+            elseif ty.Name == "function" then
                 local params = table.create<<string>>(#ty.Types)
                 local ret = nil
 
@@ -217,6 +217,8 @@ local function typeToString(ty: Type): string
 
                 assert(ret)
                 return `({ table.concat(params, ", ") }) -> { ret }`
+            elseif ty.Name == "list" then
+                return `\{ { typeToString(ty.Types[1]) } \}`
             else
                 local stringified = table.create<<string>>(#ty.Types)
 
@@ -414,7 +416,7 @@ local function unify(a: Type, b: Type, expr: caw.Expression, depth: number?): bo
             success = false
             local reportMismatch = true
 
-            if a.Name == "Function" and b.Name == "Function" then
+            if a.Name == "function" and b.Name == "function" then
                 if not isVoid(a.Types[#a.Types - 1]) and #b.Types > #a.Types - 1 and b.Types[#b.Types - 1].Kind == "Variable" then
                     success = true
 
@@ -490,9 +492,9 @@ local typeEnv: { [string]: Type? } = {
     print = functionType({}, genericT, voidType()),
     typeof = functionType({ genericT }, voidType(), stringType()),
     tostring = functionType({ genericT }, voidType(), stringType()),
-    tonumber = functionType({ numberType() }, voidType(), stringType()),
+    tonumber = functionType({ numberType() }, voidType(), numberType()), -- HMLIMIT: We cannot express that this returns `number | nil`.
 
-    List_clear = functionType({ listType(genericT), numberType(), genericT }, voidType(), voidType()),
+    list_clear = functionType({ listType(genericT), numberType(), genericT }, voidType(), voidType()),
 }
 
 local builtin = {}
@@ -771,7 +773,7 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
 
         return {
             Kind = "Operator",
-            Name = "List",
+            Name = "list",
             Types = { itemTy },
         }
 
