@@ -435,6 +435,9 @@ end
 
 local function getOperatorPrecedence(operatorTk: OperatorToken)
     local precedences: { [string]: number? } = {
+        ["="] = 1,
+        [".."] = 1,
+        ["+"] = 1,
         ["-"] = 1,
         ["*"] = 2,
         ["/"] = 2,
@@ -443,6 +446,8 @@ local function getOperatorPrecedence(operatorTk: OperatorToken)
 
     return precedences[operatorTk.Operator] or 0
 end
+
+local maybeCombineWithBinaryOperation
 
 local function parseBinaryOperation(state: ParseState, report: Report, left: Expression, opTk: OperatorToken, prevPrecedence: number?): Expression
     if opTk.Operator == "=" and left.Type ~= "Reference" then
@@ -455,30 +460,20 @@ local function parseBinaryOperation(state: ParseState, report: Report, left: Exp
         Type = "BinaryOperation",
         Operator = opTk.Operator,
         Left = left,
-        Right = parseExpression(state, report, prevPrecedence) or invalidExpr(state, `Got end-of-file trying to parse '{ opTk.Operator }' expression.`, report),
+        Right = parseExpression(state, report, precedence + 1) or invalidExpr(state, `Got end-of-file trying to parse '{ opTk.Operator }' expression.`, report),
     }, left)
 
-    local maybeOperator, consumeOperator = peekNextToken(state)
-
-    if maybeOperator.Type == "Operator" then
-        consumeOperator()
-
-        if getOperatorPrecedence(maybeOperator) < (prevPrecedence or 0) then
-            return parseBinaryOperation(state, report, op, maybeOperator)
-        end
-    end
-
-    return op
+    return maybeCombineWithBinaryOperation(state, report, op, prevPrecedence)
 end
 
-local function maybeCombineWithBinaryOperation(state: ParseState, report: Report, left: Expression, precedence: number?)
+function maybeCombineWithBinaryOperation(state: ParseState, report: Report, left: Expression, precedence: number?)
     if precedence == math.huge then
         return left
     end
 
     local maybeOperator, consumeOperator = peekNextToken(state)
 
-    if maybeOperator.Type == "Operator" then
+    if maybeOperator.Type == "Operator" and getOperatorPrecedence(maybeOperator) >= (precedence or 0) then
         consumeOperator()
         return parseBinaryOperation(state, report, left, maybeOperator, precedence)
     else
