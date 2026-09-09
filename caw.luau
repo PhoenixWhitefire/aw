@@ -51,6 +51,7 @@ type BasicToken = {
         | "OpenCurlyBraces"  | "CloseCurlyBraces"
         | "OpenSquareBraces" | "CloseSquareBraces"
         | "Comma"
+        | "Colon"
         | "Ellipsis"
         | "EndOfFile",
 }
@@ -100,8 +101,21 @@ type TokenData =
     | OperatorToken
     | BasicToken
 
-type Position = { Line: number, Character: number, Offset: number }
+export type Position = { Line: number, Character: number, Offset: number }
 type Token = TokenData & { Position: Position }
+
+type ErroneousAnnotation = {
+    read Kind: "Error",
+}
+
+type ReferenceAnnotation = {
+    read Kind: "Reference",
+    read Reference: string,
+}
+
+export type TypeAnnotation =
+    | ErroneousAnnotation
+    | ReferenceAnnotation
 
 type ExpressionData =
     | {
@@ -109,6 +123,7 @@ type ExpressionData =
         read Declaration: {
             read Name: string,
             read Value: Expression,
+            read Annotation: TypeAnnotation?,
         },
       }
     | {
@@ -212,6 +227,7 @@ local correspond: { read [string]: index<BasicToken, "Type">? } = {
     ["["] = "OpenSquareBraces",
     ["]"] = "CloseSquareBraces",
     [","] = "Comma",
+    [":"] = "Colon",
     ["..."] = "Ellipsis",
     [""] = "EndOfFile",
 }
@@ -408,6 +424,22 @@ local function invalidExpr(state, msg, report): Expression
     }, withPos)
 end
 
+local function parseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation
+    local annotation = nextToken(state)
+
+    if annotation.Type == "Identifier" then
+        return {
+            Kind = "Reference",
+            Reference = annotation.Identifier,
+        }
+    else
+        print(`{ state.Position.Line }:{ state.Position.Character }: Invalid annotation token '{ annotation.Type }'.`)
+        return {
+            Kind = "Error",
+        }
+    end
+end
+
 local parseExpression
 
 local function parseBody(state: ParseState, report: Report, stopAtElse: boolean?): ({ Expression }, Token)
@@ -556,10 +588,18 @@ function parseExpression(state: ParseState, report: Report, precedence: number?)
     elseif token.Type == "Keyword" then
         if token.Keyword == "let" then
             local nameTk = nextToken(state)
-            local name = "let" -- placeholder name
+            local name = "*error*"
+            local annotation = nil
 
             if nameTk.Type == "Identifier" then
                 name = nameTk.Identifier
+
+                local maybeColon, consumeColon = peekNextToken(state)
+
+                if maybeColon.Type == "Colon" then
+                    consumeColon()
+                    annotation = parseTypeAnnotation(state, report)
+                end
             else
                 report(`Expected an identifier, got a { nameTk.Type }.`, nameTk)
 
@@ -587,6 +627,7 @@ function parseExpression(state: ParseState, report: Report, precedence: number?)
                 Declaration = {
                     Name = name,
                     Value = expr or invalidExpr(state, `Got end-of-file trying to parse declaration.`, report),
+                    Annotation = annotation,
                 },
             }, token)
         elseif token.Keyword == "nil" then

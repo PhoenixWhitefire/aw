@@ -486,7 +486,8 @@ end
 
 local genericT = typeVariable()
 
-local typeEnv: { [string]: Type? } = {
+-- Maps declarations to types.
+local typeAssociations: { [string]: Type? } = {
     -- HMLIMIT: The type of `print`, `(...unknown) -> void`, is inexpressible, because `unknown` would have to be a "top type" that
     -- "unifies" "successfully" against everything, and does not instantiate.
     print = functionType({}, genericT, voidType()),
@@ -499,7 +500,7 @@ local typeEnv: { [string]: Type? } = {
 
 local builtin = {}
 
-for bi, _ in typeEnv do
+for bi, _ in typeAssociations do
     builtin[bi] = true
 end
 
@@ -538,7 +539,7 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             ty = errorReport(`Tried to assign '{ expr.Declaration.Name }' to an expression that returns 'void'.`, expr)
         end
 
-        typeEnv[expr.Declaration.Name] = ty
+        typeAssociations[expr.Declaration.Name] = ty
         return ty
 
     elseif expr.Type == "Constant" then
@@ -555,7 +556,7 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             error(`Unreachable.`)
         end
     elseif expr.Type == "Reference" then
-        local fromEnv = typeEnv[expr.Reference]
+        local fromEnv = typeAssociations[expr.Reference]
 
         if fromEnv then
             return fresh(fromEnv, state.nonGeneric)
@@ -589,7 +590,7 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             return booleanType()
         elseif expr.Operator == "=" then
             if expr.Left.Type == "Reference" then
-                local prev = typeEnv[expr.Left.Reference]
+                local prev = typeAssociations[expr.Left.Reference]
 
                 if not prev then
                     return errorReport(`Cannot mutate '{ expr.Left.Reference }' because it was not defined.`, expr)
@@ -668,7 +669,7 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
         return result
 
     elseif expr.Type == "Call" then
-        local fnTy = typeEnv[expr.Call.Identifier]
+        local fnTy = typeAssociations[expr.Call.Identifier]
 
         if not fnTy then
             return errorReport(`Unknown function '{ expr.Call.Identifier }'.`, expr)
@@ -699,8 +700,8 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             local tv = typeVariable()
             paramTys[i] = tv
             state.nonGeneric[tv] = true
-            shadowed[p] = typeEnv[p]
-            typeEnv[p] = tv
+            shadowed[p] = typeAssociations[p]
+            typeAssociations[p] = tv
         end
 
         if expr.Function.Variadic then
@@ -711,8 +712,8 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
         local fnTy = functionType(paramTys, variadic, typeVariable())
 
         if expr.Function.Name then
-            shadowed[expr.Function.Name] = typeEnv[expr.Function.Name]
-            typeEnv[expr.Function.Name] = fnTy
+            shadowed[expr.Function.Name] = typeAssociations[expr.Function.Name]
+            typeAssociations[expr.Function.Name] = fnTy
         end
 
         local prevVariTy = state.expectingVariadicTy
@@ -738,19 +739,19 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             state.nonGeneric[p] = nil
 
             local param = expr.Function.Parameters[i]
-            typeEnv[param] = shadowed[param]
+            typeAssociations[param] = shadowed[param]
         end
 
         state.nonGeneric[variadic] = nil
 
         if expr.Function.Name then
-            typeEnv[expr.Function.Name] = shadowed[expr.Function.Name]
+            typeAssociations[expr.Function.Name] = shadowed[expr.Function.Name]
         end
 
         fnTy = functionType(paramTys, variadic, retTy)
 
         if expr.Function.Name then
-            typeEnv[expr.Function.Name] = fnTy
+            typeAssociations[expr.Function.Name] = fnTy
         end
 
         return fnTy
@@ -873,8 +874,6 @@ local function writeInferenceLogs()
 end
 
 local function hm(expressions: { read caw.Expression }, options: { read LogInference: boolean })
-    print("\n--")
-
     logInference = options.LogInference
 
     if logInference then
@@ -898,7 +897,7 @@ local function hm(expressions: { read caw.Expression }, options: { read LogInfer
 
     local orderedInferences = {}
 
-    for k, _ in typeEnv do
+    for k, _ in typeAssociations do
         table.insert(orderedInferences, k)
     end
 
@@ -906,7 +905,7 @@ local function hm(expressions: { read caw.Expression }, options: { read LogInfer
 
     for _, k in orderedInferences do
         if not builtin[k] then
-            local v = assert(typeEnv[k])
+            local v = assert(typeAssociations[k])
 
             print(`{ k }: { typeToString(v) }`)
         end

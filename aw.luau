@@ -93,10 +93,11 @@ end
 
 local inferers = {
     hm = require("./awm"),
+    sn = require("./awn"),
 }
 
 local logInference = false
-local inference: keyof<typeof(inferers)> = "hm"
+local inference: keyof<typeof(inferers)> = "sn"
 local printAst = false
 
 local helpText = [[
@@ -177,8 +178,12 @@ else
     return false
 end
 
+print("\n--")
+
 if inference == "hm" then
     inferers.hm(result.Expressions, { LogInference = logInference })
+elseif inference == "sn" then
+    inferers.sn(result.Expressions, { LogInference = logInference })
 else
     unreachable(inference)
     error(`Unreachable.`)
