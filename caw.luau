@@ -277,7 +277,7 @@ local function nextToken(state: ParseState): Token
     if isSeparator(c) then
         local next, pos = nextCharacter(state.Program, state.Position.Offset)
 
-        if next == "=" or next == "-" then
+        if next == "=" or (next == "-" and c == "-") then
             token = c .. next
             state.Position.Offset = pos
         else
@@ -288,7 +288,7 @@ local function nextToken(state: ParseState): Token
             repeat
                 next, pos = nextCharacter(state.Program, state.Position.Offset)
                 state.Position.Offset = pos
-            until next == "\n" or next == ""
+            until next == "\n" or isEof(next)
 
             state.Position.Character = 1
             state.Position.Line += 1
@@ -433,37 +433,37 @@ local function parseBody(state: ParseState, report: Report, stopAtElse: boolean?
     return body, endTk
 end
 
-local function operatorHasPrecendence(operatorTk: OperatorToken)
-    local operatorsWithPrecedence = {
-        ["*"] = true,
-        ["/"] = true,
-        ["//"] = true,
-        ["-"] = true, -- Probably wrong. `1 - 2 - 3`.
+local function getOperatorPrecedence(operatorTk: OperatorToken)
+    local precedences: { [string]: number? } = {
+        ["-"] = 1,
+        ["*"] = 2,
+        ["/"] = 2,
+        ["//"] = 2,
     }
 
-    return operatorsWithPrecedence[operatorTk.Operator] == true
+    return precedences[operatorTk.Operator] or 0
 end
 
-local function parseBinaryOperation(state: ParseState, report: Report, left: Expression, opTk: OperatorToken): Expression
+local function parseBinaryOperation(state: ParseState, report: Report, left: Expression, opTk: OperatorToken, prevPrecedence: number?): Expression
     if opTk.Operator == "=" and left.Type ~= "Reference" then
         report(`Mutation operator expects LHS to be a reference, got a { left.Type } instead.`, left)
     end
 
-    local hasPrecendence = operatorHasPrecendence(opTk)
+    local precedence = getOperatorPrecedence(opTk)
 
     local op = ex({
         Type = "BinaryOperation",
         Operator = opTk.Operator,
         Left = left,
-        Right = parseExpression(state, report, hasPrecendence) or invalidExpr(state, `Got end-of-file trying to parse '{ opTk.Operator }' expression.`, report),
+        Right = parseExpression(state, report, prevPrecedence) or invalidExpr(state, `Got end-of-file trying to parse '{ opTk.Operator }' expression.`, report),
     }, left)
 
-    if hasPrecendence then
-        local maybeOperator, consumeOperator = peekNextToken(state)
+    local maybeOperator, consumeOperator = peekNextToken(state)
 
-        if maybeOperator.Type == "Operator" then
-            consumeOperator()
+    if maybeOperator.Type == "Operator" then
+        consumeOperator()
 
+        if getOperatorPrecedence(maybeOperator) < (prevPrecedence or 0) then
             return parseBinaryOperation(state, report, op, maybeOperator)
         end
     end
@@ -471,18 +471,18 @@ local function parseBinaryOperation(state: ParseState, report: Report, left: Exp
     return op
 end
 
-local function maybeCombineWithBinaryOperation(state: ParseState, report: Report, left: Expression, shallow: boolean?)
-    if shallow then
+local function maybeCombineWithBinaryOperation(state: ParseState, report: Report, left: Expression, precedence: number?)
+    if precedence == math.huge then
         return left
-    else
-        local maybeOperator, consumeOperator = peekNextToken(state)
+    end
 
-        if maybeOperator.Type == "Operator" then
-            consumeOperator()
-            return parseBinaryOperation(state, report, left, maybeOperator)
-        else
-            return left
-        end
+    local maybeOperator, consumeOperator = peekNextToken(state)
+
+    if maybeOperator.Type == "Operator" then
+        consumeOperator()
+        return parseBinaryOperation(state, report, left, maybeOperator, precedence)
+    else
+        return left
     end
 end
 
@@ -548,7 +548,7 @@ local function parseFunction(state: ParseState, report: Report, token: Token): E
     }, token)
 end
 
-function parseExpression(state: ParseState, report: Report, shallow: boolean?): Expression?
+function parseExpression(state: ParseState, report: Report, precedence: number?): Expression?
     local token = nextToken(state)
 
     if token.Type == "InvalidSyntax" then
@@ -722,7 +722,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
             end
         end
 
-        return maybeCombineWithBinaryOperation(state, report, left, shallow)
+        return maybeCombineWithBinaryOperation(state, report, left, precedence)
     elseif token.Type == "Literal" then
         -- TODO luau does not report error when `position` is not attached even though the annotation is explicit
         local constant: Expression = ex({
@@ -730,7 +730,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
             Constant = token.Literal,
         }, token)
 
-        return maybeCombineWithBinaryOperation(state, report, constant, shallow)
+        return maybeCombineWithBinaryOperation(state, report, constant, precedence)
     elseif token.Type == "Comma" then
         -- TODO check
         state.Position.Offset += 1
@@ -756,7 +756,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
                     }, token)
                 end
             else
-                inner = parseExpression(state, report, true) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression.`, report)
+                inner = parseExpression(state, report, math.huge) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression.`, report)
             end
 
             local negation = ex({
@@ -765,7 +765,7 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
                 Operand = inner,
             }, token)
 
-            return maybeCombineWithBinaryOperation(state, report, negation, true)
+            return maybeCombineWithBinaryOperation(state, report, negation)
         else
             report(`Unexpected '{ token.Operator }' operator.`, token)
 
@@ -819,12 +819,19 @@ function parseExpression(state: ParseState, report: Report, shallow: boolean?): 
             return maybeCombineWithBinaryOperation(state, report, ex({
                 Type = "VariadicSelection",
                 Selection = selector,
-            }, token), shallow)
+            }, token), precedence)
         else
             return ex({
                 Type = "VariadicArguments",
             }, token)
         end
+    elseif token.Type == "OpenParentheses" then
+        local inner = parseExpression(state, report)
+        local parentheses = nextToken(state)
+        assert(parentheses.Type == "CloseParentheses", `Expected closing parentheses, got { parentheses.Type }`)
+
+        return inner
+
     elseif token.Type == "EndOfFile" then
         return nil
     else
