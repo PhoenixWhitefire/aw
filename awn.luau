@@ -264,7 +264,6 @@ local function normalize(ty: Type): NormalizedType
         error(`Unreachable.`)
     end
 
-    print(`{ typeToString(ty) } = { normalizationToString(n) }`)
     return n
 end
 
@@ -392,9 +391,9 @@ local function typeAnnotationToType(position: caw.Position, annotation: caw.Type
     end
 end
 
-local function check(expr: caw.Expression, annotation: caw.TypeAnnotation): (boolean, Type, Type)
+local function check(expr: caw.Expression, annotation: caw.TypeAnnotation): (boolean, Type, Type, NormalizedType, NormalizedType)
     if annotation.Kind == "Error" then
-        return true, inferenceCache[expr] or infer(expr), errorType()
+        return true, inferenceCache[expr] or infer(expr), errorType(), normalize(errorType()), normalize(errorType())
     end
 
     local inferred = inferenceCache[expr] or infer(expr)
@@ -403,7 +402,10 @@ local function check(expr: caw.Expression, annotation: caw.TypeAnnotation): (boo
     local annotated = annotationToType[annotation] or typeAnnotationToType(expr.Position, annotation)
     annotationToType[annotation] = annotated
 
-    return isSubtypeOf(normalize(inferred), normalize(annotated)), inferred, annotated
+    local normalizedInference = normalize(inferred)
+    local normalizedAnnotation = normalize(annotated)
+
+    return isSubtypeOf(normalizedInference, normalizedAnnotation), inferred, annotated, normalizedInference, normalizedAnnotation
 end
 
 local function bidisemi(expressions: { read caw.Expression }, options: { read LogInference: boolean })
@@ -414,10 +416,34 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
         print(typeToString(ty))
 
         if expr.Type == "Declaration" and expr.Declaration.Annotation then
-            local matches, a, b  = check(expr, expr.Declaration.Annotation)
+            local matches, a, b, na, nb  = check(expr, expr.Declaration.Annotation)
 
             if not matches then
-                print(`Type does not match annotation: { typeToString(a) } is not a subtype of { typeToString(b) }.`)
+                local err = `Type does not match annotation: `
+
+                local as = typeToString(a)
+                local nas = normalizationToString(na)
+
+                err ..= `'{ as }' `
+
+                if nas ~= as then
+                    err ..= `(aka '{ nas }') `
+                end
+
+                err ..= "is not a subtype of "
+
+                local bs = typeToString(b)
+                local nbs = normalizationToString(nb)
+
+                err ..= `'{ bs }'`
+
+                if nbs ~= bs then
+                    err ..= ` (aka '{ nbs }')`
+                end
+
+                err ..= "."
+
+                print(err)
             end
         end
     end
