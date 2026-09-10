@@ -353,57 +353,6 @@ local function infer(expr: caw.Expression): Type
     end
 end
 
-local function isSyntacticSubtypeOf(a: Type, b: Type): boolean
-    if a == b then
-        return true
-    end
-
-    if a.Kind == "error" or b.Kind == "error" then
-        return true
-    elseif a.Kind == "Union" then
-        for i, c in a.Components do
-            if not isSyntacticSubtypeOf(c, b) then
-                return false
-            end
-        end
-
-        return true
-    elseif a.Kind == "Intersection" then
-        for i, c in a.Components do
-            if isSyntacticSubtypeOf(c, b) then
-                return true
-            end
-        end
-
-        return false
-    elseif b.Kind == "Union" then
-        for i, c in b.Components do
-            if isSyntacticSubtypeOf(a, c) then
-                return true
-            end
-        end
-
-        return false
-    elseif b.Kind == "Intersection" then
-        for i, c in b.Components do
-            if not isSyntacticSubtypeOf(a, c) then
-                return false
-            end
-        end
-
-        return true
-    elseif a.Kind == "never" then
-        return true
-    elseif a.Kind == "unknown" then
-        return b.Kind == "unknown"
-    elseif a.Kind == "Primitive" then
-        return b.Kind == "unknown" or (b.Kind == "Primitive" and b.Primitive == a.Primitive)
-    else
-        unreachable(a.Kind)
-        error(`Unreachable.`)
-    end
-end
-
 local function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnotation): Type
     if annotation.Kind == "Error" then
         return errorType()
