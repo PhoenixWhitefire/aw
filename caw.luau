@@ -52,6 +52,8 @@ type BasicToken = {
         | "OpenSquareBraces" | "CloseSquareBraces"
         | "Comma"
         | "Colon"
+        | "Pipe"
+        | "Ampersand"
         | "Ellipsis"
         | "EndOfFile",
 }
@@ -113,9 +115,21 @@ type ReferenceAnnotation = {
     read Reference: string,
 }
 
+type UnionTypeAnnotation = {
+    read Kind: "Union",
+    read Components: { read TypeAnnotation },
+}
+
+type IntersectionTypeAnnotation = {
+    read Kind: "Intersection",
+    read Components: { read TypeAnnotation },
+}
+
 export type TypeAnnotation =
     | ErroneousAnnotation
     | ReferenceAnnotation
+    | UnionTypeAnnotation
+    | IntersectionTypeAnnotation
 
 type ExpressionData =
     | {
@@ -228,6 +242,8 @@ local correspond: { read [string]: index<BasicToken, "Type">? } = {
     ["]"] = "CloseSquareBraces",
     [","] = "Comma",
     [":"] = "Colon",
+    ["|"] = "Pipe",
+    ["&"] = "Ampersand",
     ["..."] = "Ellipsis",
     [""] = "EndOfFile",
 }
@@ -424,20 +440,62 @@ local function invalidExpr(state, msg, report): Expression
     }, withPos)
 end
 
-local function parseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation
+local parseTypeAnnotation
+local maybeCombineWithTypeOperator
+
+local function parseBinaryTypeOperator(state: ParseState, report: Report, left: TypeAnnotation, opTk: Token): TypeAnnotation
+    local combined: TypeAnnotation = {
+        -- TODO luau false positive type error when this is `"Union" | "Intersection"`
+        Kind = if opTk.Type == "Pipe" then "Union" else "Intersection" :: "Union",
+        Components = { left, parseTypeAnnotation(state, report) },
+    }
+
+    return maybeCombineWithTypeOperator(state, report, combined)
+end
+
+function maybeCombineWithTypeOperator(state: ParseState, report: Report, left: TypeAnnotation): TypeAnnotation
+    local maybeOperator, consumeOperator = peekNextToken(state)
+
+    if maybeOperator.Type == "Pipe" or maybeOperator.Type == "Ampersand" then
+        consumeOperator()
+        -- TODO luau type error on `maybeOperator`
+        return parseBinaryTypeOperator(state, report, left, maybeOperator)
+    else
+        return left
+    end
+end
+
+function parseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation
     local annotation = nextToken(state)
+    local ty: TypeAnnotation? = nil
 
     if annotation.Type == "Identifier" then
-        return {
+        ty = {
             Kind = "Reference",
             Reference = annotation.Identifier,
         }
+    elseif annotation.Type == "Keyword" then
+        if annotation.Keyword == "nil" then
+            ty = {
+                -- TODO luau cast
+                Kind = "Reference" :: "Reference",
+                Reference = "nil",
+            }
+        else
+            report(`Invalid annotation keyword '{ annotation.Keyword }'.`, annotation)
+        end
+    elseif annotation.Type == "OpenParentheses" then
+        ty = parseTypeAnnotation(state, report)
+        local parens = nextToken(state)
+
+        if parens.Type ~= "CloseParentheses" then
+            report(`Expected closing parentheses, got { parens.Type }.`, parens)
+        end
     else
-        print(`{ state.Position.Line }:{ state.Position.Character }: Invalid annotation token '{ annotation.Type }'.`)
-        return {
-            Kind = "Error",
-        }
+        report(`Invalid annotation token '{ annotation.Type }'.`, annotation)
     end
+
+    return maybeCombineWithTypeOperator(state, report, ty or { Kind = "Error" })
 end
 
 local parseExpression

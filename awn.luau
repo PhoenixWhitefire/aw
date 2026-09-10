@@ -20,11 +20,23 @@ type PrimitiveType = {
     read Primitive: "nil" | "boolean" | "number" | "string",
 }
 
+type UnionType = {
+    read Kind: "Union",
+    read Components: { read Type },
+}
+
+type IntersectionType = {
+    read Kind: "Intersection",
+    read Components: { read Type },
+}
+
 type Type =
     | ErrorType
     | NeverType
     | UnknownType
     | PrimitiveType
+    | UnionType
+    | IntersectionType
 
 local function unreachable(x: never): never
     error(`Unexpected branch with value '{ x }' ({ typeof(x) }), this is an internal error.`)
@@ -39,6 +51,32 @@ local function typeToString(ty: Type): string
         return "unknown"
     elseif ty.Kind == "Primitive" then
         return ty.Primitive
+    elseif ty.Kind == "Union" then
+        local tys = table.create<<string>>(#ty.Components)
+
+        for i, c in ty.Components do
+            local ts = typeToString(c)
+            if c.Kind == "Union" or c.Kind == "Intersection" then
+                tys[i] = `({ ts })`
+            else
+                tys[i] = ts
+            end
+        end
+
+        return table.concat(tys, " | ")
+    elseif ty.Kind == "Intersection" then
+        local tys = table.create<<string>>(#ty.Components)
+
+        for i, c in ty.Components do
+            local ts = typeToString(c)
+            if c.Kind == "Union" or c.Kind == "Intersection" then
+                tys[i] = `({ ts })`
+            else
+                tys[i] = ts
+            end
+        end
+
+        return table.concat(tys, " & ")
     else
         unreachable(ty.Kind)
         error(`Unreachable.`)
@@ -79,12 +117,33 @@ end
 local typeEnv: { [string]: Type? } = {
     never = neverType(),
     unknown = unknownType(),
+    ["nil"] = primitiveType("nil"),
     boolean = primitiveType("boolean"),
     number = primitiveType("number"),
     string = primitiveType("string"),
 }
 -- Maps declaration names to types.
-local typeAssociations: { [string]: Type? } = {}
+local typeAssociations: { [string]: Type? } = {
+    nsn = {
+        Kind = "Intersection",
+        Components = {
+            {
+                Kind = "Union",
+                Components = {
+                    primitiveType("string"),
+                    primitiveType("nil"),
+                }
+            },
+            {
+                Kind = "Union",
+                Components = {
+                    primitiveType("number"),
+                    primitiveType("nil"),
+                }
+            }
+        }
+    }
+}
 local inferenceCache: { [caw.Expression]: Type? } = {}
 local annotationToType: { [caw.TypeAnnotation]: Type? } = {}
 
@@ -112,7 +171,43 @@ local function infer(expr: caw.Expression): Type
 end
 
 local function isSyntacticSubtypeOf(a: Type, b: Type): boolean
-    if a.Kind == "error" then
+    if a == b then
+        return true
+    end
+
+    if a.Kind == "error" or b.Kind == "error" then
+        return true
+    elseif a.Kind == "Union" then
+        for i, c in a.Components do
+            if not isSyntacticSubtypeOf(c, b) then
+                return false
+            end
+        end
+
+        return true
+    elseif a.Kind == "Intersection" then
+        for i, c in a.Components do
+            if isSyntacticSubtypeOf(c, b) then
+                return true
+            end
+        end
+
+        return false
+    elseif b.Kind == "Union" then
+        for i, c in b.Components do
+            if isSyntacticSubtypeOf(a, c) then
+                return true
+            end
+        end
+
+        return false
+    elseif b.Kind == "Intersection" then
+        for i, c in b.Components do
+            if not isSyntacticSubtypeOf(a, c) then
+                return false
+            end
+        end
+
         return true
     elseif a.Kind == "never" then
         return true
@@ -137,6 +232,28 @@ local function typeAnnotationToType(position: caw.Position, annotation: caw.Type
         else
             return errorReport(`Unknown type '{ annotation.Reference }'`, position)
         end
+    elseif annotation.Kind == "Union" then
+        local components = table.create<<Type>>(#annotation.Components)
+
+        for i, c in annotation.Components do
+            components[i] = typeAnnotationToType(position, c)
+        end
+
+        return {
+            Kind = "Union",
+            Components = components,
+        }
+    elseif annotation.Kind == "Intersection" then
+        local components = table.create<<Type>>(#annotation.Components)
+
+        for i, c in annotation.Components do
+            components[i] = typeAnnotationToType(position, c)
+        end
+
+        return {
+            Kind = "Intersection",
+            Components = components,
+        }
     else
         unreachable(annotation.Kind)
         error(`Unreachable.`)
