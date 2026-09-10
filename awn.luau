@@ -268,31 +268,31 @@ local function normalize(ty: Type): NormalizedType
 end
 
 local function isSubtypeOf(a: NormalizedType, b: NormalizedType): boolean
-    if a.Top and not b.Top then
-        return false
-    end
-
     if a.Error or b.Error then
         return true
     end
 
-    if a.Nil and b.Nil then
-        return true
+    if a.Top and not b.Top then
+        return false
     end
 
-    if a.Boolean and b.Boolean then
-        return true
+    if a.Nil and not b.Nil then
+        return false
     end
 
-    if a.Number and b.Number then
-        return true
+    if a.Boolean and not b.Boolean then
+        return false
     end
 
-    if a.String and b.String then
-        return true
+    if a.Number and not b.Number then
+        return false
     end
 
-    return false
+    if a.String and not b.String then
+        return false
+    end
+
+    return true
 end
 
 -- Maps type names to types.
@@ -328,13 +328,17 @@ local typeAssociations: { [string]: Type? } = {
 }
 local inferenceCache: { [caw.Expression]: Type? } = {}
 local annotationToType: { [caw.TypeAnnotation]: Type? } = {}
+local typeAnnotationToType
 
 local function infer(expr: caw.Expression): Type
     if expr.Type == "Constant" then
         return primitiveType(expr.Constant.Type)
 
     elseif expr.Type == "Declaration" then
-        local ty = infer(expr.Declaration.Value)
+        local ty = if expr.Declaration.Value then infer(expr.Declaration.Value)
+                    else if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation)
+                    else primitiveType("nil")
+        -- TODO luau type error on `ty`
         typeAssociations[expr.Declaration.Name] = ty
 
         return ty
@@ -352,7 +356,7 @@ local function infer(expr: caw.Expression): Type
     end
 end
 
-local function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnotation): Type
+function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnotation): Type
     if annotation.Kind == "Error" then
         return errorType()
     elseif annotation.Kind == "Reference" then

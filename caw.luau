@@ -136,7 +136,7 @@ type ExpressionData =
         read Type: "Declaration",
         read Declaration: {
             read Name: string,
-            read Value: Expression,
+            read Value: Expression?,
             read Annotation: TypeAnnotation?,
         },
       }
@@ -667,24 +667,19 @@ function parseExpression(state: ParseState, report: Report, precedence: number?)
                 }, nameTk)
             end
 
-            local equalsTk = nextToken(state)
+            local value = nil
+            local maybeEqualsTk, consumeEquals = peekNextToken(state)
 
-            if equalsTk.Type ~= "Operator" or equalsTk.Operator ~= "=" then
-                report(`Expected an '=' to follow declaration identifier, got a { equalsTk.Type }.`, equalsTk)
-
-                return ex({
-                    Type = "InvalidSyntax",
-                    Token = equalsTk.Type,
-                }, equalsTk)
+            if maybeEqualsTk.Type == "Operator" and maybeEqualsTk.Operator == "=" then
+                consumeEquals()
+                value = parseExpression(state, report) or invalidExpr(state, `Got end-of-file trying to parse declaration.`, report)
             end
-
-            local expr = parseExpression(state, report)
 
             return ex({
                 Type = "Declaration",
                 Declaration = {
                     Name = name,
-                    Value = expr or invalidExpr(state, `Got end-of-file trying to parse declaration.`, report),
+                    Value = value,
                     Annotation = annotation,
                 },
             }, token)
@@ -1101,7 +1096,7 @@ local function evaluate(expr: Expression): Value?
             fail(`A binding with the name '{ name }' already exists.`)
         end
 
-        local v = evaluate(expr.Declaration.Value)
+        local v = if expr.Declaration.Value then evaluate(expr.Declaration.Value) else nilValue()
         env[name] = v or nilValue()
 
         return v

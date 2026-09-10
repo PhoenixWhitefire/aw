@@ -533,7 +533,7 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
     end
 
     if expr.Type == "Declaration" then
-        local ty = infer(expr.Declaration.Value, state)
+        local ty = if expr.Declaration.Value then infer(expr.Declaration.Value, state) else nilType()
 
         if isVoid(ty) then
             ty = errorReport(`Tried to assign '{ expr.Declaration.Name }' to an expression that returns 'void'.`, expr)
