@@ -144,6 +144,13 @@ local function errorReport(message, position): Type
     return errorType()
 end
 
+local function makeUnion(a: Type, b: Type): Type
+    return {
+        Kind = "Union",
+        Components = { a, b },
+    }
+end
+
 local function toNever(n: NormalizedType)
     n.Error = false
     n.Top = false
@@ -272,8 +279,8 @@ local function isSubtypeOf(a: NormalizedType, b: NormalizedType): boolean
         return true
     end
 
-    if a.Top and not b.Top then
-        return false
+    if b.Top then
+        return true
     end
 
     if a.Nil and not b.Nil then
@@ -305,51 +312,72 @@ local typeEnv: { [string]: Type? } = {
     string = primitiveType("string"),
 }
 -- Maps declaration names to types.
-local typeAssociations: { [string]: Type? } = {
-    nsn = {
-        Kind = "Intersection",
-        Components = {
-            {
-                Kind = "Union",
-                Components = {
-                    primitiveType("string"),
-                    primitiveType("nil"),
-                }
-            },
-            {
-                Kind = "Union",
-                Components = {
-                    primitiveType("number"),
-                    primitiveType("nil"),
-                }
-            }
-        }
-    }
-}
-local inferenceCache: { [caw.Expression]: Type? } = {}
-local annotationToType: { [caw.TypeAnnotation]: Type? } = {}
+local typeAssociations: { [string]: { Expression: caw.Expression, Type: Type }? } = {}
+
 local typeAnnotationToType
+local check
 
 local function infer(expr: caw.Expression): Type
     if expr.Type == "Constant" then
         return primitiveType(expr.Constant.Type)
 
     elseif expr.Type == "Declaration" then
-        local ty = if expr.Declaration.Value then infer(expr.Declaration.Value)
-                    else if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation)
-                    else primitiveType("nil")
-        -- TODO luau type error on `ty`
-        typeAssociations[expr.Declaration.Name] = ty
+        local ty = if expr.Declaration.Value then infer(expr.Declaration.Value) else primitiveType("nil")
+        local anno = if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation) else nil
+
+        -- TODO luau type error on `ty` when `anno or` is removed
+        typeAssociations[expr.Declaration.Name] = {
+            Expression = expr,
+            Type = anno or ty
+        }
+
+        if anno then
+            check(ty, anno, if expr.Declaration.Value then expr.Declaration.Value.Position else expr.Position)
+        end
 
         return ty
+
     elseif expr.Type == "Reference" then
         local name = expr.Reference
         local referred = typeAssociations[name]
 
         if referred then
-            return referred
+            return referred.Type
         else
             return errorReport(`Invalid reference '{ name }'.`, expr.Position)
+        end
+
+    elseif expr.Type == "BinaryOperation" then
+        if expr.Operator == "=" then
+            local variable = expr.Left
+            local value = expr.Right
+
+            assert(variable.Type == "Reference")
+            local ref = typeAssociations[variable.Reference]
+
+            if not ref then
+                return errorReport(`Undefined variable '{ variable.Reference }'`, variable)
+            end
+            assert(ref.Expression.Type == "Declaration")
+
+            local variableTy = infer(variable)
+            local valueTy = infer(value)
+            local annoTy = if ref.Expression.Declaration.Annotation then typeAnnotationToType(ref.Expression.Position, ref.Expression.Declaration.Annotation) else nil
+
+            if annoTy then
+                check(valueTy, annoTy, value.Position)
+            elseif ref.Expression.Declaration.Value then
+                check(valueTy, variableTy, value.Position)
+            else
+                typeAssociations[variable.Reference] = {
+                    Expression = ref.Expression,
+                    Type = valueTy,
+                }
+            end
+
+            return annoTy or valueTy
+        else
+            error(`Cannot infer '{ expr.Operator }' operations.`)
         end
     else
         error(`Cannot infer { expr.Type }.`)
@@ -395,61 +423,56 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
     end
 end
 
-local function check(expr: caw.Expression, annotation: caw.TypeAnnotation): (boolean, Type, Type, NormalizedType, NormalizedType)
-    if annotation.Kind == "Error" then
-        return true, inferenceCache[expr] or infer(expr), errorType(), normalize(errorType()), normalize(errorType())
+local function reportMismatch(a: Type, na: NormalizedType, b: Type, nb: NormalizedType, position: caw.Position)
+    local err = `{ position.Line }:{ position.Character }: Type error: `
+
+    local as = typeToString(a)
+    local nas = normalizationToString(na)
+
+    err ..= `'{ as }' `
+
+    if nas ~= as then
+        err ..= `(aka '{ nas }') `
     end
 
-    local inferred = inferenceCache[expr] or infer(expr)
-    inferenceCache[expr] = inferred
+    err ..= "is not a subtype of "
 
-    local annotated = annotationToType[annotation] or typeAnnotationToType(expr.Position, annotation)
-    annotationToType[annotation] = annotated
+    local bs = typeToString(b)
+    local nbs = normalizationToString(nb)
+
+    err ..= `'{ bs }'`
+
+    if nbs ~= bs then
+        err ..= ` (aka '{ nbs }')`
+    end
+
+    err ..= "."
+
+    print(err)
+end
+
+function check(inferred: Type, annotation: Type, position: caw.Position)
+    if annotation.Kind == "Error" then
+        return
+    end
 
     local normalizedInference = normalize(inferred)
-    local normalizedAnnotation = normalize(annotated)
+    local normalizedAnnotation = normalize(annotation)
 
-    return isSubtypeOf(normalizedInference, normalizedAnnotation), inferred, annotated, normalizedInference, normalizedAnnotation
+    if not isSubtypeOf(normalizedInference, normalizedAnnotation) then
+        reportMismatch(inferred, normalizedInference, annotation, normalizedAnnotation, position)
+    end
 end
 
 local function bidisemi(expressions: { read caw.Expression }, options: { read LogInference: boolean })
     -- logInference = options.LogInference
 
     for _, expr in expressions do
-        local ty = infer(expr)
-        print(typeToString(ty))
+        infer(expr)
+    end
 
-        if expr.Type == "Declaration" and expr.Declaration.Annotation then
-            local matches, a, b, na, nb  = check(expr, expr.Declaration.Annotation)
-
-            if not matches then
-                local err = `Type does not match annotation: `
-
-                local as = typeToString(a)
-                local nas = normalizationToString(na)
-
-                err ..= `'{ as }' `
-
-                if nas ~= as then
-                    err ..= `(aka '{ nas }') `
-                end
-
-                err ..= "is not a subtype of "
-
-                local bs = typeToString(b)
-                local nbs = normalizationToString(nb)
-
-                err ..= `'{ bs }'`
-
-                if nbs ~= bs then
-                    err ..= ` (aka '{ nbs }')`
-                end
-
-                err ..= "."
-
-                print(err)
-            end
-        end
+    for k, t in typeAssociations do
+        print(`{ k }: { typeToString(t.Type) }`)
     end
 end
 
