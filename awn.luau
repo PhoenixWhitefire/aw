@@ -15,10 +15,31 @@ type UnknownType = {
     read Kind: "unknown",
 }
 
-type PrimitiveType = {
+type NilType = {
     read Kind: "Primitive",
-    read Primitive: "nil" | "boolean" | "number" | "string",
+    read Primitive: "nil",
 }
+
+type BooleanType = {
+    read Kind: "Primitive",
+    read Primitive: "boolean",
+}
+
+type NumberType = {
+    read Kind: "Primitive",
+    read Primitive: "number",
+}
+
+type StringType = {
+    read Kind: "Primitive",
+    read Primitive: "string",
+}
+
+type PrimitiveType =
+    | NilType
+    | BooleanType
+    | NumberType
+    | StringType
 
 type UnionType = {
     read Kind: "Union",
@@ -37,6 +58,15 @@ type Type =
     | PrimitiveType
     | UnionType
     | IntersectionType
+
+type NormalizedType = {
+    Error:   boolean,
+    Top:     boolean,
+    Nil:     boolean,
+    Boolean: boolean,
+    Number:  boolean,
+    String:  boolean,
+}
 
 local function unreachable(x: never): never
     error(`Unexpected branch with value '{ x }' ({ typeof(x) }), this is an internal error.`)
@@ -111,6 +141,86 @@ end
 local function errorReport(message, position): Type
     print(`{ position.Line }:{ position.Character }: { message }`)
     return errorType()
+end
+
+local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
+    n.Error = n.Error or with.Error
+    n.Top = n.Top or with.Top
+    n.Nil = n.Nil or with.Nil
+    n.Boolean = n.Boolean or with.Boolean
+    n.Number = n.Number or with.Number
+    n.String = n.String or with.String
+end
+
+local function normalize(ty: Type): NormalizedType
+    local n: NormalizedType = {
+        Top = false,
+        Error = false,
+        Nil = false,
+        Boolean = false,
+        Number = false,
+        String = false,
+    }
+
+    if ty.Kind == "error" then
+        n.Error = true
+    elseif ty.Kind == "never" then
+    elseif ty.Kind == "unknown" then
+        n.Top = true
+    elseif ty.Kind == "Primitive" then
+        if ty.Primitive == "nil" then
+            n.Nil = true
+        elseif ty.Primitive == "boolean" then
+            n.Boolean = true
+        elseif ty.Primitive == "number" then
+            n.Number = true
+        elseif ty.Primitive == "string" then
+            n.String = true
+        else
+            unreachable(ty.Primitive)
+            error(`Unreachable.`)
+        end
+    elseif ty.Kind == "Union" then
+        for i, c in ty.Components do
+            local inner = normalize(c)
+            unionNormalizedType(n, inner)
+        end
+    elseif ty.Kind == "Intersection" then
+        error(`Not yet.`)
+    else
+        unreachable(ty.Kind)
+        error(`Unreachable.`)
+    end
+
+    return n
+end
+
+local function isSubtypeOf(a: NormalizedType, b: NormalizedType): boolean
+    if a.Top and not b.Top then
+        return false
+    end
+
+    if a.Error or b.Error then
+        return true
+    end
+
+    if a.Nil and b.Nil then
+        return true
+    end
+
+    if a.Boolean and b.Boolean then
+        return true
+    end
+
+    if a.Number and b.Number then
+        return true
+    end
+
+    if a.String and b.String then
+        return true
+    end
+
+    return false
 end
 
 -- Maps type names to types.
@@ -271,7 +381,7 @@ local function check(expr: caw.Expression, annotation: caw.TypeAnnotation): (boo
     local annotated = annotationToType[annotation] or typeAnnotationToType(expr.Position, annotation)
     annotationToType[annotation] = annotated
 
-    return isSyntacticSubtypeOf(inferred, annotated), inferred, annotated
+    return isSubtypeOf(normalize(inferred), normalize(annotated)), inferred, annotated
 end
 
 local function bidisemi(expressions: { read caw.Expression }, options: { read LogInference: boolean })
