@@ -131,16 +131,35 @@ local function unknownType(): Type
     }
 end
 
-local function primitiveType(primitive: index<PrimitiveType, "Primitive">): Type
+local function primitiveType(primitive: index<PrimitiveType, "Primitive">): PrimitiveType
     return {
         Kind = "Primitive",
-        Primitive = primitive,
+        -- TODO luau cast
+        Primitive = primitive :: "nil",
     }
 end
 
 local function errorReport(message, position): Type
     print(`{ position.Line }:{ position.Character }: { message }`)
     return errorType()
+end
+
+local function toNever(n: NormalizedType)
+    n.Error = false
+    n.Top = false
+    n.Nil = false
+    n.Boolean = false
+    n.Number = false
+    n.String = false
+end
+
+local function toUnknown(n: NormalizedType)
+    n.Error = false
+    n.Top = true
+    n.Nil = true
+    n.Boolean = true
+    n.Number = true
+    n.String = true
 end
 
 local function normalizationToString(n: NormalizedType): string
@@ -168,6 +187,10 @@ local function normalizationToString(n: NormalizedType): string
 
     if n.String then
         table.insert(t, "string")
+    end
+
+    if #t == 0 then
+        return "never"
     end
 
     return table.concat(t, " | ")
@@ -204,8 +227,9 @@ local function normalize(ty: Type): NormalizedType
     if ty.Kind == "error" then
         n.Error = true
     elseif ty.Kind == "never" then
+        toNever(n)
     elseif ty.Kind == "unknown" then
-        n.Top = true
+        toUnknown(n)
     elseif ty.Kind == "Primitive" then
         if ty.Primitive == "nil" then
             n.Nil = true
@@ -220,11 +244,17 @@ local function normalize(ty: Type): NormalizedType
             error(`Unreachable.`)
         end
     elseif ty.Kind == "Union" then
+        -- Unions grow from `never`.
+        toNever(n)
+
         for i, c in ty.Components do
             local inner = normalize(c)
             unionNormalizedType(n, inner)
         end
     elseif ty.Kind == "Intersection" then
+        -- Intersections are carved out from `unknown`.
+        toUnknown(n)
+
         for i, c in ty.Components do
             local inner = normalize(c)
             intersectNormalizedType(n, inner)
