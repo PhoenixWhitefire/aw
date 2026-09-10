@@ -143,6 +143,36 @@ local function errorReport(message, position): Type
     return errorType()
 end
 
+local function normalizationToString(n: NormalizedType): string
+    local t = {}
+
+    if n.Error then
+        table.insert(t, "*error*")
+    end
+
+    if n.Top then
+        table.insert(t, "unknown")
+    end
+
+    if n.Nil then
+        table.insert(t, "nil")
+    end
+
+    if n.Boolean then
+        table.insert(t, "boolean")
+    end
+
+    if n.Number then
+        table.insert(t, "number")
+    end
+
+    if n.String then
+        table.insert(t, "string")
+    end
+
+    return table.concat(t, " | ")
+end
+
 local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
     n.Error = n.Error or with.Error
     n.Top = n.Top or with.Top
@@ -150,6 +180,15 @@ local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
     n.Boolean = n.Boolean or with.Boolean
     n.Number = n.Number or with.Number
     n.String = n.String or with.String
+end
+
+local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
+    n.Error = n.Error or with.Error
+    n.Top = n.Top and with.Top
+    n.Nil = n.Nil and with.Nil
+    n.Boolean = n.Boolean and with.Boolean
+    n.Number = n.Number and with.Number
+    n.String = n.String and with.String
 end
 
 local function normalize(ty: Type): NormalizedType
@@ -186,12 +225,16 @@ local function normalize(ty: Type): NormalizedType
             unionNormalizedType(n, inner)
         end
     elseif ty.Kind == "Intersection" then
-        error(`Not yet.`)
+        for i, c in ty.Components do
+            local inner = normalize(c)
+            intersectNormalizedType(n, inner)
+        end
     else
         unreachable(ty.Kind)
         error(`Unreachable.`)
     end
 
+    print(`{ typeToString(ty) } = { normalizationToString(n) }`)
     return n
 end
 
