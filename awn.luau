@@ -319,6 +319,20 @@ local function normalize(ty: Type): NormalizedType
         n.Error = true
         print(`Cannot normalize generics.`)
     elseif ty.Kind == "Function" then
+        if #ty.Parameters == 1 and ty.Returns then
+            n.Function = {
+                Components = {
+                    {
+                        Parameter = normalize(ty.Parameters[1]),
+                        Return = normalize(ty.Returns),
+                    },
+                }
+            }
+        else
+            toUnknown(n)
+            n.Error = true
+            print(`Function normalization only supports functions taking in exactly 1 parameter and returning a value.`)
+        end
 
     elseif ty.Kind == "Union" then
         -- Unions grow from `never`.
@@ -347,6 +361,8 @@ local function normalize(ty: Type): NormalizedType
 
     return n
 end
+
+local isSupertypeOf
 
 local function isSubtypeOf(a: NormalizedType, b: NormalizedType): boolean
     if a.Error or b.Error then
@@ -390,7 +406,39 @@ local function isSubtypeOf(a: NormalizedType, b: NormalizedType): boolean
         end
     end
 
+    if a.Function and not b.Function then
+        return false
+    elseif a.Function and b.Function then
+        local afn = a.Function
+        local bfn = b.Function
+        assert(afn and bfn)
+
+        if #afn.Components ~= #bfn.Components then
+            print(`Normalization: Subtype checks cannot currently handle function intersections with differing numbers of components.`)
+            return false
+        end
+
+        for _, ca in afn.Components do
+            for _, cb in bfn.Components do
+                if not isSupertypeOf(ca.Parameter, cb.Parameter) then
+                    return false
+                end
+
+                if not isSubtypeOf(ca.Return, cb.Return) then
+                    return false
+                end
+            end
+        end
+    elseif a.Function or b.Function then
+        -- TODO
+        return false
+    end
+
     return true
+end
+
+function isSupertypeOf(a: NormalizedType, b: NormalizedType)
+    return isSubtypeOf(b, a)
 end
 
 local freeTypeNameCount = 0
@@ -528,10 +576,29 @@ local function normalizationToType(n: NormalizedType): Type
                 table.insert(t, primitiveType("string"))
             end
         end
+
+        if n.Function then
+            local cs = table.create<<Type>>(#n.Function.Components)
+
+            for i, f in n.Function.Components do
+                cs[i] = functionType({}, { normalizationToType(f.Parameter) }, nil, normalizationToType(f.Return))
+            end
+
+            if #cs == 1 then
+                table.insert(t, cs[1])
+            else
+                table.insert(t, {
+                    Kind = "Union",
+                    Components = cs,
+                })
+            end
+        end
     end
 
     if #t == 0 then
         return neverType()
+    elseif #t == 1 then
+        return t[1]
     end
 
     return {
@@ -744,7 +811,7 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
             params[i] = typeAnnotationToType(position, param)
         end
 
-        return functionType({}, params, if annotation.Returns then typeAnnotationToType(position, annotation.Returns) else nil)
+        return functionType({}, params, nil, if annotation.Returns then typeAnnotationToType(position, annotation.Returns) else nil)
     elseif annotation.Kind == "Union" then
         local components = table.create<<Type>>(#annotation.Components)
 
@@ -843,10 +910,12 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
         end
     end
 
-    local tyA = assert(typeEnv["A"])
-    local tyB = assert(typeEnv["B"])
+    local tyA = typeEnv["A"]
+    local tyB = typeEnv["B"]
 
-    check(tyA, tyB, { Line = 1, Character = 1, Offset = 1 }, true)
+    if tyA and tyB then
+        check(tyA, tyB, { Line = 1, Character = 1, Offset = 1 }, true)
+    end
 end
 
 return bidisemi
