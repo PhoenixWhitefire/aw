@@ -41,9 +41,16 @@ type PrimitiveType =
     | NumberType
     | StringType
 
+type GenericType = {
+    read Kind: "Generic",
+    read Name: string,
+}
+
 type FunctionType = {
     read Kind: "Function",
+    read Generics: { read GenericType },
     read Parameters: { read Type },
+    read Variadic: Type?,
     read Returns: Type?,
 }
 
@@ -68,6 +75,8 @@ type Type =
     | NeverType
     | UnknownType
     | PrimitiveType
+    | GenericType
+    | FunctionType
     | UnionType
     | IntersectionType
     | FreeType
@@ -108,6 +117,23 @@ local function primitiveType(primitive: index<PrimitiveType, "Primitive">): Prim
         Kind = "Primitive",
         -- TODO luau cast
         Primitive = primitive :: "nil",
+    }
+end
+
+local function genericType(name: string): GenericType
+    return {
+        Kind = "Generic",
+        Name = name,
+    }
+end
+
+local function functionType(generics: { read GenericType }, parameters: { read Type }, variadic: Type?, returns: Type?): Type
+    return {
+        Kind = "Function",
+        Generics = generics,
+        Parameters = parameters,
+        Variadic = variadic,
+        Returns = returns,
     }
 end
 
@@ -157,40 +183,6 @@ local function isUnknown(n: NormalizedType)
     return n.Top
 end
 
-local function normalizationToString(n: NormalizedType): string
-    local t = {}
-
-    if n.Error then
-        table.insert(t, "*error*")
-    end
-
-    if n.Top then
-        table.insert(t, "unknown")
-    end
-
-    if n.Nil then
-        table.insert(t, "nil")
-    end
-
-    if n.Boolean then
-        table.insert(t, "boolean")
-    end
-
-    if n.Number then
-        table.insert(t, "number")
-    end
-
-    if n.String then
-        table.insert(t, "string")
-    end
-
-    if #t == 0 then
-        return "never"
-    end
-
-    return table.concat(t, " | ")
-end
-
 local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
     n.Error = n.Error or with.Error
     n.Top = n.Top or with.Top
@@ -238,6 +230,14 @@ local function normalize(ty: Type): NormalizedType
             unreachable(ty.Primitive)
             error(`Unreachable.`)
         end
+    elseif ty.Kind == "Generic" then
+        toUnknown(n)
+        n.Error = true
+        print(`Cannot normalize generics.`)
+    elseif ty.Kind == "Function" then
+        toUnknown(n)
+        n.Error = true
+        print(`Cannot normalize functions.`)
     elseif ty.Kind == "Union" then
         -- Unions grow from `never`.
         toNever(n)
@@ -322,6 +322,32 @@ local function typeToString(ty: Type): string
         return "unknown"
     elseif ty.Kind == "Primitive" then
         return ty.Primitive
+    elseif ty.Kind == "Generic" then
+        return ty.Name
+    elseif ty.Kind == "Function" then
+        local str = ""
+
+        if #ty.Generics > 0 then
+            local gens = table.create<<string>>(#ty.Generics)
+
+            for i, gen in ty.Generics do
+                gens[i] = gen.Name
+            end
+
+            str = `<{ table.concat(gens, ", ") }>`
+        end
+
+        local params = table.create<<string>>(#ty.Parameters)
+
+        for i, param in ty.Parameters do
+            params[i] = typeToString(param)
+        end
+
+        str ..= `({ table.concat(params, ", ") }) -> `
+        str ..= if ty.Returns then typeToString(ty.Returns) else "()"
+
+        return str
+
     elseif ty.Kind == "Union" then
         local tys = table.create<<string>>(#ty.Components)
 
@@ -349,17 +375,10 @@ local function typeToString(ty: Type): string
 
         return table.concat(tys, " & ")
     elseif ty.Kind == "Free" then
-        local name = freeTypeName(ty)
-        local str = ""
+        local str = freeTypeName(ty)
 
-        if not isNever(normalize(ty.LowerBound)) then
-            str = `{ typeToString(ty.LowerBound) } <: `
-        end
-
-        str ..= name
-
-        if not isUnknown(normalize(ty.UpperBound)) then
-            str = ` <: { typeToString(ty.UpperBound) }`
+        if not isUnknown(normalize(ty.Bound)) then
+            str ..= ` <: { typeToString(ty.Bound) }`
         end
 
         return str
@@ -367,6 +386,47 @@ local function typeToString(ty: Type): string
         unreachable(ty.Kind)
         error(`Unreachable.`)
     end
+end
+
+local function normalizationToType(n: NormalizedType): Type
+    local t = {}
+
+    if n.Error then
+        table.insert(t, errorType())
+    end
+
+    if isUnknown(n) then
+        table.insert(t, unknownType())
+    else
+        if n.Nil then
+            table.insert(t, primitiveType("nil"))
+        end
+
+        if n.Boolean then
+            table.insert(t, primitiveType("boolean"))
+        end
+
+        if n.Number then
+            table.insert(t, primitiveType("number"))
+        end
+
+        if n.String then
+            table.insert(t, primitiveType("string"))
+        end
+    end
+
+    if #t == 0 then
+        return neverType()
+    end
+
+    return {
+        Kind = "Union",
+        Components = t,
+    }
+end
+
+local function normalizationToString(n: NormalizedType): string
+    return typeToString(normalizationToType(n))
 end
 
 -- Maps type names to types.
@@ -384,13 +444,21 @@ local typeAssociations: { [string]: { Expression: caw.Expression, Type: Type }? 
 local typeAnnotationToType
 local check
 
-local function infer(expr: caw.Expression): Type
+type InferenceState = {
+    ReturnType: Type? | true,
+}
+
+local function infer(state: InferenceState, expr: caw.Expression): Type
     if expr.Type == "Constant" then
         return primitiveType(expr.Constant.Type)
 
     elseif expr.Type == "Declaration" then
-        local ty = if expr.Declaration.Value then infer(expr.Declaration.Value) else primitiveType("nil")
+        local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value) else primitiveType("nil")
         local anno = if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation) else nil
+
+        if ty.Kind == "Free" and anno then
+            ty.Bound = makeIntersection(ty.Bound, anno)
+        end
 
         -- TODO luau type error on `ty` when `anno or` is removed
         typeAssociations[expr.Declaration.Name] = {
@@ -425,10 +493,22 @@ local function infer(expr: caw.Expression): Type
             if not ref then
                 return errorReport(`Undefined variable '{ variable.Reference }'`, variable)
             end
-            assert(ref.Expression.Type == "Declaration")
 
-            local variableTy = infer(variable)
-            local valueTy = infer(value)
+            if ref.Expression.Type == "Function" then -- Function parameter.
+                if ref.Type.Kind == "Free" then
+                    local ty = makeIntersection(ref.Type.Bound, infer(state, value))
+                    ref.Type.Bound = ty
+
+                    return ty
+                else
+                    return ref.Type
+                end
+            end
+
+            assert(ref.Expression.Type == "Declaration", ref.Expression.Type)
+
+            local variableTy = infer(state, variable)
+            local valueTy = infer(state, value)
             local annoTy = if ref.Expression.Declaration.Annotation then typeAnnotationToType(ref.Expression.Position, ref.Expression.Declaration.Annotation) else nil
 
             if annoTy then
@@ -447,17 +527,72 @@ local function infer(expr: caw.Expression): Type
             error(`Cannot infer '{ expr.Operator }' operations.`)
         end
     elseif expr.Type == "Function" then
-        for _, param in expr.Function.Parameters do
+        local gens = table.create<<GenericType>>(#expr.Function.Parameters)
+        local params = table.create<<Type>>(#expr.Function.Parameters)
+
+        for i, param in expr.Function.Parameters do
+            local ty = if param.Annotation then typeAnnotationToType(expr.Position, param.Annotation) else freeType()
+            params[i] = ty
+
             typeAssociations[param.Name] = {
                 Expression = expr,
-                Type = if param.Annotation then typeAnnotationToType(expr.Position, param.Annotation) else freeType(),
+                Type = ty,
             }
         end
 
+        local prevRetTy = state.ReturnType
+        state.ReturnType = true
 
+        for _, expr in expr.Function.Body do
+            infer(state, expr)
+        end
 
-        for _, param in expr.Function.Parameters do
+        local retTy = state.ReturnType
+        state.ReturnType = prevRetTy
+
+        for i, param in expr.Function.Parameters do
             typeAssociations[param.Name] = nil
+
+            local paramTy = params[i]
+
+            if paramTy.Kind == "Free" then
+                if isUnknown(normalize(paramTy.Bound)) then
+                    local gen = genericType(string.char((#gens + 19) % 26 + 65))
+                    params[i] = gen
+
+                    if retTy == paramTy then
+                        retTy = gen
+                    end
+
+                    table.insert(gens, gen)
+                else
+                    local bound = normalizationToType(normalize(paramTy.Bound))
+                    params[i] = bound
+
+                    if retTy == paramTy then
+                        retTy = bound
+                    end
+                end
+            end
+        end
+
+        if retTy == true then
+            retTy = nil
+        end
+
+        return functionType(gens, params, nil, retTy)
+    elseif expr.Type == "Return" then
+        local retTy = state.ReturnType
+
+        if retTy == true then
+            state.ReturnType = infer(state, expr.Return or primitiveType("nil"))
+        elseif retTy ~= nil then
+            assert(retTy.Kind == "Free")
+            state.ReturnType = makeIntersection(retTy.Bound, infer(state, expr.Return or primitiveType("nil")))
+
+            return retTy
+        else
+            return errorReport(`Cannot 'return' outside of functions.`, expr.Position)
         end
     else
         error(`Cannot infer { expr.Type }.`)
@@ -547,8 +682,12 @@ end
 local function bidisemi(expressions: { read caw.Expression }, options: { read LogInference: boolean })
     -- logInference = options.LogInference
 
+    local state: InferenceState = {
+        ReturnType = nil
+    }
+
     for _, expr in expressions do
-        infer(expr)
+        infer(state, expr)
     end
 
     for k, t in typeAssociations do
