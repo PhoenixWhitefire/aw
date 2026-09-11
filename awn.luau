@@ -503,22 +503,32 @@ local function typeToString(ty: Type): string
 
     elseif ty.Kind == "Union" then
         local tys = table.create<<string>>(#ty.Components)
+        local length = 0
 
         for i, c in ty.Components do
             local ts = typeToString(c)
+            length += #ts
+
             if c.Kind == "Union" or c.Kind == "Intersection" then
                 tys[i] = `({ ts })`
             else
                 tys[i] = ts
             end
+
+            if #ts > 16 then
+                tys[i] ..= "\n"
+            end
         end
 
-        return table.concat(tys, " | ")
+        return table.concat(tys, if length < 24 then " | " else "\n  | ")
     elseif ty.Kind == "Intersection" then
         local tys = table.create<<string>>(#ty.Components)
+        local length = 0
 
         for i, c in ty.Components do
             local ts = typeToString(c)
+            length += #ts
+
             if c.Kind == "Union" or c.Kind == "Intersection" then
                 tys[i] = `({ ts })`
             else
@@ -526,7 +536,7 @@ local function typeToString(ty: Type): string
             end
         end
 
-        return table.concat(tys, " & ")
+        return table.concat(tys, if length < 24 then " & " else "\n  & ")
     elseif ty.Kind == "Free" then
         local str = freeTypeName(ty)
 
@@ -909,6 +919,8 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
             print(`type { k } = { typeToString(a) }`)
         end
     end
+
+    print("\n")
 
     local tyA = typeEnv["A"]
     local tyB = typeEnv["B"]

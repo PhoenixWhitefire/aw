@@ -1,7 +1,7 @@
 -- aw.luau - erin5/@PhoenixWhitefire, 03/09/2026
 local caw = require("./caw")
 
-local program = [[
+local program_1 = [[
 
 let a_toasting = function(toToast)
     let a_toaster = toToast + 1
@@ -68,6 +68,27 @@ let f_addmul = f_compose(f_add, f_mul) -- HMLIMIT: `f_addmul` is inferred as `(.
 let f_result = f_addmul(2)
 print(f_result)
 
+]]
+
+local program = [[
+type Red = "red"
+type Blue = "blue"
+type Color = Red | Blue
+type Coloring = (Color) -> (Color) -> (Color) -> boolean
+type Uncolorable = (Color) -> (Color) -> (Color) -> false
+
+type Line = Coloring
+  & ((Red) -> (Red) -> (Color) -> false)
+  & ((Blue) -> (Blue) -> (Color) -> false)
+  & ((Color) -> (Red) -> (Red) -> false)
+  & ((Color) -> (Blue) -> (Blue) -> false)
+
+type Triangle = Line
+  & ((Red) -> (Color) -> (Red) -> false)
+  & ((Blue) -> (Color) -> (Blue) -> false)
+
+type A = Triangle
+type B = Line
 ]]
 
 local function unreachable(x: never): never
