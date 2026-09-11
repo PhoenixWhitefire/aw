@@ -826,6 +826,8 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
 
     elseif expr.Type == "InvalidSyntax" then
         return errorType()
+    elseif expr.Type == "TypeAliasDeclaration" then
+        return errorType()
     else
         unreachable(expr.Type)
         error(`Unreachable.`)

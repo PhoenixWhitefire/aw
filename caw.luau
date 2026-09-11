@@ -54,11 +54,12 @@ type BasicToken = {
         | "Colon"
         | "Pipe"
         | "Ampersand"
+        | "Arrow"
         | "Ellipsis"
         | "EndOfFile",
 }
 
-type Keyword = "nil" | "true" | "false" | "let" | "function" | "return" | "end" | "if" | "else" | "then"
+type Keyword = "nil" | "true" | "false" | "let" | "type" | "function" | "return" | "end" | "if" | "else" | "then"
 
 local operators = {
     ["+"] = true,
@@ -115,6 +116,17 @@ type ReferenceAnnotation = {
     read Reference: string,
 }
 
+type SingletonTypeAnnotation = {
+    read Kind: "Singleton",
+    read Value: string | boolean,
+}
+
+type FunctionTypeAnnotation = {
+    read Kind: "Function",
+    read Parameters: { read TypeAnnotation },
+    read Returns: TypeAnnotation?
+}
+
 type UnionTypeAnnotation = {
     read Kind: "Union",
     read Components: { read TypeAnnotation },
@@ -128,6 +140,8 @@ type IntersectionTypeAnnotation = {
 export type TypeAnnotation =
     | ErroneousAnnotation
     | ReferenceAnnotation
+    | SingletonTypeAnnotation
+    | FunctionTypeAnnotation
     | UnionTypeAnnotation
     | IntersectionTypeAnnotation
 
@@ -222,6 +236,11 @@ type ExpressionData =
         read ElseBody: { read Expression }?,
       }
     | {
+        read Type: "TypeAliasDeclaration",
+        read Name: string,
+        read Value: TypeAnnotation,
+      }
+    | {
         read Type: "InvalidSyntax",
         read Token: string,
       }
@@ -235,6 +254,7 @@ local keywords: { read [string]: Keyword? } = {
     ["true"] = "true",
     ["false"] = "false",
     let = "let",
+    type = "type",
     ["function"] = "function",
     ["return"] = "return",
     ["if"] = "if",
@@ -255,6 +275,7 @@ local correspond: { read [string]: index<BasicToken, "Type">? } = {
     [":"] = "Colon",
     ["|"] = "Pipe",
     ["&"] = "Ampersand",
+    ["->"] = "Arrow",
     ["..."] = "Ellipsis",
     [""] = "EndOfFile",
 }
@@ -290,6 +311,7 @@ end
 local function isSeparator(c: string)
     return isEof(c) or isWhitespace(c) or c == ":" or c == ";" or c == "(" or c == ")" or c == "{" or c == "}" or c == "," or c == "^" or c == '"' or c == "#"
         or c == "[" or c == "]"
+        or c == "->"
         or operators[c]
 end
 
@@ -320,7 +342,9 @@ local function nextToken(state: ParseState): Token
     if isSeparator(c) then
         local next, pos = nextCharacter(state.Program, state.Position.Offset)
 
-        if next == "=" or (next == "-" and c == "-") then
+        if next == "=" or (next == "-" and c == "-")
+            or next == ">" and c == "-"
+        then
             token = c .. next
             state.Position.Offset = pos
         else
@@ -492,8 +516,22 @@ function parseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation
                 Kind = "Reference" :: "Reference",
                 Reference = "nil",
             }
+        elseif annotation.Keyword == "true" or annotation.Keyword == "false" then
+            ty = {
+                Kind = "Singleton",
+                Value = annotation.Keyword == "true",
+            }
         else
             report(`Invalid annotation keyword '{ annotation.Keyword }'.`, annotation)
+        end
+    elseif annotation.Type == "Literal" then
+        if annotation.Literal.Type == "string" or annotation.Literal.Type == "boolean" then
+            ty = {
+                Kind = "Singleton",
+                Value = annotation.Literal.Value,
+            }
+        else
+            report(`{ annotation.Literal.Type } singletons are not supported.`, annotation)
         end
     elseif annotation.Type == "OpenParentheses" then
         ty = parseTypeAnnotation(state, report)
@@ -501,6 +539,19 @@ function parseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation
 
         if parens.Type ~= "CloseParentheses" then
             report(`Expected closing parentheses, got { parens.Type }.`, parens)
+        end
+
+        local maybeArrow, consumeArrow = peekNextToken(state)
+
+        if maybeArrow.Type == "Arrow" then
+            consumeArrow()
+
+            local returns = parseTypeAnnotation(state, report)
+            ty = {
+                Kind = "Function",
+                Parameters = { ty },
+                Returns = returns,
+            }
         end
     else
         report(`Invalid annotation token '{ annotation.Type }'.`, annotation)
@@ -708,6 +759,24 @@ function parseExpression(state: ParseState, report: Report, precedence: number?)
                     Value = value,
                     Annotation = annotation,
                 },
+            }, token)
+        elseif token.Keyword == "type" then
+            local name = nextToken(state)
+
+            if name.Type ~= "Identifier" then
+                return invalidExpr(state, `Expected identifier after 'type', got { name.Type } instead.`, report)
+            end
+
+            local equals = nextToken(state)
+
+            if equals.Type ~= "Operator" or equals.Operator ~= "=" then
+                return invalidExpr(state, `Expected '=' after type alias name, got { equals.Type } instead.`, report)
+            end
+
+            return ex({
+                Type = "TypeAliasDeclaration",
+                Name = name.Identifier,
+                Value = parseTypeAnnotation(state, report),
             }, token)
         elseif token.Keyword == "nil" then
             return ex({
@@ -1407,6 +1476,8 @@ local function evaluate(expr: Expression): Value?
         list.Value[index.Value] = value
 
         return value
+    elseif expr.Type == "TypeAliasDeclaration" then
+        return nilValue()
     else
         unreachable(expr.Type)
         error(`Unreachable.`)

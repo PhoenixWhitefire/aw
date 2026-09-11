@@ -41,6 +41,11 @@ type PrimitiveType =
     | NumberType
     | StringType
 
+type SingletonType = {
+    read Kind: "Singleton",
+    read Value: string | boolean,
+}
+
 type GenericType = {
     read Kind: "Generic",
     read Name: string,
@@ -75,19 +80,38 @@ type Type =
     | NeverType
     | UnknownType
     | PrimitiveType
+    | SingletonType
     | GenericType
     | FunctionType
     | UnionType
     | IntersectionType
     | FreeType
 
+type NormalizedFunctionType = {
+    Components: {
+        {
+            Parameter: NormalizedType,
+            Return: NormalizedType,
+        }
+    }
+}
+
 type NormalizedType = {
     Error:   boolean,
     Top:     boolean,
     Nil:     boolean,
-    Boolean: boolean,
+    -- `nil` = not present.
+    Boolean: {
+        -- `nil` = top `boolean`, otherwise singleton.
+        Value: boolean?,
+    }?,
     Number:  boolean,
-    String:  boolean,
+    -- `nil` = not present.
+    String:  {
+        -- If this is `nil`, we're the top 'string'.
+        Singletons: { string }?,
+    }?,
+    Function: NormalizedFunctionType?,
 }
 
 local function unreachable(x: never): never
@@ -160,24 +184,27 @@ local function toNever(n: NormalizedType)
     n.Error = false
     n.Top = false
     n.Nil = false
-    n.Boolean = false
+    n.Boolean = nil
     n.Number = false
-    n.String = false
+    n.String = nil
 end
 
 local function toUnknown(n: NormalizedType)
     n.Error = false
     n.Top = true
     n.Nil = true
-    n.Boolean = true
+    n.Boolean = {}
     n.Number = true
-    n.String = true
+    n.String = {}
 end
 
+-- TODO string singleton
+--[[
 local function isNever(n: NormalizedType)
     return not n.Top and not n.Nil and not n.Boolean
         and not n.Number and not n.String
 end
+]]--
 
 local function isUnknown(n: NormalizedType)
     return n.Top
@@ -187,9 +214,35 @@ local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
     n.Error = n.Error or with.Error
     n.Top = n.Top or with.Top
     n.Nil = n.Nil or with.Nil
-    n.Boolean = n.Boolean or with.Boolean
     n.Number = n.Number or with.Number
-    n.String = n.String or with.String
+
+    if n.Boolean and with.Boolean then
+        local myBoolean = n.Boolean.Value
+        local withBoolean = with.Boolean.Value
+
+        if not myBoolean and withBoolean then
+            n.Boolean.Value = nil -- Become top `boolean`.
+        elseif (myBoolean == false and withBoolean == true)
+            or (myBoolean == true and withBoolean == false)
+        then
+            n.Boolean.Value = nil -- Become top `boolean`.
+        end
+    else
+        n.Boolean = n.Boolean or with.Boolean
+    end
+
+    if n.String and with.String then
+        local mySingles = n.String.Singletons
+        local withSingles = with.String.Singletons
+
+        if mySingles and withSingles then
+            table.move(withSingles, 1, #withSingles, #mySingles + 1, mySingles)
+        elseif mySingles and not withSingles then
+            n.String = {} -- Union singletons with top `string`.
+        end
+    else
+        n.String = n.String or with.String
+    end
 end
 
 local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
@@ -198,7 +251,30 @@ local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
     n.Nil = n.Nil and with.Nil
     n.Boolean = n.Boolean and with.Boolean
     n.Number = n.Number and with.Number
-    n.String = n.String and with.String
+
+    if n.String and with.String then
+        local mySingles = n.String.Singletons
+        local withSingles = with.String.Singletons
+
+        if mySingles and withSingles then
+            local removed = false
+
+            repeat
+                removed = false
+
+                for i, s in mySingles do
+                    if not table.find(withSingles, s) then
+                        table.remove(mySingles, i)
+                        removed = true
+                    end
+                end
+            until not removed
+        elseif not mySingles and withSingles then
+            n.String.Singletons = withSingles -- `string & "a" = "a"`.
+        end
+    else
+        n.String = nil
+    end
 end
 
 local function normalize(ty: Type): NormalizedType
@@ -206,9 +282,9 @@ local function normalize(ty: Type): NormalizedType
         Top = false,
         Error = false,
         Nil = false,
-        Boolean = false,
+        Boolean = nil,
         Number = false,
-        String = false,
+        String = nil,
     }
 
     if ty.Kind == "error" then
@@ -221,23 +297,29 @@ local function normalize(ty: Type): NormalizedType
         if ty.Primitive == "nil" then
             n.Nil = true
         elseif ty.Primitive == "boolean" then
-            n.Boolean = true
+            n.Boolean = {}
         elseif ty.Primitive == "number" then
             n.Number = true
         elseif ty.Primitive == "string" then
-            n.String = true
+            n.String = {}
         else
             unreachable(ty.Primitive)
             error(`Unreachable.`)
+        end
+    elseif ty.Kind == "Singleton" then
+        if typeof(ty.Value) == "boolean" then
+            n.Boolean = { Value = ty.Value }
+        elseif typeof(ty.Value) == "string" then
+            n.String = { Singletons = { ty.Value } }
+        else
+            error(`Unsupported singleton kind '{ typeof(ty.Value) }'.`)
         end
     elseif ty.Kind == "Generic" then
         toUnknown(n)
         n.Error = true
         print(`Cannot normalize generics.`)
     elseif ty.Kind == "Function" then
-        toUnknown(n)
-        n.Error = true
-        print(`Cannot normalize functions.`)
+
     elseif ty.Kind == "Union" then
         -- Unions grow from `never`.
         toNever(n)
@@ -281,6 +363,14 @@ local function isSubtypeOf(a: NormalizedType, b: NormalizedType): boolean
 
     if a.Boolean and not b.Boolean then
         return false
+    -- `boolean </: true` etc.
+    elseif a.Boolean and a.Boolean.Value == nil and b.Boolean and b.Boolean.Value ~= nil then
+        return false
+    elseif a.Boolean and a.Boolean.Value ~= nil and b.Boolean and b.Boolean.Value ~= nil then
+        -- `false </: true`
+        if a.Boolean.Value ~=  b.Boolean.Value then
+            return false
+        end
     end
 
     if a.Number and not b.Number then
@@ -289,6 +379,15 @@ local function isSubtypeOf(a: NormalizedType, b: NormalizedType): boolean
 
     if a.String and not b.String then
         return false
+    -- `string </: "a" | "b" | ...`
+    elseif a.String and not a.String.Singletons and b.String and b.String.Singletons then
+        return false
+    elseif a.String and a.String.Singletons and b.String and b.String.Singletons then
+        for _, as in a.String.Singletons do
+            if not table.find(b.String.Singletons, as) then
+                return false
+            end
+        end
     end
 
     return true
@@ -322,6 +421,12 @@ local function typeToString(ty: Type): string
         return "unknown"
     elseif ty.Kind == "Primitive" then
         return ty.Primitive
+    elseif ty.Kind == "Singleton" then
+        if typeof(ty.Value) == "string" then
+            return `"{ ty.Value }"`
+        else
+            return tostring(ty.Value)
+        end
     elseif ty.Kind == "Generic" then
         return ty.Name
     elseif ty.Kind == "Function" then
@@ -403,7 +508,11 @@ local function normalizationToType(n: NormalizedType): Type
         end
 
         if n.Boolean then
-            table.insert(t, primitiveType("boolean"))
+            if n.Boolean.Value ~= nil then
+                table.insert(t, { Kind = "Singleton", Value = n.Boolean.Value })
+            else
+                table.insert(t, primitiveType("boolean"))
+            end
         end
 
         if n.Number then
@@ -411,7 +520,13 @@ local function normalizationToType(n: NormalizedType): Type
         end
 
         if n.String then
-            table.insert(t, primitiveType("string"))
+            if n.String.Singletons then
+                for _, s in n.String.Singletons do
+                    table.insert(t, { Kind = "Singleton", Value = s })
+                end
+            else
+                table.insert(t, primitiveType("string"))
+            end
         end
     end
 
@@ -586,14 +701,19 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
 
         if retTy == true then
             state.ReturnType = infer(state, expr.Return or primitiveType("nil"))
+
+            return assert(state.ReturnType)
         elseif retTy ~= nil then
             assert(retTy.Kind == "Free")
             state.ReturnType = makeIntersection(retTy.Bound, infer(state, expr.Return or primitiveType("nil")))
 
-            return retTy
+            return assert(state.ReturnType)
         else
             return errorReport(`Cannot 'return' outside of functions.`, expr.Position)
         end
+    elseif expr.Type == "TypeAliasDeclaration" then
+        typeEnv[expr.Name] = typeAnnotationToType(expr.Position, expr.Value)
+        return errorType()
     else
         error(`Cannot infer { expr.Type }.`)
     end
@@ -610,6 +730,21 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
         else
             return errorReport(`Unknown type '{ annotation.Reference }'`, position)
         end
+    elseif annotation.Kind == "Singleton" then
+        local single: SingletonType = {
+            Kind = "Singleton",
+            Value = annotation.Value
+        }
+
+        return single
+    elseif annotation.Kind == "Function" then
+        local params = table.create<<Type>>(#annotation.Parameters)
+
+        for i, param in annotation.Parameters do
+            params[i] = typeAnnotationToType(position, param)
+        end
+
+        return functionType({}, params, if annotation.Returns then typeAnnotationToType(position, annotation.Returns) else nil)
     elseif annotation.Kind == "Union" then
         local components = table.create<<Type>>(#annotation.Components)
 
@@ -666,7 +801,7 @@ local function reportMismatch(a: Type, na: NormalizedType, b: Type, nb: Normaliz
     print(err)
 end
 
-function check(inferred: Type, annotation: Type, position: caw.Position)
+function check(inferred: Type, annotation: Type, position: caw.Position, printNote: boolean?)
     if annotation.Kind == "Error" then
         return
     end
@@ -676,6 +811,8 @@ function check(inferred: Type, annotation: Type, position: caw.Position)
 
     if not isSubtypeOf(normalizedInference, normalizedAnnotation) then
         reportMismatch(inferred, normalizedInference, annotation, normalizedAnnotation, position)
+    elseif printNote then
+        print(`'{ typeToString(inferred) }' is a subtype of '{ typeToString(annotation) }'.`)
     end
 end
 
@@ -686,6 +823,12 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
         ReturnType = nil
     }
 
+    local builtins = {}
+
+    for k, _ in typeEnv do
+        builtins[k] = true
+    end
+
     for _, expr in expressions do
         infer(state, expr)
     end
@@ -693,6 +836,17 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
     for k, t in typeAssociations do
         print(`{ k }: { typeToString(t.Type) }`)
     end
+
+    for k, a in typeEnv do
+        if not builtins[k] then
+            print(`type { k } = { typeToString(a) }`)
+        end
+    end
+
+    local tyA = assert(typeEnv["A"])
+    local tyB = assert(typeEnv["B"])
+
+    check(tyA, tyB, { Line = 1, Character = 1, Offset = 1 }, true)
 end
 
 return bidisemi
