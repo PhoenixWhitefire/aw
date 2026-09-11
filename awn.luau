@@ -41,6 +41,12 @@ type PrimitiveType =
     | NumberType
     | StringType
 
+type FunctionType = {
+    read Kind: "Function",
+    read Parameters: { read Type },
+    read Returns: Type?,
+}
+
 type UnionType = {
     read Kind: "Union",
     read Components: { read Type },
@@ -51,6 +57,12 @@ type IntersectionType = {
     read Components: { read Type },
 }
 
+type FreeType = {
+    read Kind: "Free",
+    Name: string?,
+    Bound: Type,
+}
+
 type Type =
     | ErrorType
     | NeverType
@@ -58,6 +70,7 @@ type Type =
     | PrimitiveType
     | UnionType
     | IntersectionType
+    | FreeType
 
 type NormalizedType = {
     Error:   boolean,
@@ -70,47 +83,6 @@ type NormalizedType = {
 
 local function unreachable(x: never): never
     error(`Unexpected branch with value '{ x }' ({ typeof(x) }), this is an internal error.`)
-end
-
-local function typeToString(ty: Type): string
-    if ty.Kind == "error" then
-        return "*error*"
-    elseif ty.Kind == "never" then
-        return "never"
-    elseif ty.Kind == "unknown" then
-        return "unknown"
-    elseif ty.Kind == "Primitive" then
-        return ty.Primitive
-    elseif ty.Kind == "Union" then
-        local tys = table.create<<string>>(#ty.Components)
-
-        for i, c in ty.Components do
-            local ts = typeToString(c)
-            if c.Kind == "Union" or c.Kind == "Intersection" then
-                tys[i] = `({ ts })`
-            else
-                tys[i] = ts
-            end
-        end
-
-        return table.concat(tys, " | ")
-    elseif ty.Kind == "Intersection" then
-        local tys = table.create<<string>>(#ty.Components)
-
-        for i, c in ty.Components do
-            local ts = typeToString(c)
-            if c.Kind == "Union" or c.Kind == "Intersection" then
-                tys[i] = `({ ts })`
-            else
-                tys[i] = ts
-            end
-        end
-
-        return table.concat(tys, " & ")
-    else
-        unreachable(ty.Kind)
-        error(`Unreachable.`)
-    end
 end
 
 local function errorType(): Type
@@ -139,14 +111,21 @@ local function primitiveType(primitive: index<PrimitiveType, "Primitive">): Prim
     }
 end
 
+local function freeType(): Type
+    return {
+        Kind = "Free",
+        Bound = unknownType(),
+    }
+end
+
 local function errorReport(message, position): Type
     print(`{ position.Line }:{ position.Character }: { message }`)
     return errorType()
 end
 
-local function makeUnion(a: Type, b: Type): Type
+local function makeIntersection(a: Type, b: Type): Type
     return {
-        Kind = "Union",
+        Kind = "Intersection",
         Components = { a, b },
     }
 end
@@ -167,6 +146,15 @@ local function toUnknown(n: NormalizedType)
     n.Boolean = true
     n.Number = true
     n.String = true
+end
+
+local function isNever(n: NormalizedType)
+    return not n.Top and not n.Nil and not n.Boolean
+        and not n.Number and not n.String
+end
+
+local function isUnknown(n: NormalizedType)
+    return n.Top
 end
 
 local function normalizationToString(n: NormalizedType): string
@@ -266,6 +254,10 @@ local function normalize(ty: Type): NormalizedType
             local inner = normalize(c)
             intersectNormalizedType(n, inner)
         end
+    elseif ty.Kind == "Free" then
+        toUnknown(n)
+        n.Error = true
+        print(`Cannot normalize free types.`)
     else
         unreachable(ty.Kind)
         error(`Unreachable.`)
@@ -300,6 +292,81 @@ local function isSubtypeOf(a: NormalizedType, b: NormalizedType): boolean
     end
 
     return true
+end
+
+local freeTypeNameCount = 0
+
+local function typeToString(ty: Type): string
+    local function freeTypeName(tyvar: FreeType)
+        if tyvar.Name then
+            return tyvar.Name
+        else
+            local name = `'{ string.char((freeTypeNameCount + 19) % 26 + 97) }`
+
+            if freeTypeNameCount > 25 then
+                name ..= freeTypeNameCount // 25 + 1
+            end
+
+            tyvar.Name = name
+            freeTypeNameCount += 1
+
+            return name
+        end
+    end
+
+    if ty.Kind == "error" then
+        return "*error*"
+    elseif ty.Kind == "never" then
+        return "never"
+    elseif ty.Kind == "unknown" then
+        return "unknown"
+    elseif ty.Kind == "Primitive" then
+        return ty.Primitive
+    elseif ty.Kind == "Union" then
+        local tys = table.create<<string>>(#ty.Components)
+
+        for i, c in ty.Components do
+            local ts = typeToString(c)
+            if c.Kind == "Union" or c.Kind == "Intersection" then
+                tys[i] = `({ ts })`
+            else
+                tys[i] = ts
+            end
+        end
+
+        return table.concat(tys, " | ")
+    elseif ty.Kind == "Intersection" then
+        local tys = table.create<<string>>(#ty.Components)
+
+        for i, c in ty.Components do
+            local ts = typeToString(c)
+            if c.Kind == "Union" or c.Kind == "Intersection" then
+                tys[i] = `({ ts })`
+            else
+                tys[i] = ts
+            end
+        end
+
+        return table.concat(tys, " & ")
+    elseif ty.Kind == "Free" then
+        local name = freeTypeName(ty)
+        local str = ""
+
+        if not isNever(normalize(ty.LowerBound)) then
+            str = `{ typeToString(ty.LowerBound) } <: `
+        end
+
+        str ..= name
+
+        if not isUnknown(normalize(ty.UpperBound)) then
+            str = ` <: { typeToString(ty.UpperBound) }`
+        end
+
+        return str
+    else
+        unreachable(ty.Kind)
+        error(`Unreachable.`)
+    end
 end
 
 -- Maps type names to types.
@@ -348,10 +415,10 @@ local function infer(expr: caw.Expression): Type
         end
 
     elseif expr.Type == "BinaryOperation" then
-        if expr.Operator == "=" then
-            local variable = expr.Left
-            local value = expr.Right
+        local variable = expr.Left
+        local value = expr.Right
 
+        if expr.Operator == "=" then
             assert(variable.Type == "Reference")
             local ref = typeAssociations[variable.Reference]
 
@@ -378,6 +445,19 @@ local function infer(expr: caw.Expression): Type
             return annoTy or valueTy
         else
             error(`Cannot infer '{ expr.Operator }' operations.`)
+        end
+    elseif expr.Type == "Function" then
+        for _, param in expr.Function.Parameters do
+            typeAssociations[param.Name] = {
+                Expression = expr,
+                Type = if param.Annotation then typeAnnotationToType(expr.Position, param.Annotation) else freeType(),
+            }
+        end
+
+
+
+        for _, param in expr.Function.Parameters do
+            typeAssociations[param.Name] = nil
         end
     else
         error(`Cannot infer { expr.Type }.`)

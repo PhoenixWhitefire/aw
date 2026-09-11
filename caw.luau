@@ -131,6 +131,16 @@ export type TypeAnnotation =
     | UnionTypeAnnotation
     | IntersectionTypeAnnotation
 
+type FunctionParameter = {
+    read Name: string,
+    read Annotation: TypeAnnotation?,
+}
+
+type FunctionVariadicParameter = {
+    read Present: boolean,
+    read Annotation: TypeAnnotation?,
+}
+
 type ExpressionData =
     | {
         read Type: "Declaration",
@@ -181,8 +191,9 @@ type ExpressionData =
         read Type: "Function",
         read Function: {
             read Name: string?,
-            read Parameters: { string },
-            read Variadic: boolean,
+            read Generics: { read string }?,
+            read Parameters: { read FunctionParameter },
+            read Variadic: FunctionVariadicParameter,
             read Body: { Expression },
         },
       }
@@ -498,6 +509,17 @@ function parseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation
     return maybeCombineWithTypeOperator(state, report, ty or { Kind = "Error" })
 end
 
+local function maybeParseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation?
+    local maybeColon, consumeColon = peekNextToken(state)
+
+    if maybeColon.Type == "Colon" then
+        consumeColon()
+        return parseTypeAnnotation(state, report)
+    end
+
+    return nil
+end
+
 local parseExpression
 
 local function parseBody(state: ParseState, report: Report, stopAtElse: boolean?): ({ Expression }, Token)
@@ -585,23 +607,33 @@ local function parseFunction(state: ParseState, report: Report, token: Token): E
     end
 
     local parameters = {}
-    local variadic = false
+    local paramsPresent = {}
+    local variadic: FunctionVariadicParameter = {
+        Present = false,
+    }
     local paramTk = nextToken(state)
 
     while paramTk.Type ~= "CloseParentheses" do
         if paramTk.Type == "Identifier" then
-            if table.find(parameters, paramTk.Identifier) then
+            if paramsPresent[paramTk.Identifier] then
                 report(`Duplicate parameter '{ paramTk.Identifier }'.`, paramTk)
             end
 
-            table.insert(parameters, paramTk.Identifier)
+            table.insert(parameters, {
+                Name = paramTk.Identifier,
+                Annotation = maybeParseTypeAnnotation(state, report),
+            })
+            paramsPresent[paramTk.Identifier] = true
             paramTk = nextToken(state)
 
             if paramTk.Type == "Comma" then
                 paramTk = nextToken(state)
             end
         elseif paramTk.Type == "Ellipsis" then
-            variadic = true
+            variadic = {
+                Present = true,
+                Annotation = maybeParseTypeAnnotation(state, report),
+            }
 
             local closeParen = nextToken(state)
 
@@ -651,13 +683,7 @@ function parseExpression(state: ParseState, report: Report, precedence: number?)
 
             if nameTk.Type == "Identifier" then
                 name = nameTk.Identifier
-
-                local maybeColon, consumeColon = peekNextToken(state)
-
-                if maybeColon.Type == "Colon" then
-                    consumeColon()
-                    annotation = parseTypeAnnotation(state, report)
-                end
+                annotation = maybeParseTypeAnnotation(state, report)
             else
                 report(`Expected an identifier, got a { nameTk.Type }.`, nameTk)
 
@@ -1293,13 +1319,19 @@ local function evaluate(expr: Expression): Value?
             error(`Unreachable.`)
         end
     elseif expr.Type == "Function" then
+        local params = table.create<<string>>(#expr.Function.Parameters)
+
+        for i, p in expr.Function.Parameters do
+            params[i] = p.Name
+        end
+
         -- TODO luau extraneous annotation
         local f: Value = {
             Type = "function",
             Value = {
                 IsLuau = false,
-                Parameters = expr.Function.Parameters,
-                Variadic = expr.Function.Variadic,
+                Parameters = params,
+                Variadic = expr.Function.Variadic.Present,
                 Body = expr.Function.Body,
             },
         }

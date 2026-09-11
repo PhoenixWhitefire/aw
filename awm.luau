@@ -96,7 +96,7 @@ end
 
 local function exprToStringShallow(expr: caw.Expression)
     if expr.Type == "Declaration" then
-        return `let { expr.Declaration.Name } = { exprToStringShallow(expr.Declaration.Value) }`
+        return `let { expr.Declaration.Name }{ if expr.Declaration.Value then " = " .. exprToStringShallow(expr.Declaration.Value) else "" }`
     elseif expr.Type == "BinaryOperation" then
         return `{ exprToStringShallow(expr.Left) } { expr.Operator } { exprToStringShallow(expr.Right) }`
     elseif expr.Type == "UnaryOperation" then
@@ -700,11 +700,11 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             local tv = typeVariable()
             paramTys[i] = tv
             state.nonGeneric[tv] = true
-            shadowed[p] = typeAssociations[p]
-            typeAssociations[p] = tv
+            shadowed[p.Name] = typeAssociations[p.Name]
+            typeAssociations[p.Name] = tv
         end
 
-        if expr.Function.Variadic then
+        if expr.Function.Variadic.Present then
             variadic = typeVariable()
             state.nonGeneric[variadic] = true
         end
@@ -739,7 +739,7 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             state.nonGeneric[p] = nil
 
             local param = expr.Function.Parameters[i]
-            typeAssociations[param] = shadowed[param]
+            typeAssociations[param.Name] = shadowed[param.Name]
         end
 
         state.nonGeneric[variadic] = nil
