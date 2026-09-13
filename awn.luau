@@ -313,7 +313,11 @@ local function dumpNormalization(n: NormalizedType)
         end
     end
 
-    return table.concat(t, " | ")
+    if #t == 0 then
+        return "never"
+    else
+        return table.concat(t, " | ")
+    end
 end
 
 local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
@@ -348,6 +352,11 @@ local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
         end
     else
         n.String = n.String or with.String
+    end
+
+    if n.Function or with.Function then
+        print(`Cannot union '{ dumpNormalization(n) }' with '{ dumpNormalization(with) }': Unions of functions cannot be normalized at this time.`)
+        n.Error = true
     end
 end
 
@@ -691,10 +700,6 @@ local function typeToString(ty: Type, alias: string?): string
                 tys[i] = `({ ts })`
             else
                 tys[i] = ts
-            end
-
-            if #ts > 16 then
-                tys[i] ..= "\n"
             end
         end
 
@@ -1184,6 +1189,8 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
     for k, t in typeAssociations do
         print(`{ k }: { typeToString(t.Type) }`)
     end
+
+    print("")
 
     for _, k in typeEnvOrdered do
         if not builtins[k] then
