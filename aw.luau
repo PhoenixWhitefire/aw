@@ -1,7 +1,7 @@
 -- aw.luau - erin5/@PhoenixWhitefire, 03/09/2026
 local caw = require("./caw")
 
-local program_1 = [[
+local hmProgram = [[
 
 let a_toasting = function(toToast)
     let a_toaster = toToast + 1
@@ -70,7 +70,7 @@ print(f_result)
 
 ]]
 
-local program = [[
+local npProgram = [[
 type Red = "red"
 type Blue = "blue"
 type Color = Red | Blue
@@ -90,11 +90,19 @@ type Triangle = Line
 let x: checkissubtype<Triangle, Uncolorable>
 ]]
 
+local programs = {
+    hm = hmProgram,
+    np = npProgram,
+}
+
+local program = hmProgram
+
 local function unreachable(x: never): never
     error(`Unexpected branch with value '{ x }' ({ typeof(x) }), this is an internal error.`)
 end
 
-local function prettyPrint(t, indent: string?)
+-- TODO luau any
+local function prettyPrint(t: any, indent: string?)
     local initdent = indent or ""
     local s = `\{\n`
     indent = initdent .. "  "
@@ -117,7 +125,7 @@ local inferers = {
 }
 
 local logInference = false
-local inference: keyof<typeof(inferers)> = "sn"
+local inferer: keyof<typeof(inferers)> = "hm"
 local printAst = false
 
 local helpText = [[
@@ -146,24 +154,49 @@ if select("#", ...) > 0 then
 
                 return false
             end
+        elseif arg == "--program-name" then
+            local programNameArg = select(i + 1, ...)
+
+            if programNameArg then
+                program = programs[programNameArg]
+
+                if not program then
+                    print(`Invalid program '{ programNameArg }'.`)
+
+                    return false
+                end
+            else
+                print(`Missing argument for '--program-name' command-line option.`)
+
+                return false
+            end
         elseif arg == "--log-inference" then
             logInference = true
 
-        elseif arg == "--inference" then
+        elseif arg == "--inferer" then
             local algoArg = select(i + 1, ...)
 
             if algoArg then
                 local algo = tostring(algoArg)
 
-                if algo == "hm" then
-                    inference = "hm" :: "hm" -- TODO luau cast
+                if algo == "hm" or algo == "sn" then
+                    --inferer = "hm" -- TODO luau cast
+                    inferer = algo
+
+                    if algo == "hm" then
+                        program = hmProgram
+                        print(`The program will be 'hm'.\n`)
+                    elseif algo == "sn" then
+                        program = npProgram
+                        print(`The program will be 'np'.\n`)
+                    end
                 else
-                    print(`Invalid '--inference' algorithm '{ algo }', please check '--help' for the supported algorithms.`)
+                    print(`Invalid '--inferer' algorithm '{ algo }', please check '--help' for the supported algorithms.`)
 
                     return false
                 end
             else
-                print("Missing argument for '--inference' command-line option.")
+                print("Missing argument for '--inferer' command-line option.")
 
                 return false
             end
@@ -200,11 +233,11 @@ end
 
 print("\n--")
 
-if inference == "hm" then
+if inferer == "hm" then
     inferers.hm(result.Expressions, { LogInference = logInference })
-elseif inference == "sn" then
+elseif inferer == "sn" then
     inferers.sn(result.Expressions, { LogInference = logInference })
 else
-    unreachable(inference)
+    unreachable(inferer)
     error(`Unreachable.`)
 end
