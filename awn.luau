@@ -511,22 +511,28 @@ local function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResul
         local bfn = b.Function
         assert(afn and bfn)
 
-        for i, ca in afn.Components do
+        for i, cb in bfn.Components do
             local found = false
             local failed = {}
 
-            for _, cb in bfn.Components do
+            for _, ca in afn.Components do
                 local paramResult = isSupertypeOf(ca.Parameter, cb.Parameter)
 
                 if not paramResult.Holds then
-                    table.insert(failed, `'({ dumpNormalization(cb.Parameter) }) -> { dumpNormalization(cb.Return) }' does not match in function parameter: { paramResult.FailedPath }`)
+                    table.insert(
+                        failed,
+                        `'({ dumpNormalization(ca.Parameter) }) -> { dumpNormalization(ca.Return) }' does not accept parameter '{ dumpNormalization(cb.Parameter) }'.`
+                    )
                     continue
                 end
 
                 local returnResult = isSubtypeOf(ca.Return, cb.Return)
 
                 if not returnResult.Holds then
-                    table.insert(failed, `'({ dumpNormalization(cb.Parameter) }) -> { dumpNormalization(cb.Return) }' does not match in function return type: { returnResult.FailedPath }`)
+                    table.insert(
+                        failed,
+                        `'({ dumpNormalization(ca.Parameter) }) -> { dumpNormalization(ca.Return) }' does not accept return '{ dumpNormalization(cb.Return) }'.`
+                    )
                     continue
                 end
 
@@ -535,7 +541,7 @@ local function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResul
             end
 
             if not found then
-                return subtypeFailure(`No compatible overload was found for #{ i } '({ dumpNormalization(ca.Parameter) }) -> { dumpNormalization(ca.Return) }':\n* { table.concat(failed, "\n* ") }`)
+                return subtypeFailure(`No compatible overload was found for #{ i } '({ dumpNormalization(cb.Parameter) }) -> { dumpNormalization(cb.Return) }':\n* { table.concat(failed, "\n* ") }`)
             end
         end
     elseif a.Function or b.Function then
@@ -716,7 +722,7 @@ local function normalizationToType(n: NormalizedType): Type
                     table.insert(t, cs[1])
                 else
                     table.insert(t, {
-                        Kind = "Union",
+                        Kind = "Intersection",
                         Components = cs,
                     })
                 end
