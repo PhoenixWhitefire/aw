@@ -88,7 +88,7 @@ type Triangle = Line
   & ((Blue) -> (Color) -> (Blue) -> false)
 
 type A = Triangle
-type B = Line
+type B = Uncolorable
 ]]
 
 local function unreachable(x: never): never
