@@ -332,11 +332,12 @@ local function isErrorSuppressing(ty: Type)
     return false
 end
 
-local function deepCopy<T>(tab: T & {}): T
+-- TODO luau any
+local function deepCopy(tab: any): any
     assert(typeof(tab) == "table")
     local t = table.clone(tab)
 
-    for k, v in t do -- TODO luau, `intersect<>` should always reduce methinks?
+    for k, v in t do -- TODO luau, `intersect<>` should always reduce methinks? only occurs when function signature is `local function deepCopy<T>(tab: T & {}): T`
         if typeof(v) == "table" then
             t[k] = deepCopy(v)
         else
