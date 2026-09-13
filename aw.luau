@@ -87,8 +87,7 @@ type Triangle = Line
   & ((Red) -> (Color) -> (Red) -> false)
   & ((Blue) -> (Color) -> (Blue) -> false)
 
-type A = Triangle
-type B = Uncolorable
+let x: checkissubtype<Triangle, Uncolorable>
 ]]
 
 local function unreachable(x: never): never

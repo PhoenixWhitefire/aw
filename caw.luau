@@ -127,6 +127,12 @@ type FunctionTypeAnnotation = {
     read Returns: TypeAnnotation?
 }
 
+type GenericInstantiationTypeAnnotation = {
+    read Kind: "GenericInstantiation",
+    read Name: string,
+    read Arguments: { read TypeAnnotation },
+}
+
 type UnionTypeAnnotation = {
     read Kind: "Union",
     read Components: { read TypeAnnotation },
@@ -142,6 +148,7 @@ export type TypeAnnotation =
     | ReferenceAnnotation
     | SingletonTypeAnnotation
     | FunctionTypeAnnotation
+    | GenericInstantiationTypeAnnotation
     | UnionTypeAnnotation
     | IntersectionTypeAnnotation
 
@@ -505,10 +512,37 @@ function parseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation
     local ty: TypeAnnotation? = nil
 
     if annotation.Type == "Identifier" then
-        ty = {
-            Kind = "Reference",
-            Reference = annotation.Identifier,
-        }
+        local maybeInstantiation, consumeOpenInstantion = peekNextToken(state)
+
+        if maybeInstantiation.Type == "Operator" and maybeInstantiation.Operator == "<" then
+            consumeOpenInstantion()
+
+            local closeInstantiation, consumeCloseInstantiation = peekNextToken(state)
+            local typeArguments: { TypeAnnotation } = {}
+
+            while closeInstantiation.Type ~= "Operator" or closeInstantiation.Operator ~= ">" do
+                table.insert(typeArguments, parseTypeAnnotation(state, report))
+                closeInstantiation, consumeCloseInstantiation = peekNextToken(state)
+
+                if closeInstantiation.Type == "Comma" then
+                    consumeCloseInstantiation()
+                    closeInstantiation, consumeCloseInstantiation = peekNextToken(state)
+                end
+            end
+
+            consumeCloseInstantiation()
+
+            ty = {
+                Kind = "GenericInstantiation",
+                Name = annotation.Identifier,
+                Arguments = typeArguments,
+            }
+        else
+            ty = {
+                Kind = "Reference",
+                Reference = annotation.Identifier,
+            }
+        end
     elseif annotation.Type == "Keyword" then
         if annotation.Keyword == "nil" then
             ty = {

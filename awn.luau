@@ -60,6 +60,12 @@ type FunctionType = {
     read IsTop: boolean?,
 }
 
+type GenericInstantiationType = {
+    read Kind: "GenericInstantiation",
+    read Name: string,
+    read Arguments: { read Type },
+}
+
 type UnionType = {
     read Kind: "Union",
     read Components: { read Type },
@@ -84,6 +90,7 @@ type TypeData =
     | SingletonType
     | GenericType
     | FunctionType
+    | GenericInstantiationType
     | UnionType
     | IntersectionType
     | FreeType
@@ -123,41 +130,53 @@ local function unreachable(x: never): never
     error(`Unexpected branch with value '{ x }' ({ typeof(x) }), this is an internal error.`)
 end
 
-local function errorType(): Type
-    return {
+local function makeType(ty: TypeData): Type
+    local t = ty :: Type
+    return t
+end
+
+local function errorType()
+    return makeType{
         Kind = "error",
     }
 end
 
-local function neverType(): Type
-    return {
+local function neverType()
+    return makeType{
         Kind = "never",
     }
 end
 
-local function unknownType(): Type
-    return {
+local function unknownType()
+    return makeType{
         Kind = "unknown",
     }
 end
 
-local function primitiveType(primitive: index<PrimitiveType, "Primitive">): PrimitiveType
-    return {
+local function primitiveType(primitive: index<PrimitiveType, "Primitive">)
+    return makeType{
         Kind = "Primitive",
         -- TODO luau cast
         Primitive = primitive :: "nil",
     }
 end
 
-local function genericType(name: string): GenericType
-    return {
+local function singletonType(value)
+    return makeType{
+        Kind = "Singleton",
+        Value = value,
+    }
+end
+
+local function genericType(name: string)
+    return makeType{
         Kind = "Generic",
         Name = name,
     }
 end
 
-local function functionType(generics: { read GenericType }, parameters: { read Type }, variadic: Type?, returns: Type?): Type
-    return {
+local function functionType(generics: { read GenericType }, parameters: { read Type }, variadic: Type, returns: Type?)
+    return makeType{
         Kind = "Function",
         Generics = generics,
         Parameters = parameters,
@@ -166,8 +185,30 @@ local function functionType(generics: { read GenericType }, parameters: { read T
     }
 end
 
-local function freeType(): Type
-    return {
+local function genericInstantationType(name: string, arguments: { read Type })
+    return makeType{
+        Kind = "GenericInstantiation",
+        Name = name,
+        Arguments = arguments,
+    }
+end
+
+local function unionType(components: { read Type })
+    return makeType{
+        Kind = "Union",
+        Components = components,
+    }
+end
+
+local function intersectionType(components: { read Type })
+    return makeType{
+        Kind = "Intersection",
+        Components = components,
+    }
+end
+
+local function freeType()
+    return makeType{
         Kind = "Free",
         Bound = unknownType(),
     }
@@ -178,8 +219,8 @@ local function errorReport(message, position): Type
     return errorType()
 end
 
-local function makeIntersection(a: Type, b: Type): Type
-    return {
+local function makeIntersection(a: Type, b: Type)
+    return makeType{
         Kind = "Intersection",
         Components = { a, b },
     }
@@ -411,6 +452,11 @@ local function normalize(ty: Type): NormalizedType
             end
         end
 
+    elseif ty.Kind == "GenericInstantiation" then
+        toUnknown(n)
+        n.Error = true
+        print(`Cannot normalize generic instantiations.`)
+
     elseif ty.Kind == "Union" then
         -- Unions grow from `never`.
         toNever(n)
@@ -624,6 +670,15 @@ local function typeToString(ty: Type, alias: string?): string
 
         return str
 
+    elseif ty.Kind == "GenericInstantiation" then
+        local arguments = table.create<<string>>(#ty.Arguments)
+
+        for i, a in ty.Arguments do
+            arguments[i] = typeToString(a)
+        end
+
+        return `{ ty.Name }<{ table.concat(arguments, ", ") }>`
+
     elseif ty.Kind == "Union" then
         local tys = table.create<<string>>(#ty.Components)
         local length = 0
@@ -663,7 +718,7 @@ local function typeToString(ty: Type, alias: string?): string
     elseif ty.Kind == "Free" then
         local str = freeTypeName(ty)
 
-        if not isUnknown(normalize(ty.Bound)) then
+        if ty.Bound.Kind ~= "unknown" then
             str ..= ` <: { typeToString(ty.Bound) }`
         end
 
@@ -675,7 +730,7 @@ local function typeToString(ty: Type, alias: string?): string
 end
 
 local function normalizationToType(n: NormalizedType): Type
-    local t = {}
+    local t: { Type } = {}
 
     if n.Error then
         table.insert(t, errorType())
@@ -690,7 +745,7 @@ local function normalizationToType(n: NormalizedType): Type
 
         if n.Boolean then
             if n.Boolean.Value ~= nil then
-                table.insert(t, { Kind = "Singleton", Value = n.Boolean.Value })
+                table.insert(t, singletonType(n.Boolean.Value))
             else
                 table.insert(t, primitiveType("boolean"))
             end
@@ -703,7 +758,7 @@ local function normalizationToType(n: NormalizedType): Type
         if n.String then
             if n.String.Singletons then
                 for _, s in n.String.Singletons do
-                    table.insert(t, { Kind = "Singleton", Value = s })
+                    table.insert(t, singletonType(s))
                 end
             else
                 table.insert(t, primitiveType("string"))
@@ -715,16 +770,13 @@ local function normalizationToType(n: NormalizedType): Type
                 local cs = table.create<<Type>>(#n.Function.Components)
 
                 for i, f in n.Function.Components do
-                    cs[i] = functionType({}, { normalizationToType(f.Parameter) }, nil, normalizationToType(f.Return))
+                    cs[i] = functionType({}, { normalizationToType(f.Parameter) }, neverType(), normalizationToType(f.Return))
                 end
 
                 if #cs == 1 then
                     table.insert(t, cs[1])
                 else
-                    table.insert(t, {
-                        Kind = "Intersection",
-                        Components = cs,
-                    })
+                    table.insert(t, intersectionType(cs))
                 end
             else
                 local f: FunctionType = {
@@ -734,7 +786,7 @@ local function normalizationToType(n: NormalizedType): Type
                     IsTop = true,
                 }
 
-                table.insert(t, f)
+                table.insert(t, makeType(f))
             end
         end
     end
@@ -745,10 +797,7 @@ local function normalizationToType(n: NormalizedType): Type
         return t[1]
     end
 
-    return {
-        Kind = "Union",
-        Components = t,
-    }
+    return unionType(t)
 end
 
 local function normalizationToString(n: NormalizedType): string
@@ -883,9 +932,11 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
             local paramTy = params[i]
 
             if paramTy.Kind == "Free" then
-                if isUnknown(normalize(paramTy.Bound)) then
-                    local gen = genericType(string.char((#gens + 19) % 26 + 65))
-                    params[i] = gen
+                local normalizedBound = normalize(paramTy.Bound)
+
+                if isUnknown(normalizedBound) then
+                    local gen = genericType(string.char((#gens + 19) % 26 + 65)) :: GenericType
+                    params[i] = gen :: Type
 
                     if retTy == paramTy then
                         retTy = gen
@@ -893,7 +944,7 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
 
                     table.insert(gens, gen)
                 else
-                    local bound = normalizationToType(normalize(paramTy.Bound))
+                    local bound = normalizationToType(normalizedBound)
                     params[i] = bound
 
                     if retTy == paramTy then
@@ -907,18 +958,21 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
             retTy = nil
         end
 
-        return functionType(gens, params, nil, retTy)
+        return functionType(gens, params, neverType(), retTy)
+
     elseif expr.Type == "Return" then
         local retTy = state.ReturnType
 
         if retTy == true then
-            state.ReturnType = infer(state, expr.Return or primitiveType("nil"))
+            state.ReturnType = if expr.Return then infer(state, expr.Return) else primitiveType("nil")
 
+            assert(state.ReturnType ~= true)
             return assert(state.ReturnType)
         elseif retTy ~= nil then
             assert(retTy.Kind == "Free")
-            state.ReturnType = makeIntersection(retTy.Bound, infer(state, expr.Return or primitiveType("nil")))
+            state.ReturnType = makeIntersection(retTy.Bound, if expr.Return then infer(state, expr.Return) else primitiveType("nil"))
 
+            assert(state.ReturnType ~= true)
             return assert(state.ReturnType)
         else
             return errorReport(`Cannot 'return' outside of functions.`, expr.Position)
@@ -931,7 +985,7 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
         table.insert(typeEnvOrdered, expr.Name)
         return errorType()
     else
-        error(`Cannot infer { expr.Type }.`)
+        error(`Cannot infer { expr.Type }s.`)
     end
 end
 
@@ -947,12 +1001,8 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
             return errorReport(`Unknown type '{ annotation.Reference }'`, position)
         end
     elseif annotation.Kind == "Singleton" then
-        local single: SingletonType = {
-            Kind = "Singleton",
-            Value = annotation.Value
-        }
+        return singletonType(annotation.Value)
 
-        return single
     elseif annotation.Kind == "Function" then
         local params = table.create<<Type>>(#annotation.Parameters)
 
@@ -960,7 +1010,17 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
             params[i] = typeAnnotationToType(position, param)
         end
 
-        return functionType({}, params, nil, if annotation.Returns then typeAnnotationToType(position, annotation.Returns) else nil)
+        return functionType({}, params, neverType(), if annotation.Returns then typeAnnotationToType(position, annotation.Returns) else nil)
+
+    elseif annotation.Kind == "GenericInstantiation" then
+        local arguments = table.create<<Type>>(#annotation.Arguments)
+
+        for i, a in annotation.Arguments do
+            arguments[i] = typeAnnotationToType(position, a)
+        end
+
+        return genericInstantationType(annotation.Name, arguments)
+
     elseif annotation.Kind == "Union" then
         local components = table.create<<Type>>(#annotation.Components)
 
@@ -968,10 +1028,8 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
             components[i] = typeAnnotationToType(position, c)
         end
 
-        return {
-            Kind = "Union",
-            Components = components,
-        }
+        return unionType(components)
+
     elseif annotation.Kind == "Intersection" then
         local components = table.create<<Type>>(#annotation.Components)
 
@@ -979,10 +1037,7 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
             components[i] = typeAnnotationToType(position, c)
         end
 
-        return {
-            Kind = "Intersection",
-            Components = components,
-        }
+        return intersectionType(components)
     else
         unreachable(annotation.Kind)
         error(`Unreachable.`)
@@ -1017,13 +1072,88 @@ local function reportMismatch(a: Type, na: NormalizedType, b: Type, nb: Normaliz
     print(err)
 end
 
+local function instantiateType(ty: Type): Type
+    local inited: Type
+
+    if ty.Kind == "error" or ty.Kind == "never" or ty.Kind == "unknown"
+        or ty.Kind == "Primitive" or ty.Kind == "Singleton" or ty.Kind == "Generic"
+        or ty.Kind == "Free" or ty.Kind == "Function"
+    then
+        inited = ty
+    elseif ty.Kind == "GenericInstantiation" then
+        if ty.Name == "checkissubtype" then
+            if #ty.Arguments ~= 2 then
+                inited = errorReport(`Expected exactly 2 type arguments to 'checkissubtype' type, got { #ty.Arguments } instead.`, {})
+            else
+                local a = ty.Arguments[1]
+                local b = ty.Arguments[2]
+
+                local na = normalize(a)
+                local nb = normalize(b)
+
+                if isSubtypeOf(na, nb).Holds then
+                    print(`{ a.AliasName } is a subtype of { b.AliasName }.`)
+                else
+                    print(`{ a.AliasName } is not a subtype of { b.AliasName }.`)
+                end
+
+                inited = primitiveType("nil")
+            end
+        else
+            inited = errorReport(`Tried to instantiate invalid type alias '{ ty.Name }'.`, {})
+        end
+    elseif ty.Kind == "Union" then
+        local components = table.create<<Type>>(#ty.Components)
+        local changed = false
+
+        for i, c in ty.Components do
+            local new = instantiateType(c)
+            components[i] = new
+
+            if new ~= c then
+                changed = true
+            end
+        end
+
+        if changed then
+            inited = unionType(components)
+        else
+            inited = ty
+        end
+    elseif ty.Kind == "Intersection" then
+        local components = table.create<<Type>>(#ty.Components)
+        local changed = false
+
+        for i, c in ty.Components do
+            local new = instantiateType(c)
+            components[i] = new
+
+            if new ~= c then
+                changed = true
+            end
+        end
+
+        if changed then
+            inited = intersectionType(components)
+        else
+            inited = ty
+        end
+    else
+        unreachable(ty.Kind)
+        error(`Unreachable.`)
+    end
+
+    inited.AliasName = ty.AliasName
+    return inited
+end
+
 function check(inferred: Type, annotation: Type, position: caw.Position, printNote: boolean?)
     if annotation.Kind == "Error" then
         return
     end
 
-    local normalizedInference = normalize(inferred)
-    local normalizedAnnotation = normalize(annotation)
+    local normalizedInference = normalize(instantiateType(inferred))
+    local normalizedAnnotation = normalize(instantiateType(annotation))
 
     local subtypeResult = isSubtypeOf(normalizedInference, normalizedAnnotation)
 
@@ -1060,15 +1190,6 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
             local a = assert(typeEnv[k])
             print(`type { k } = { typeToString(a, k) }`)
         end
-    end
-
-    print("\n")
-
-    local tyA = typeEnv["A"]
-    local tyB = typeEnv["B"]
-
-    if tyA and tyB then
-        check(tyA, tyB, { Line = 1, Character = 1, Offset = 1 }, true)
     end
 end
 
