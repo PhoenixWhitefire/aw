@@ -139,6 +139,8 @@ local function exprToStringShallow(expr: caw.Expression)
         return `...[{ exprToStringShallow(expr.Selection) }]`
     elseif expr.Type == "VariadicLength" then
         return `#...`
+    elseif expr.Type == "TypeAliasDeclaration" then
+        return `**TypeAliasDeclaration**`
     elseif expr.Type == "InvalidSyntax" then
         return expr.Token
     else
@@ -505,9 +507,9 @@ for bi, _ in typeAssociations do
 end
 
 type InferenceState = {
-    nonGeneric: { [Type]: true? },
-    expectingRetTy: Type? | false,
-    expectingVariadicTy: Type?,
+    NonGeneric: { [Type]: true? },
+    CurrentReturnType: Type? | false,
+    CurrentVariadicType: Type?,
 }
 
 local totalInferenceSteps = 0
@@ -559,7 +561,7 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
         local fromEnv = typeAssociations[expr.Reference]
 
         if fromEnv then
-            return fresh(fromEnv, state.nonGeneric)
+            return fresh(fromEnv, state.NonGeneric)
         else
             return errorReport(`Unknown symbol '{ expr.Reference }'.`, expr)
         end
@@ -627,13 +629,13 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             error(`Unreachable.`)
         end
     elseif expr.Type == "Return" then
-        if state.expectingRetTy == nil then
+        if state.CurrentReturnType == nil then
             return errorReport(`Unexpected 'return' outside of function body.`, expr)
-        elseif state.expectingRetTy == false then
-            state.expectingRetTy = typeVariable()
+        elseif state.CurrentReturnType == false then
+            state.CurrentReturnType = typeVariable()
         end
 
-        assert(state.expectingRetTy)
+        assert(state.CurrentReturnType)
 
         local here = voidType()
 
@@ -641,7 +643,7 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             here = infer(expr.Return, state)
         end
 
-        unify(here, state.expectingRetTy, expr)
+        unify(here, state.CurrentReturnType, expr)
         return voidType()
 
     elseif expr.Type == "IfCondition" then
@@ -675,7 +677,7 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             return errorReport(`Unknown function '{ expr.Call.Identifier }'.`, expr)
         end
 
-        fnTy = fresh(fnTy, state.nonGeneric)
+        fnTy = fresh(fnTy, state.NonGeneric)
         local argTys = table.create<<Type>>(#expr.Call.Arguments)
 
         for i, a in expr.Call.Arguments do
@@ -699,14 +701,14 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
         for i, p in expr.Function.Parameters do
             local tv = typeVariable()
             paramTys[i] = tv
-            state.nonGeneric[tv] = true
+            state.NonGeneric[tv] = true
             shadowed[p.Name] = typeAssociations[p.Name]
             typeAssociations[p.Name] = tv
         end
 
         if expr.Function.Variadic.Present then
             variadic = typeVariable()
-            state.nonGeneric[variadic] = true
+            state.NonGeneric[variadic] = true
         end
 
         local fnTy = functionType(paramTys, variadic, typeVariable())
@@ -716,11 +718,11 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
             typeAssociations[expr.Function.Name] = fnTy
         end
 
-        local prevVariTy = state.expectingVariadicTy
-        state.expectingVariadicTy = variadic
+        local prevVariTy = state.CurrentVariadicType
+        state.CurrentVariadicType = variadic
 
-        local prevRetTy = state.expectingRetTy
-        state.expectingRetTy = false
+        local prevRetTy = state.CurrentReturnType
+        state.CurrentReturnType = false
 
         for _, b in expr.Function.Body do
             infer(b, state)
@@ -728,21 +730,21 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
 
         local retTy = voidType()
 
-        if state.expectingRetTy then
-            retTy = state.expectingRetTy
+        if state.CurrentReturnType then
+            retTy = state.CurrentReturnType
         end
 
-        state.expectingVariadicTy = prevVariTy
-        state.expectingRetTy = prevRetTy
+        state.CurrentVariadicType = prevVariTy
+        state.CurrentReturnType = prevRetTy
 
         for i, p in paramTys do
-            state.nonGeneric[p] = nil
+            state.NonGeneric[p] = nil
 
             local param = expr.Function.Parameters[i]
             typeAssociations[param.Name] = shadowed[param.Name]
         end
 
-        state.nonGeneric[variadic] = nil
+        state.NonGeneric[variadic] = nil
 
         if expr.Function.Name then
             typeAssociations[expr.Function.Name] = shadowed[expr.Function.Name]
@@ -804,21 +806,21 @@ local function infer_(expr: caw.Expression, state: InferenceState): Type
         return valueTy
 
     elseif expr.Type == "VariadicArguments" then
-        if state.expectingVariadicTy then
-            return state.expectingVariadicTy
+        if state.CurrentVariadicType then
+            return state.CurrentVariadicType
         else
             return errorReport(`'...' may only be referenced within function bodies.`, expr)
         end
 
     elseif expr.Type == "VariadicSelection" then
-        if state.expectingVariadicTy then
-            return state.expectingVariadicTy
+        if state.CurrentVariadicType then
+            return state.CurrentVariadicType
         else
             return errorReport(`'...' may only be referenced within function bodies.`, expr)
         end
 
     elseif expr.Type == "VariadicLength" then
-        if state.expectingVariadicTy then
+        if state.CurrentVariadicType then
             return numberType()
         else
             return errorReport(`'...' may only be referenced within function bodies.`, expr)
@@ -888,7 +890,7 @@ local function hm(expressions: { read caw.Expression }, options: { read LogInfer
 
     for _, v in expressions do
         inferenceStep = nil
-        infer(v, { nonGeneric = {} })
+        infer(v, { NonGeneric = {} })
 
         if logInference then
             table.insert(rootInferenceSteps, assert(inferenceStep))

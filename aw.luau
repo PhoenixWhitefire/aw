@@ -185,10 +185,10 @@ if select("#", ...) > 0 then
 
                     if algo == "hm" then
                         program = hmProgram
-                        print(`The program will be 'hm'.\n`)
+                        print(`The default program will be 'hm'.\n`)
                     elseif algo == "sn" then
                         program = npProgram
-                        print(`The program will be 'np'.\n`)
+                        print(`The default program will be 'np'.\n`)
                     end
                 else
                     print(`Invalid '--inferer' algorithm '{ algo }', please check '--help' for the supported algorithms.`)
