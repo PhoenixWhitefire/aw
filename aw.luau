@@ -74,26 +74,21 @@ local npProgram = [[
 type Red = "red"
 type Blue = "blue"
 type Color = Red | Blue
-type Coloring = (Color) -> (Color) -> (Color) -> (Color) -> boolean
-type Uncolorable = (Color) -> (Color) -> (Color) -> (Color) -> false
+type Coloring = (Color) -> (Color) -> (Color) -> boolean
+type Uncolorable = (Color) -> (Color) -> (Color) -> false
 
 type Line = Coloring
-  & ((Red) -> (Red) -> (Color) -> (Color) -> false)
-  & ((Blue) -> (Blue) -> (Color) -> (Color) -> false)
-  & ((Color) -> (Red) -> (Red) -> (Color) -> false)
-  & ((Color) -> (Blue) -> (Blue) -> (Color) -> false)
+  & ((Red) -> (Red) -> (Color) -> false)
+  & ((Blue) -> (Blue) -> (Color) -> false)
+  & ((Color) -> (Red) -> (Red) -> false)
+  & ((Color) -> (Blue) -> (Blue) -> false)
 
 type Triangle = Line
-  & ((Red) -> (Color) -> (Red) -> (Color) -> false)
-  & ((Blue) -> (Color) -> (Blue) -> (Color) -> false)
-
-type Quad = Triangle
-  & ((Red) -> (Color) -> (Color) -> (Red) -> false)
-  & ((Blue) -> (Color) -> (Color) -> (Blue) -> false)
+  & ((Red) -> (Color) -> (Red) -> false)
+  & ((Blue) -> (Color) -> (Blue) -> false)
 
 let lineIsUncolorable: issubtypeof<Line, Uncolorable> = valuenever
 let triangleIsUncolorable: issubtypeof<Triangle, Uncolorable> = valuenever
-let quadIsUncolorable: issubtypeof<Quad, Uncolorable> = valuenever
 ]]
 
 local programs = {
