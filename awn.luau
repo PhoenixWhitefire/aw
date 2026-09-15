@@ -219,10 +219,45 @@ local function errorReport(message, position): Type
     return errorType()
 end
 
+local function makeUnion(a: Type, b: Type)
+    local components = {}
+
+    if a.Kind == "Union" then
+        table.move(a.Components, 1, #a.Components, 1, components)
+    else
+        components[1] = a
+    end
+
+    if b.Kind == "Union" then
+        table.move(b.Components, 1, #b.Components, 1, components)
+    else
+        table.insert(components, b)
+    end
+
+    return makeType{
+        Kind = "Union",
+        Components = components,
+    }
+end
+
 local function makeIntersection(a: Type, b: Type)
+    local components = {}
+
+    if a.Kind == "Intersection" then
+        table.move(a.Components, 1, #a.Components, 1, components)
+    else
+        components[1] = a
+    end
+
+    if b.Kind == "Intersection" then
+        table.move(b.Components, 1, #b.Components, 1, components)
+    else
+        table.insert(components, b)
+    end
+
     return makeType{
         Kind = "Intersection",
-        Components = { a, b },
+        Components = components,
     }
 end
 
@@ -413,6 +448,8 @@ local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
         else
             n.Function.Components = with.Function.Components
         end
+    elseif n.Function and not with.Function then
+        n.Function = nil
     end
 end
 
@@ -984,8 +1021,38 @@ local typeAssociationsOrdered = {}
 local typeAnnotationToType
 local check
 
+-- `Target <: Super`. Can modify `Target.Bound` if `Target` is Free.
+-- Otherwise report error if relation does not hold.
+-- TODO: Free type lower bounds: If `Super` is Free... then... we can do lower bounds I guess?
+type SubtypeConstraint = {
+    read Position: caw.Position,
+    read Target: Type,
+    read Super: Type,
+}
+
+local function subtypeConstraint(position, target, super): SubtypeConstraint
+    return {
+        Position = position,
+        Target = target,
+        Super = super,
+    }
+end
+
+local function dispatchSubtypeConstraints(constraints: { SubtypeConstraint })
+    for _, sc in constraints do
+        if sc.Target.Kind == "Free" then
+            sc.Target.Bound = makeIntersection(sc.Target.Bound, sc.Super)
+        else
+            check(sc.Target, sc.Super, sc.Position)
+        end
+    end
+
+    table.clear(constraints)
+end
+
 type InferenceState = {
     ReturnType: Type? | true,
+    SubtypeConstraints: { SubtypeConstraint },
 }
 
 local function infer(state: InferenceState, expr: caw.Expression): Type
@@ -996,10 +1063,6 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
         local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value) else primitiveType("nil")
         local anno = if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation) else nil
 
-        if ty.Kind == "Free" and anno then
-            ty.Bound = makeIntersection(ty.Bound, anno)
-        end
-
         -- TODO luau type error on `ty` when `anno or` is removed
         typeAssociations[expr.Declaration.Name] = {
             Expression = expr,
@@ -1008,7 +1071,8 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
         table.insert(typeAssociationsOrdered, expr.Declaration.Name)
 
         if anno then
-            check(ty, anno, if expr.Declaration.Value then expr.Declaration.Value.Position else expr.Position)
+            local position = if expr.Declaration.Value then expr.Declaration.Value.Position else expr.Position
+            table.insert(state.SubtypeConstraints, subtypeConstraint(position, ty, anno))
         end
 
         return ty
@@ -1048,18 +1112,15 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
 
             assert(ref.Expression.Type == "Declaration", ref.Expression.Type)
 
-            local variableTy = infer(state, variable)
             local valueTy = infer(state, value)
             local annoTy = if ref.Expression.Declaration.Annotation then typeAnnotationToType(ref.Expression.Position, ref.Expression.Declaration.Annotation) else nil
 
             if annoTy then
-                check(valueTy, annoTy, value.Position)
-            elseif ref.Expression.Declaration.Value then
-                check(valueTy, variableTy, value.Position)
+                table.insert(state.SubtypeConstraints, subtypeConstraint(value.Position, valueTy, annoTy))
             else
                 typeAssociations[variable.Reference] = {
                     Expression = ref.Expression,
-                    Type = valueTy,
+                    Type = makeUnion(ref.Type, valueTy),
                 }
             end
 
@@ -1087,6 +1148,8 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
         for _, expr in expr.Function.Body do
             infer(state, expr)
         end
+
+        dispatchSubtypeConstraints(state.SubtypeConstraints)
 
         local retTy = state.ReturnType
         state.ReturnType = prevRetTy
@@ -1335,7 +1398,8 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
     -- logInference = options.LogInference
 
     local state: InferenceState = {
-        ReturnType = nil
+        ReturnType = nil,
+        SubtypeConstraints = {},
     }
 
     local builtins = {}
@@ -1347,6 +1411,8 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
     for _, expr in expressions do
         infer(state, expr)
     end
+
+    dispatchSubtypeConstraints(state.SubtypeConstraints)
 
     for _, k in typeAssociationsOrdered do
         local t = assert(typeAssociations[k])
