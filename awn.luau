@@ -124,6 +124,8 @@ type NormalizedType = {
     }?,
     -- `nil` = not present.
     Function: NormalizedFunctionType?,
+    -- Union of generic types.
+    Generic: { string }?,
 }
 
 local function unreachable(x: never): never
@@ -281,6 +283,7 @@ local function toNever(n: NormalizedType)
     n.Number = false
     n.String = nil
     n.Function = nil
+    n.Generic = nil
 end
 
 local function toUnknown(n: NormalizedType)
@@ -291,6 +294,7 @@ local function toUnknown(n: NormalizedType)
     n.Number = true
     n.String = {}
     n.Function = {}
+    n.Generic = {}
 end
 
 -- TODO string singleton
@@ -364,6 +368,14 @@ local function dumpNormalization(n: NormalizedType)
         end
     end
 
+    if n.Generic then
+        if #n.Generic == 0 then
+            table.insert(t, "*G")
+        else
+            table.insert(t, table.concat(n.Generic, " | "))
+        end
+    end
+
     if #t == 0 then
         return "never"
     else
@@ -409,6 +421,10 @@ local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
         print(`Cannot union '{ dumpNormalization(n) }' with '{ dumpNormalization(with) }': Unions of functions cannot be normalized at this time.`)
         n.Error = true
     end
+
+    if n.Generic and #n.Generic > 0 and with.Generic and #with.Generic > 0 then
+        table.move(with.Generic, 1, #with.Generic, #n.Generic + 1, n.Generic)
+    end
 end
 
 local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
@@ -436,7 +452,7 @@ local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
                 end
             until not removed
         elseif not mySingles and withSingles then
-            n.String.Singletons = withSingles -- `string & "a" = "a"`.
+            n.String.Singletons = table.clone(withSingles) -- `string & "a" = "a"`.
         end
     else
         n.String = nil
@@ -451,6 +467,12 @@ local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
     elseif n.Function and not with.Function then
         n.Function = nil
     end
+
+    if n.Generic and not with.Generic then
+        n.Generic = nil
+    elseif n.Generic and #n.Generic == 0 and with.Generic and #with.Generic > 0 then
+        n.Generic = table.clone(with.Generic)
+    end
 end
 
 local function normalize(ty: Type): NormalizedType
@@ -459,7 +481,7 @@ local function normalize(ty: Type): NormalizedType
     if ty.Kind == "error" then
         n.Error = true
     elseif ty.Kind == "never" then
-        toNever(n)
+        -- Default state is `never`.
     elseif ty.Kind == "unknown" then
         toUnknown(n)
     elseif ty.Kind == "Primitive" then
@@ -484,9 +506,8 @@ local function normalize(ty: Type): NormalizedType
             error(`Unsupported singleton kind '{ typeof(ty.Value) }'.`)
         end
     elseif ty.Kind == "Generic" then
-        toUnknown(n)
-        n.Error = true
-        print(`Cannot normalize generics.`)
+        n.Generic = { ty.Name }
+
     elseif ty.Kind == "Function" then
         if ty.IsTop then
             n.Function = {}
@@ -974,6 +995,20 @@ local function normalizationToType(n: NormalizedType): Type
                 table.insert(t, makeType(f))
             end
         end
+
+        if n.Generic then
+            if #n.Generic == 0 then
+                print("Top generic type??")
+            else
+                local gens = table.create<<Type>>(#n.Generic)
+
+                for i, gen in n.Generic do
+                    gens[i] = genericType(gen)
+                end
+
+                table.insert(t, unionType(gens))
+            end
+        end
     end
 
     if #t == 0 then
@@ -1061,16 +1096,21 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
 
     elseif expr.Type == "Declaration" then
         local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value) else primitiveType("nil")
+
+        if not ty then
+            errorReport(`Trying to assign '{ expr.Declaration.Name }' to an expression returning no values.`, expr.Position)
+        end
+
         local anno = if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation) else nil
 
         -- TODO luau type error on `ty` when `anno or` is removed
         typeAssociations[expr.Declaration.Name] = {
             Expression = expr,
-            Type = anno or ty
+            Type = anno or ty or errorType()
         }
         table.insert(typeAssociationsOrdered, expr.Declaration.Name)
 
-        if anno then
+        if anno and ty then
             local position = if expr.Declaration.Value then expr.Declaration.Value.Position else expr.Position
             table.insert(state.SubtypeConstraints, subtypeConstraint(position, ty, anno))
         end
@@ -1154,6 +1194,8 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
         local retTy = state.ReturnType
         state.ReturnType = prevRetTy
 
+        local freeTypeSubstitutions: { [Type]: Type } = {}
+
         for i, param in expr.Function.Parameters do
             typeAssociations[param.Name] = nil
 
@@ -1164,7 +1206,7 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
 
                 if isUnknown(normalizedBound) then
                     local gen = genericType(string.char((#gens + 19) % 26 + 65)) :: GenericType
-                    params[i] = gen :: Type
+                    freeTypeSubstitutions[paramTy] = gen :: Type
 
                     if retTy == paramTy then
                         retTy = gen
@@ -1173,13 +1215,66 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
                     table.insert(gens, gen)
                 else
                     local bound = normalizationToType(normalizedBound)
-                    params[i] = bound
+                    freeTypeSubstitutions[paramTy] = bound
 
                     if retTy == paramTy then
                         retTy = bound
                     end
                 end
             end
+        end
+
+        local function substituteAllIn(ty: Type): Type
+            if ty.Kind == "error" or ty.Kind == "never" or ty.Kind == "unknown"
+                or ty.Kind == "Primitive" or ty.Kind == "Singleton" or ty.Kind == "Generic"
+            then
+                return ty
+            elseif ty.Kind == "Free" then
+                return freeTypeSubstitutions[ty] or ty
+            elseif ty.Kind == "Function" then
+                local params = table.create<<Type>>(#ty.Parameters)
+
+                for i, param in ty.Parameters do
+                    params[i] = substituteAllIn(param)
+                end
+
+                local rets = if ty.Returns then substituteAllIn(ty.Returns) else nil
+                return functionType(ty.Generics, params, neverType(), rets)
+
+            elseif ty.Kind == "Union" then
+                local components = table.create<<Type>>(#ty.Components)
+
+                for i, c in ty.Components do
+                    components[i] = substituteAllIn(c)
+                end
+
+                return unionType(components)
+
+            elseif ty.Kind == "Intersection" then
+                local components = table.create<<Type>>(#ty.Components)
+
+                for i, c in ty.Components do
+                    components[i] = substituteAllIn(c)
+                end
+
+                return intersectionType(components)
+
+            elseif ty.Kind == "GenericInstantiation" then
+                local arguments = table.create<<Type>>(#ty.Arguments)
+
+                for i, a in ty.Arguments do
+                    arguments[i] = substituteAllIn(a)
+                end
+
+                return genericInstantationType(ty.Name, arguments)
+            else
+                unreachable(ty.Kind)
+                error(`Unreachable.`)
+            end
+        end
+
+        for i, param in params do
+            params[i] = substituteAllIn(param)
         end
 
         if retTy == true then
@@ -1192,10 +1287,10 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
         local retTy = state.ReturnType
 
         if retTy == true then
-            state.ReturnType = infer(state, expr.Return)
+            state.ReturnType = expr.Return and infer(state, expr.Return)
 
             assert(state.ReturnType ~= true)
-            return assert(state.ReturnType)
+            return state.ReturnType
         elseif retTy ~= nil then
             assert(retTy.Kind == "Free")
             local thisRet
@@ -1219,25 +1314,36 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
         local fn = typeAssociations[expr.Call.Identifier]
 
         if not fn then
-            return errorReport(`Unknown funciton '{ expr.Call.Identifier }'`, expr.Position)
+            return errorReport(`Unknown function '{ expr.Call.Identifier }'.`, expr.Position)
         end
 
         local fnTy = fn.Type
 
-        if fnTy.Kind ~= "Function" then
-            return errorReport(`Cannot call a value of type '{ fnTy.Kind }'`, expr.Position)
-        end
-
-        if #expr.Call.Arguments ~= #fnTy.Parameters then
-            return errorReport(`Function expected { #fnTy.Parameters } arguments, got { #expr.Call.Arguments }`, expr.Position)
-        end
+        local arguments = table.create<<Type>>(#expr.Call.Arguments)
 
         for i, a in expr.Call.Arguments do
-            local ty = infer(state, a)
-            table.insert(state.SubtypeConstraints, subtypeConstraint(a.Position, ty, fnTy.Parameters[i]))
+            arguments[i] = infer(state, a)
         end
 
-        return fnTy.Returns
+        local checkFnTy = functionType({}, arguments, neverType(), genericType("R"))
+        table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, fnTy, checkFnTy))
+
+        dispatchSubtypeConstraints(state.SubtypeConstraints)
+
+        if fnTy.Kind == "Free" then
+            local normFn = normalize(fnTy.Bound)
+            local finalFn = normalizationToType(normFn)
+
+            if finalFn.Kind == "Function" then
+                return finalFn.Returns
+            else
+                return errorReport(`Free: Cannot call a value of type '{ typeToString(fnTy.Bound) }'.`, expr.Position)
+            end
+        elseif fnTy.Kind == "Function" then
+            return fnTy.Returns
+        else
+            return errorReport(`Cannot call a value of type '{ typeToString(fnTy) }'.`, expr.Position)
+        end
 
     elseif expr.Type == "TypeAliasDeclaration" then
         local ty = typeAnnotationToType(expr.Position, expr.Value)
