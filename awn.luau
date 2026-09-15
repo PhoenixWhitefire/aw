@@ -214,7 +214,7 @@ local function freeType()
     }
 end
 
-local function errorReport(message, position): Type
+local function errorReport(message, position: caw.Position): Type
     print(`{ position.Line }:{ position.Character }: { message }`)
     return errorType()
 end
@@ -1055,7 +1055,7 @@ type InferenceState = {
     SubtypeConstraints: { SubtypeConstraint },
 }
 
-local function infer(state: InferenceState, expr: caw.Expression): Type
+local function infer(state: InferenceState, expr: caw.Expression): Type?
     if expr.Type == "Constant" then
         return primitiveType(expr.Constant.Type)
 
@@ -1096,7 +1096,7 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
             local ref = typeAssociations[variable.Reference]
 
             if not ref then
-                return errorReport(`Undefined variable '{ variable.Reference }'`, variable)
+                return errorReport(`Undefined variable '{ variable.Reference }'`, variable.Position)
             end
 
             if ref.Expression.Type == "Function" then -- Function parameter.
@@ -1192,19 +1192,53 @@ local function infer(state: InferenceState, expr: caw.Expression): Type
         local retTy = state.ReturnType
 
         if retTy == true then
-            state.ReturnType = if expr.Return then infer(state, expr.Return) else primitiveType("nil")
+            state.ReturnType = infer(state, expr.Return)
 
             assert(state.ReturnType ~= true)
             return assert(state.ReturnType)
         elseif retTy ~= nil then
             assert(retTy.Kind == "Free")
-            state.ReturnType = makeIntersection(retTy.Bound, if expr.Return then infer(state, expr.Return) else primitiveType("nil"))
+            local thisRet
 
-            assert(state.ReturnType ~= true)
-            return assert(state.ReturnType)
+            if expr.Return then
+                thisRet = infer(state, expr.Return)
+            end
+
+            if thisRet then
+                state.ReturnType = makeIntersection(retTy.Bound, thisRet)
+
+                assert(state.ReturnType ~= true)
+                return assert(state.ReturnType)
+            end
+
+            return nil
         else
             return errorReport(`Cannot 'return' outside of functions.`, expr.Position)
         end
+    elseif expr.Type == "Call" then
+        local fn = typeAssociations[expr.Call.Identifier]
+
+        if not fn then
+            return errorReport(`Unknown funciton '{ expr.Call.Identifier }'`, expr.Position)
+        end
+
+        local fnTy = fn.Type
+
+        if fnTy.Kind ~= "Function" then
+            return errorReport(`Cannot call a value of type '{ fnTy.Kind }'`, expr.Position)
+        end
+
+        if #expr.Call.Arguments ~= #fnTy.Parameters then
+            return errorReport(`Function expected { #fnTy.Parameters } arguments, got { #expr.Call.Arguments }`, expr.Position)
+        end
+
+        for i, a in expr.Call.Arguments do
+            local ty = infer(state, a)
+            table.insert(state.SubtypeConstraints, subtypeConstraint(a.Position, ty, fnTy.Parameters[i]))
+        end
+
+        return fnTy.Returns
+
     elseif expr.Type == "TypeAliasDeclaration" then
         local ty = typeAnnotationToType(expr.Position, expr.Value)
         ty.AliasName = expr.Name
