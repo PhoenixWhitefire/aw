@@ -98,13 +98,18 @@ type TypeData =
 type Type = { AliasName: string? } & TypeData
 
 type NormalizedFunctionComponentType = {
-    Parameter: NormalizedType,
-    Return: NormalizedType,
+    Parameters: { NormalizedType },
+    Return: NormalizedType?,
 }
 
 type NormalizedFunctionType = {
     -- `nil` = top 'function' type.
     Components: { NormalizedFunctionComponentType }?
+}
+
+type NormalizedFreeType = {
+    Free: Type,
+    Bound: NormalizedType,
 }
 
 type NormalizedType = {
@@ -126,6 +131,8 @@ type NormalizedType = {
     Function: NormalizedFunctionType?,
     -- Union of generic types.
     Generic: { string }?,
+    -- Union of free types.
+    Free: { NormalizedFreeType }?,
 }
 
 local function unreachable(x: never): never
@@ -263,6 +270,20 @@ local function makeIntersection(a: Type, b: Type)
     }
 end
 
+local function normalizedUnknown(): NormalizedType
+    return {
+        Error = false,
+        Top = true,
+        Nil = true,
+        Boolean = {},
+        Number = true,
+        String = {},
+        Function = {},
+        Generic = {},
+        Free = {},
+    }
+end
+
 local function normalizedNever(): NormalizedType
     return {
         Error = false,
@@ -295,6 +316,7 @@ local function toUnknown(n: NormalizedType)
     n.String = {}
     n.Function = {}
     n.Generic = {}
+    n.Free = {}
 end
 
 -- TODO string singleton
@@ -318,6 +340,7 @@ local function dumpNormalization(n: NormalizedType)
 
     if n.Top then
         table.insert(t, "unknown")
+        return table.concat(t, " | ")
     end
 
     if n.Nil then
@@ -359,7 +382,13 @@ local function dumpNormalization(n: NormalizedType)
             local fs = table.create<<string>>(#n.Function.Components)
 
             for i, f in n.Function.Components do
-                fs[i] = `({ dumpNormalization(f.Parameter) }) -> { dumpNormalization(f.Return) }`
+                local params = table.create<<string>>(#f.Parameters)
+
+                for i, param in f.Parameters do
+                    params[i] = dumpNormalization(param)
+                end
+
+                fs[i] = `({ table.concat(params, ", ") }) -> { if f.Return then dumpNormalization(f.Return) else "()" }`
             end
 
             table.insert(t, table.concat(fs, " & "))
@@ -373,6 +402,20 @@ local function dumpNormalization(n: NormalizedType)
             table.insert(t, "*G")
         else
             table.insert(t, table.concat(n.Generic, " | "))
+        end
+    end
+
+    if n.Free then
+        if #n.Free == 0 then
+            table.insert(t, "'*F")
+        else
+            local frees = table.create<<string>>(#n.Free)
+
+            for i, free in n.Free do
+                frees[i] = `t{i}` -- <: { dumpNormalization(free.Bound) }`
+            end
+
+            table.insert(t, table.concat(frees, " | "))
         end
     end
 
@@ -425,6 +468,12 @@ local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
     if n.Generic and #n.Generic > 0 and with.Generic and #with.Generic > 0 then
         table.move(with.Generic, 1, #with.Generic, #n.Generic + 1, n.Generic)
     end
+
+    if not n.Free and with.Free then
+        n.Free = with.Free
+    elseif n.Free and with.Free then
+        table.move(with.Free, 1, #with.Free, #n.Free + 1, n.Free)
+    end
 end
 
 local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
@@ -473,6 +522,12 @@ local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
     elseif n.Generic and #n.Generic == 0 and with.Generic and #with.Generic > 0 then
         n.Generic = table.clone(with.Generic)
     end
+
+    if n.Free and not with.Free then
+        n.Free = nil
+    elseif n.Free and #n.Free == 0 and with.Free and #with.Free > 0 then
+        n.Free = table.clone(with.Free)
+    end
 end
 
 local function normalize(ty: Type): NormalizedType
@@ -506,26 +561,27 @@ local function normalize(ty: Type): NormalizedType
             error(`Unsupported singleton kind '{ typeof(ty.Value) }'.`)
         end
     elseif ty.Kind == "Generic" then
+        toUnknown(n)
         n.Generic = { ty.Name }
 
     elseif ty.Kind == "Function" then
         if ty.IsTop then
             n.Function = {}
         else
-            if #ty.Parameters == 1 and ty.Returns then
-                n.Function = {
-                    Components = {
-                        {
-                            Parameter = normalize(ty.Parameters[1]),
-                            Return = normalize(ty.Returns),
-                        },
-                    }
-                }
-            else
-                toUnknown(n)
-                n.Error = true
-                print(`Function normalization only supports functions taking in exactly 1 parameter and returning a value.`)
+            local params = table.create<<NormalizedType>>(#ty.Parameters)
+
+            for i, param in ty.Parameters do
+                params[i] = normalize(param)
             end
+
+            n.Function = {
+                Components = {
+                    {
+                        Parameters = params,
+                        Return = if ty.Returns then normalize(ty.Returns) else nil,
+                    },
+                }
+            }
         end
 
     elseif ty.Kind == "GenericInstantiation" then
@@ -550,9 +606,14 @@ local function normalize(ty: Type): NormalizedType
             intersectNormalizedType(n, inner)
         end
     elseif ty.Kind == "Free" then
-        toUnknown(n)
-        n.Error = true
-        print(`Cannot normalize free types.`)
+        n = normalize(ty.Bound)
+
+        n.Free = {
+            {
+                Free = ty,
+                Bound = n,
+            }
+        }
     else
         unreachable(ty.Kind)
         error(`Unreachable.`)
@@ -629,12 +690,14 @@ local function deepCopy(tab: any): any
     return t
 end
 
-local function intersectApplicableReturns(components: { NormalizedFunctionComponentType }, argument: NormalizedType): NormalizedType?
+local function intersectApplicableReturns(components: { NormalizedFunctionComponentType }, arguments: { read NormalizedType }): NormalizedType?
     local applicable = {}
 
     for _, c in components do
-        if isSubtypeOf(argument, c.Parameter).Holds then
-            table.insert(applicable, c.Return)
+        for i, a in arguments do
+            if isSubtypeOf(a, c.Parameters[i]).Holds then
+                table.insert(applicable, c.Return)
+            end
         end
     end
 
@@ -652,7 +715,7 @@ local function intersectApplicableReturns(components: { NormalizedFunctionCompon
 end
 
 local function decomposeToSingletons(n: NormalizedType): { NormalizedType }?
-    if n.Top or n.Number or n.Function then
+    if n.Top or n.Number or n.Function or n.Generic or n.Free then
         return nil
     end
 
@@ -697,9 +760,19 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
     end
 
     for i, cb in b.Components do
-        local singles = decomposeToSingletons(cb.Parameter)
+        local singles = {}
+        local singledAny = false
 
-        if singles then
+        for i, param in cb.Parameters do
+            local thisSingle = decomposeToSingletons(param)
+            singles[i] = thisSingle or normalizedUnknown()
+
+            if thisSingle then
+                singledAny = true
+            end
+        end
+
+        if singledAny then
             for _, single in singles do
                 local car = intersectApplicableReturns(a.Components, single)
 
@@ -707,10 +780,12 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
                     return subtypeFailure(`No overload accepts '{ dumpNormalization(single) }'`)
                 end
 
-                local result = isSubtypeOf(car, cb.Return)
+                if cb.Return then
+                    local result = isSubtypeOf(car, cb.Return)
 
-                if not result.Holds then
-                    return subtypeFailure(`With '{ dumpNormalization(single) }': { result.FailedPath }`)
+                    if not result.Holds then
+                        return subtypeFailure(`With '{ dumpNormalization(single) }': { result.FailedPath }`)
+                    end
                 end
             end
         else
@@ -718,24 +793,41 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
             local failed = {}
 
             for _, ca in a.Components do
-                local paramResult = isSupertypeOf(ca.Parameter, cb.Parameter)
+                local paramStrings = table.create<<string>>(#ca.Parameters)
 
-                if not paramResult.Holds then
-                    table.insert(
-                        failed,
-                        `'({ dumpNormalization(ca.Parameter) }) -> { dumpNormalization(ca.Return) }' does not accept parameter '{ dumpNormalization(cb.Parameter) }'.`
-                    )
+                for i, param in ca.Parameters do
+                    paramStrings[i] = dumpNormalization(param)
+                end
+
+                local signature = `({ table.concat(paramStrings, ", ") }) -> { if ca.Return then dumpNormalization(ca.Return) else "()" }`
+
+                if #ca.Parameters ~= #cb.Parameters then
+                    table.insert(failed, `'{ signature }' has a differing number of parameters.`)
                     continue
                 end
 
-                local returnResult = isSubtypeOf(ca.Return, cb.Return)
+                for i, param in ca.Parameters do
+                    local paramResult = isSupertypeOf(param, cb.Parameters[i])
 
-                if not returnResult.Holds then
-                    table.insert(
-                        failed,
-                        `'({ dumpNormalization(ca.Parameter) }) -> { dumpNormalization(ca.Return) }' does not accept return '{ dumpNormalization(cb.Return) }'.`
-                    )
-                    continue
+                    if not paramResult.Holds then
+                        table.insert(
+                            failed,
+                            `'{ signature }' does not accept parameter #{ i } '{ dumpNormalization(cb.Parameters[i]) }'.`
+                        )
+                        continue
+                    end
+                end
+
+                if ca.Return and cb.Return then
+                    local returnResult = isSubtypeOf(ca.Return, cb.Return)
+
+                    if not returnResult.Holds then
+                        table.insert(
+                            failed,
+                            `'{ signature }' does not return '{ dumpNormalization(cb.Return) }'.`
+                        )
+                        continue
+                    end
                 end
 
                 found = true
@@ -743,7 +835,15 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
             end
 
             if not found then
-                return subtypeFailure(`No compatible overload was found for #{ i } '({ dumpNormalization(cb.Parameter) }) -> { dumpNormalization(cb.Return) }':\n* { table.concat(failed, "\n* ") }`)
+                local paramStrings = table.create<<string>>(#cb.Parameters)
+
+                for i, param in cb.Parameters do
+                    paramStrings[i] = dumpNormalization(param)
+                end
+
+                local signature = `({ table.concat(paramStrings, ", ") }) -> { if cb.Return then dumpNormalization(cb.Return) else "()" }`
+
+                return subtypeFailure(`No compatible overload was found for #{ i } '{ signature }':\n* { table.concat(failed, "\n* ") }`)
             end
         end
     end
@@ -804,6 +904,16 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         end
     end
 
+    if a.Free then
+        for _, free in a.Free do
+            local result = isSubtypeOf(free.Bound, b)
+
+            if not result.Holds then
+                return result
+            end
+        end
+    end
+
     return subtypeSuccess()
 end
 
@@ -823,7 +933,7 @@ local function typeToString(ty: Type, alias: string?): string
         if tyvar.Name then
             return tyvar.Name
         else
-            local name = `'{ string.char((freeTypeNameCount + 19) % 26 + 97) }`
+            local name = `'{ string.char((freeTypeNameCount + 19) % 26 + 78) }`
 
             if freeTypeNameCount > 25 then
                 name ..= freeTypeNameCount // 25 + 1
@@ -976,7 +1086,13 @@ local function normalizationToType(n: NormalizedType): Type
                 local cs = table.create<<Type>>(#n.Function.Components)
 
                 for i, f in n.Function.Components do
-                    cs[i] = functionType({}, { normalizationToType(f.Parameter) }, neverType(), normalizationToType(f.Return))
+                    local params = table.create<<Type>>(#f.Parameters)
+
+                    for i, param in f.Parameters do
+                        params[i] = normalizationToType(param)
+                    end
+
+                    cs[i] = functionType({}, params, neverType(), if f.Return then normalizationToType(f.Return) else nil)
                 end
 
                 if #cs == 1 then
@@ -1007,6 +1123,20 @@ local function normalizationToType(n: NormalizedType): Type
                 end
 
                 table.insert(t, unionType(gens))
+            end
+        end
+
+        if n.Free then
+            if #n.Free == 0 then
+                print("Top free type??")
+            else
+                local frees = table.create<<Type>>(#n.Free)
+
+                for i, free in n.Free do
+                    frees[i] = free.Free
+                end
+
+                table.insert(t, unionType(frees))
             end
         end
     end
@@ -1182,6 +1312,15 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
             }
         end
 
+        if expr.Function.Name then
+            typeAssociations[expr.Function.Name] = {
+                Type = functionType({}, params, neverType(), freeType()),
+                Expression = expr,
+            }
+
+            table.insert(typeAssociationsOrdered, expr.Function.Name)
+        end
+
         local prevRetTy = state.ReturnType
         state.ReturnType = true
 
@@ -1281,7 +1420,16 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
             retTy = nil
         end
 
-        return functionType(gens, params, neverType(), retTy)
+        local fty = functionType(gens, params, neverType(), retTy)
+
+        if expr.Function.Name then
+            typeAssociations[expr.Function.Name] = {
+                Type = fty,
+                Expression = expr,
+            }
+        end
+
+        return fty
 
     elseif expr.Type == "Return" then
         local retTy = state.ReturnType
