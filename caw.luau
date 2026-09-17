@@ -55,6 +55,7 @@ type BasicToken = {
         | "Pipe"
         | "Ampersand"
         | "Arrow"
+        | "Tilde"
         | "Ellipsis"
         | "EndOfFile",
 }
@@ -133,6 +134,11 @@ type GenericInstantiationTypeAnnotation = {
     read Arguments: { read TypeAnnotation },
 }
 
+type NegationTypeAnnotation = {
+    read Kind: "Negation",
+    read Negated: TypeAnnotation,
+}
+
 type UnionTypeAnnotation = {
     read Kind: "Union",
     read Components: { read TypeAnnotation },
@@ -149,6 +155,7 @@ export type TypeAnnotation =
     | SingletonTypeAnnotation
     | FunctionTypeAnnotation
     | GenericInstantiationTypeAnnotation
+    | NegationTypeAnnotation
     | UnionTypeAnnotation
     | IntersectionTypeAnnotation
 
@@ -283,6 +290,7 @@ local correspond: { read [string]: index<BasicToken, "Type">? } = {
     ["|"] = "Pipe",
     ["&"] = "Ampersand",
     ["->"] = "Arrow",
+    ["~"] = "Tilde",
     ["..."] = "Ellipsis",
     [""] = "EndOfFile",
 }
@@ -318,7 +326,7 @@ end
 local function isSeparator(c: string)
     return isEof(c) or isWhitespace(c) or c == ":" or c == ";" or c == "(" or c == ")" or c == "{" or c == "}" or c == "," or c == "^" or c == '"' or c == "#"
         or c == "[" or c == "]"
-        or c == "->"
+        or c == "->" or c == "~"
         or operators[c]
 end
 
@@ -567,6 +575,11 @@ function parseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation
         else
             report(`{ annotation.Literal.Type } singletons are not supported.`, annotation)
         end
+    elseif annotation.Type == "Tilde" then
+        ty = {
+            Kind = "Negation",
+            Negated = parseTypeAnnotation(state, report),
+        }
     elseif annotation.Type == "OpenParentheses" then
         ty = parseTypeAnnotation(state, report)
         local parens = nextToken(state)

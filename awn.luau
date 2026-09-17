@@ -66,6 +66,11 @@ type GenericInstantiationType = {
     read Arguments: { read Type },
 }
 
+type NegationType = {
+    read Kind: "Negation",
+    read Negated: Type,
+}
+
 type UnionType = {
     read Kind: "Union",
     read Components: { read Type },
@@ -91,6 +96,7 @@ type TypeData =
     | GenericType
     | FunctionType
     | GenericInstantiationType
+    | NegationType
     | UnionType
     | IntersectionType
     | FreeType
@@ -320,12 +326,11 @@ local function toUnknown(n: NormalizedType)
 end
 
 -- TODO string singleton
---[[
 local function isNever(n: NormalizedType)
     return not n.Top and not n.Nil and not n.Boolean
         and not n.Number and not n.String and not n.Function
+        and not n.Generic and not n.Free
 end
-]]--
 
 local function isUnknown(n: NormalizedType)
     return n.Top
@@ -588,6 +593,37 @@ local function normalize(ty: Type): NormalizedType
         toUnknown(n)
         n.Error = true
         print(`Cannot normalize generic instantiations.`)
+
+    elseif ty.Kind == "Negation" then
+        n = normalize(ty.Negated)
+
+        if n.Top then
+            toNever(n)
+        elseif isNever(n) then
+            toUnknown(n)
+        else
+            n.Nil = not n.Nil
+
+            if n.Boolean then
+                if n.Boolean.Value then
+                    n.Boolean.Value = not n.Boolean.Value
+                else
+                    n.Boolean = nil
+                end
+            else
+                n.Boolean = {}
+            end
+
+            n.Number = not n.Number
+            n.String = if n.String then nil else {}
+
+            if n.Function or n.Generic or n.Free then
+                print(`Cannot negate function, generic, or free types.`)
+                n.Function = nil
+                n.Generic = nil
+                n.Free = nil
+            end
+        end
 
     elseif ty.Kind == "Union" then
         -- Unions grow from `never`.
@@ -999,6 +1035,15 @@ local function typeToString(ty: Type, alias: string?): string
 
         return `{ ty.Name }<{ table.concat(arguments, ", ") }> => { typeToString(instantiateType(ty)) }`
 
+    elseif ty.Kind == "Negation" then
+        local inner = typeToString(ty.Negated)
+
+        if ty.Negated.Kind == "Union" or ty.Negated.Kind == "Intersection" then
+            return `~({ inner })`
+        else
+            return `~{ inner }`
+        end
+
     elseif ty.Kind == "Union" then
         local tys = table.create<<string>>(#ty.Components)
         local length = 0
@@ -1380,6 +1425,12 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
                 local rets = if ty.Returns then substituteAllIn(ty.Returns) else nil
                 return functionType(ty.Generics, params, neverType(), rets)
 
+            elseif ty.Kind == "Negation" then
+                return {
+                    Kind = "Negation",
+                    Negated = substituteAllIn(ty.Negated),
+                }
+
             elseif ty.Kind == "Union" then
                 local components = table.create<<Type>>(#ty.Components)
 
@@ -1537,6 +1588,12 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
 
         return genericInstantationType(annotation.Name, arguments)
 
+    elseif annotation.Kind == "Negation" then
+        return makeType{
+            Kind = "Negation",
+            Negated = typeAnnotationToType(position, annotation.Negated),
+        }
+
     elseif annotation.Kind == "Union" then
         local components = table.create<<Type>>(#annotation.Components)
 
@@ -1620,6 +1677,12 @@ function instantiateType(ty: Type): Type
         else
             inited = errorReport(`Tried to instantiate invalid type alias '{ ty.Name }'.`, {})
         end
+    elseif ty.Kind == "Negation" then
+        return makeType{
+            Kind = "Negation",
+            Negated = instantiateType(ty.Negated),
+        }
+
     elseif ty.Kind == "Union" then
         local components = table.create<<Type>>(#ty.Components)
         local changed = false
