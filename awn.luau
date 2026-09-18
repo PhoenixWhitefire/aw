@@ -54,7 +54,7 @@ type SingletonType = {
 
 type GenericType = {
     read Kind: "Generic",
-    read Name: string,
+    Name: string?,
 }
 
 type FunctionType = {
@@ -147,7 +147,7 @@ type NormalizedType = {
     -- `nil` = not present.
     Function: NormalizedFunctionType?,
     -- Union of generic types.
-    Generic: { string }?,
+    Generic: { Type }?,
     -- Union of free types.
     Free: { NormalizedFreeType }?,
 }
@@ -194,7 +194,7 @@ local function singletonType(value)
     }
 end
 
-local function genericType(name: string)
+local function genericType(name: string?)
     return makeType{
         Kind = "Generic",
         Name = name,
@@ -348,6 +348,8 @@ local function isUnknown(n: NormalizedType)
     return n.Top
 end
 
+local typeToString
+
 local function dumpNormalization(n: NormalizedType)
     local t = {}
 
@@ -418,7 +420,13 @@ local function dumpNormalization(n: NormalizedType)
         if #n.Generic == 0 then
             table.insert(t, "*G")
         else
-            table.insert(t, table.concat(n.Generic, " | "))
+            local strs = table.create<<string>>(#n.Generic)
+
+            for i, gen in n.Generic do
+                strs[i] = typeToString(gen)
+            end
+
+            table.insert(t, table.concat(strs, " | "))
         end
     end
 
@@ -605,8 +613,7 @@ local function normalize(ty: Type): NormalizedType
             error(`Unsupported singleton kind '{ typeof(ty.Value) }'.`)
         end
     elseif ty.Kind == "Generic" then
-        toUnknown(n)
-        n.Generic = { ty.Name }
+        n.Generic = { ty }
 
     elseif ty.Kind == "Function" then
         if ty.IsTop then
@@ -1020,12 +1027,30 @@ function isSupertypeOf(a: NormalizedType, b: NormalizedType)
     return isSubtypeOf(b, a)
 end
 
+local genericTypeNameCount = 0
 local freeTypeNameCount = 0
 local instantiateType
 
-local function typeToString(ty: Type, alias: string?): string
+function typeToString(ty: Type, alias: string?): string
     if ty.AliasName and ty.AliasName ~= alias then
         return ty.AliasName
+    end
+
+    local function genericTypeName(tyvar: GenericType)
+        if tyvar.Name then
+            return tyvar.Name
+        else
+            local name = string.char((genericTypeNameCount + 19) % 26 + 65)
+
+            if genericTypeNameCount > 25 then
+                name ..= genericTypeNameCount // 25 + 1
+            end
+
+            tyvar.Name = name
+            genericTypeNameCount += 1
+
+            return name
+        end
     end
 
     local function freeTypeName(tyvar: FreeType)
@@ -1060,7 +1085,7 @@ local function typeToString(ty: Type, alias: string?): string
             return tostring(ty.Value)
         end
     elseif ty.Kind == "Generic" then
-        return ty.Name
+        return genericTypeName(ty)
     elseif ty.Kind == "Function" then
         if ty.IsTop then
             return "function"
@@ -1242,13 +1267,11 @@ local function normalizationToType(n: NormalizedType): Type
             if #n.Generic == 0 then
                 print("Top generic type??")
             else
-                local gens = table.create<<Type>>(#n.Generic)
-
-                for i, gen in n.Generic do
-                    gens[i] = genericType(gen)
+                if #n.Generic == 1 then
+                    table.insert(t, n.Generic[1])
+                else
+                    table.insert(t, unionType(n.Generic))
                 end
-
-                table.insert(t, unionType(gens))
             end
         end
 
@@ -1262,7 +1285,11 @@ local function normalizationToType(n: NormalizedType): Type
                     frees[i] = free.Free
                 end
 
-                table.insert(t, unionType(frees))
+                if #frees == 1 then
+                    table.insert(t, frees[1])
+                else
+                    table.insert(t, unionType(frees))
+                end
             end
         end
     end
@@ -1418,6 +1445,11 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             assert(ref.Expression.Type == "Declaration", ref.Expression.Type)
 
             local valueTy = infer(state, value)
+
+            if not valueTy then
+                return errorReport(`Tried to assign '{ variable.Reference }' to an expression that returns no value.`, expr.Position)
+            end
+
             local annoTy = if ref.Expression.Declaration.Annotation then typeAnnotationToType(ref.Expression.Position, ref.Expression.Declaration.Annotation) else nil
 
             if annoTy then
@@ -1552,7 +1584,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
             if paramTy.Kind == "Free" then
                 if paramTy.LowerBound.Kind == "never" and paramTy.UpperBound.Kind == "unknown" then
-                    local gen = genericType(string.char((#gens + 19) % 26 + 65)) :: GenericType
+                    local gen = genericType() :: GenericType
                     freeTypeSubstitutions[paramTy] = gen :: Type
 
                     table.insert(gens, gen)
@@ -1714,7 +1746,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             arguments[i] = infer(state, a, if fnTy.Kind == "Function" then fnTy.Parameters[i] else nil)
         end
 
-        local checkFnTy = functionType({}, arguments, neverType(), expected or genericType("R"))
+        local checkFnTy = functionType({}, arguments, neverType(), expected or genericType())
         table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, fnTy, checkFnTy))
 
         dispatchSubtypeConstraints(state.SubtypeConstraints)
