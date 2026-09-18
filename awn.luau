@@ -61,7 +61,7 @@ type FunctionType = {
     read Kind: "Function",
     read Generics: { read GenericType },
     read Parameters: { read Type },
-    read Variadic: Type?,
+    read Variadic: Type,
     read Returns: Type?,
     read IsTop: boolean?,
 }
@@ -1031,7 +1031,7 @@ local genericTypeNameCount = 0
 local freeTypeNameCount = 0
 local instantiateType
 
-function typeToString(ty: Type, alias: string?, hideFtyBounds: boolean?): string
+function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?): string
     if ty.AliasName and ty.AliasName ~= alias then
         return ty.AliasName
     end
@@ -1103,11 +1103,15 @@ function typeToString(ty: Type, alias: string?, hideFtyBounds: boolean?): string
             str = `<{ table.concat(gens, ", ") }>`
         end
 
-        local params = table.create<<string>>(#ty.Parameters)
+        local params = table.create<<string>>(#ty.Parameters + 1)
 
         for i, param in ty.Parameters do
             params[i] = typeToString(param)
         end
+
+        -- if ty.Variadic.Kind ~= "never" then
+        --     table.insert(params, `...{ typeToString(ty.Variadic) }`)
+        -- end
 
         str ..= `({ table.concat(params, ", ") }) -> `
         str ..= if ty.Returns then typeToString(ty.Returns) else "()"
@@ -1258,6 +1262,7 @@ local function normalizationToType(n: NormalizedType): Type
                     Kind = "Function",
                     Generics = {},
                     Parameters = {},
+                    Variadic = neverType(),
                     IsTop = true,
                 }
 
@@ -1391,6 +1396,7 @@ end
 
 type InferenceState = {
     ReturnType: Type? | true,
+    Variadic: Type?,
     SubtypeConstraints: { SubtypeConstraint },
 }
 
@@ -1578,8 +1584,15 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             table.insert(typeAssociationsOrdered, expr.Function.Name)
         end
 
+        local prevVarTy = state.Variadic
         local prevRetTy = state.ReturnType
         state.ReturnType = if expected and expected.Kind == "Function" then expected.Returns else true
+
+        if expr.Function.Variadic then
+            state.Variadic = freeType()
+        else
+            state.Variadic = nil
+        end
 
         for _, expr in expr.Function.Body do
             infer(state, expr)
@@ -1588,9 +1601,30 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         dispatchSubtypeConstraints(state.SubtypeConstraints)
 
         local retTy = state.ReturnType
+        local varTy = state.Variadic
         state.ReturnType = prevRetTy
+        state.Variadic = prevVarTy
 
         local freeTypeSubstitutions: { [Type]: Type } = {}
+
+        local function eliminateFreeType(ty: Type, name: string)
+            assert(ty.Kind == "Free")
+
+            if ty.LowerBound.Kind == "never" and ty.UpperBound.Kind == "unknown" then
+                local gen = genericType() :: GenericType
+                freeTypeSubstitutions[ty] = gen :: Type
+
+                table.insert(gens, gen)
+            else
+                local replacement = if ty.LowerBound.Kind ~= "never" then normalize(ty.LowerBound) else normalize(ty.UpperBound)
+                local bound = normalizationToType(replacement)
+                freeTypeSubstitutions[ty] = bound
+
+                if isNever(replacement) then
+                    errorReport(`Parameter '{ name }' has conflicting usage and was reduced to 'never'. This function is not callable with any possible value.`, expr.Position)
+                end
+            end
+        end
 
         for i, param in expr.Function.Parameters do
             typeAssociations[param.Name] = nil
@@ -1598,21 +1632,12 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             local paramTy = params[i]
 
             if paramTy.Kind == "Free" then
-                if paramTy.LowerBound.Kind == "never" and paramTy.UpperBound.Kind == "unknown" then
-                    local gen = genericType() :: GenericType
-                    freeTypeSubstitutions[paramTy] = gen :: Type
-
-                    table.insert(gens, gen)
-                else
-                    local replacement = if paramTy.LowerBound.Kind ~= "never" then normalize(paramTy.LowerBound) else normalize(paramTy.UpperBound)
-                    local bound = normalizationToType(replacement)
-                    freeTypeSubstitutions[paramTy] = bound
-
-                    if isNever(replacement) then
-                        errorReport(`Parameter '{ param.Name }' has conflicting usage and was reduced to 'never'. This function is not callable with any possible value.`, expr.Position)
-                    end
-                end
+                eliminateFreeType(paramTy, param.Name)
             end
+        end
+
+        if varTy then
+            eliminateFreeType(varTy, "...")
         end
 
         local function substituteAllIn(ty: Type): Type
@@ -1686,6 +1711,10 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             params[i] = substituteAllIn(param)
         end
 
+        if varTy then
+            varTy = substituteAllIn(varTy)
+        end
+
         if typeof(retTy) == "table" then
             retTy = substituteAllIn(retTy)
         end
@@ -1694,7 +1723,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             retTy = nil
         end
 
-        local fty = functionType(gens, params, neverType(), retTy)
+        local fty = functionType(gens, params, varTy or neverType(), retTy)
 
         if expr.Function.Name then
             typeAssociations[expr.Function.Name] = {
@@ -1830,12 +1859,34 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         return result
 
+    elseif expr.Type == "VariadicArguments" then
+        if state.Variadic then
+            return state.Variadic
+        else
+            return errorReport(`Function does not have a variadic.`, expr.Position)
+        end
+    elseif expr.Type == "VariadicSelection" then
+        if state.Variadic then
+            return state.Variadic
+        else
+            return errorReport(`Function does not have a variadic.`, expr.Position)
+        end
+
+    elseif expr.Type == "VariadicLength" then
+        if state.Variadic then
+            return primitiveType("number")
+        else
+            return errorReport(`Function does not have a variadic.`, expr.Position)
+        end
+
     elseif expr.Type == "TypeAliasDeclaration" then
         local ty = typeAnnotationToType(expr.Position, expr.Value)
         ty.AliasName = expr.Name
 
         typeEnv[expr.Name] = ty
         table.insert(typeEnvOrdered, expr.Name)
+        return errorType()
+    elseif expr.Type == "InvalidSyntax" then
         return errorType()
     else
         -- unreachable(expr.Type)
