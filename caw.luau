@@ -125,7 +125,7 @@ type SingletonTypeAnnotation = {
 type FunctionTypeAnnotation = {
     read Kind: "Function",
     read Parameters: { read TypeAnnotation },
-    read Returns: TypeAnnotation?
+    read Returns: TypeAnnotation?,
 }
 
 type GenericInstantiationTypeAnnotation = {
@@ -515,7 +515,7 @@ function maybeCombineWithTypeOperator(state: ParseState, report: Report, left: T
     end
 end
 
-function parseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation
+function parseTypeAnnotation(state: ParseState, report: Report, shallow: boolean?): TypeAnnotation
     local annotation = nextToken(state)
     local ty: TypeAnnotation? = nil
 
@@ -578,33 +578,57 @@ function parseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation
     elseif annotation.Type == "Tilde" then
         ty = {
             Kind = "Negation",
-            Negated = parseTypeAnnotation(state, report),
+            Negated = parseTypeAnnotation(state, report, true),
         }
     elseif annotation.Type == "OpenParentheses" then
-        ty = parseTypeAnnotation(state, report)
-        local parens = nextToken(state)
+        local params = {}
+        local definitelyFunction = false
+        local parens, consumeParens = peekNextToken(state)
 
-        if parens.Type ~= "CloseParentheses" then
-            report(`Expected closing parentheses, got { parens.Type }.`, parens)
+        while parens.Type ~= "CloseParentheses" do
+            table.insert(params, parseTypeAnnotation(state, report))
+            parens, consumeParens = peekNextToken(state)
+
+            if parens.Type == "Comma" then
+                definitelyFunction = true
+                consumeParens()
+                parens, consumeParens = peekNextToken(state)
+            end
         end
 
+        consumeParens()
         local maybeArrow, consumeArrow = peekNextToken(state)
 
         if maybeArrow.Type == "Arrow" then
             consumeArrow()
 
             local returns = parseTypeAnnotation(state, report)
+
+            if returns.Kind == "Error" then
+                returns = nil -- For `(T) -> ()`, `()` will parse as `{ Kind = "Error" }` due to `ty = params[1]`.
+            end
+
             ty = {
                 Kind = "Function",
-                Parameters = { ty },
+                Parameters = params,
                 Returns = returns,
             }
+        -- `(T, U)` is not a valid annotation,
+        elseif definitelyFunction then
+            report(`Expected '->', got { maybeArrow.Type } instead.`, maybeArrow)
+        -- ... but `(T)` is.
+        else
+            ty = params[1]
         end
     else
         report(`Invalid annotation token '{ annotation.Type }'.`, annotation)
     end
 
-    return maybeCombineWithTypeOperator(state, report, ty or { Kind = "Error" })
+    if shallow then
+        return ty or { Kind = "Error" }
+    else
+        return maybeCombineWithTypeOperator(state, report, ty or { Kind = "Error" })
+    end
 end
 
 local function maybeParseTypeAnnotation(state: ParseState, report: Report): TypeAnnotation?

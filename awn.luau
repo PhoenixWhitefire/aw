@@ -35,11 +35,17 @@ type StringType = {
     read Primitive: "string",
 }
 
+type FunctionTopType = {
+    read Kind: "Primitive",
+    read Primitive: "function",
+}
+
 type PrimitiveType =
     | NilType
     | BooleanType
     | NumberType
     | StringType
+    | FunctionTopType
 
 type SingletonType = {
     read Kind: "Singleton",
@@ -132,6 +138,9 @@ type NormalizedType = {
     String:  {
         -- If this is `nil`, we're the top 'string'.
         Singletons: { string }?,
+        -- Whether we're a union of negated singletons.
+        -- (took this term directly from Luau :)
+        Cofinite: boolean,
     }?,
     -- `nil` = not present.
     Function: NormalizedFunctionType?,
@@ -319,7 +328,7 @@ local function toUnknown(n: NormalizedType)
     n.Nil = true
     n.Boolean = {}
     n.Number = true
-    n.String = {}
+    n.String = { Cofinite = false }
     n.Function = {}
     n.Generic = {}
     n.Free = {}
@@ -369,7 +378,7 @@ local function dumpNormalization(n: NormalizedType)
             local s = table.create<<string>>(#n.String.Singletons)
 
             for i, str in n.String.Singletons do
-                s[i] = `"{ str }"`
+                s[i] = if n.String.Cofinite then `~"{ str }"` else `"{ str }"`
             end
 
             if #s == 1 then
@@ -457,17 +466,29 @@ local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
         local withSingles = with.String.Singletons
 
         if mySingles and withSingles then
-            table.move(withSingles, 1, #withSingles, #mySingles + 1, mySingles)
+            if n.String.Cofinite and not with.String.Cofinite then
+                for i, s in withSingles do
+                    local foundIndex = table.find(mySingles, s)
+                    if foundIndex then
+                        table.remove(mySingles, foundIndex)
+                    end
+                end
+            else
+                table.move(withSingles, 1, #withSingles, #mySingles + 1, mySingles)
+            end
         elseif mySingles and not withSingles then
-            n.String = {} -- Union singletons with top `string`.
+            n.String = { Cofinite = false } -- Union singletons with top `string`.
         end
     else
         n.String = n.String or with.String
     end
 
-    if n.Function or with.Function then
-        print(`Cannot union '{ dumpNormalization(n) }' with '{ dumpNormalization(with) }': Unions of functions cannot be normalized at this time.`)
-        n.Error = true
+    if not n.Function and with.Function then
+        n.Function = table.clone(with.Function)
+    elseif n.Function and with.Function and not with.Function.Components and n.Function.Components then
+        n.Function = {}
+    elseif n.Function and with.Function and n.Function.Components and with.Function.Components then
+        table.move(with.Function.Components, 1, #with.Function.Components, #n.Function.Components + 1, n.Function.Components)
     end
 
     if n.Generic and #n.Generic > 0 and with.Generic and #with.Generic > 0 then
@@ -499,14 +520,27 @@ local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
                 removed = false
 
                 for i, s in mySingles do
-                    if not table.find(withSingles, s) then
+                    local found = table.find(withSingles, s) ~= nil
+
+                    if not found and not with.String.Cofinite and not n.String.Cofinite then
                         table.remove(mySingles, i)
                         removed = true
                     end
                 end
             until not removed
+
+            if n.String.Cofinite and with.String.Cofinite then
+                for i, s in withSingles do
+                    local found = table.find(mySingles, s) ~= nil
+
+                    if not found then
+                        table.insert(mySingles, s)
+                    end
+                end
+            end
         elseif not mySingles and withSingles then
             n.String.Singletons = table.clone(withSingles) -- `string & "a" = "a"`.
+            n.String.Cofinite = with.String.Cofinite
         end
     else
         n.String = nil
@@ -552,7 +586,9 @@ local function normalize(ty: Type): NormalizedType
         elseif ty.Primitive == "number" then
             n.Number = true
         elseif ty.Primitive == "string" then
-            n.String = {}
+            n.String = { Cofinite = false }
+        elseif ty.Primitive == "function" then
+            n.Function = {}
         else
             unreachable(ty.Primitive)
             error(`Unreachable.`)
@@ -561,7 +597,7 @@ local function normalize(ty: Type): NormalizedType
         if typeof(ty.Value) == "boolean" then
             n.Boolean = { Value = ty.Value }
         elseif typeof(ty.Value) == "string" then
-            n.String = { Singletons = { ty.Value } }
+            n.String = { Singletons = { ty.Value }, Cofinite = false }
         else
             error(`Unsupported singleton kind '{ typeof(ty.Value) }'.`)
         end
@@ -615,14 +651,22 @@ local function normalize(ty: Type): NormalizedType
             end
 
             n.Number = not n.Number
-            n.String = if n.String then nil else {}
+
+            if n.String then
+                if n.String.Singletons then
+                    n.String.Cofinite = true
+                else
+                    n.String = nil
+                end
+            else
+                n.String = { Cofinite = false }
+            end
 
             if n.Function or n.Generic or n.Free then
                 print(`Cannot negate function, generic, or free types.`)
-                n.Function = nil
-                n.Generic = nil
-                n.Free = nil
             end
+
+            n.Function = if n.Function then nil else {}
         end
 
     elseif ty.Kind == "Union" then
@@ -920,10 +964,19 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         return subtypeFailure("Unexpected 'string'.")
     -- `string </: "a" | "b" | ...`
     elseif a.String and not a.String.Singletons and b.String and b.String.Singletons then
-        return subtypeFailure(`Expected string singletons such as "{ b.String.Singletons[1] }", got top 'string' instead.`)
+        if b.String.Cofinite then
+            return subtypeFailure(`Top 'string' includes negated types like "{ b.String.Singletons[1] }".`)
+        else
+            return subtypeFailure(`Expected string singletons such as "{ b.String.Singletons[1] }", got top 'string' instead.`)
+        end
+
     elseif a.String and a.String.Singletons and b.String and b.String.Singletons then
         for _, as in a.String.Singletons do
-            if not table.find(b.String.Singletons, as) then
+            local found = table.find(b.String.Singletons, as) ~= nil
+
+            if found and b.String.Cofinite then
+                return subtypeFailure(`'"{ as }"' is excluded by '~"{ as }"'.`)
+            elseif not found and not b.String.Cofinite then
                 return subtypeFailure(`Unexpected '"{ as }"'.`)
             end
         end
@@ -1119,7 +1172,13 @@ local function normalizationToType(n: NormalizedType): Type
         if n.String then
             if n.String.Singletons then
                 for _, s in n.String.Singletons do
-                    table.insert(t, singletonType(s))
+                    local sty = singletonType(s)
+
+                    if n.String.Cofinite then
+                        table.insert(t, makeType{ Kind = "Negation", Negated = sty })
+                    else
+                        table.insert(t, sty)
+                    end
                 end
             else
                 table.insert(t, primitiveType("string"))
@@ -1267,7 +1326,11 @@ type InferenceState = {
 
 local function infer(state: InferenceState, expr: caw.Expression): Type?
     if expr.Type == "Constant" then
-        return primitiveType(expr.Constant.Type)
+        if expr.Constant.Type == "boolean" or expr.Constant.Type == "string" then
+            return singletonType(expr.Constant.Value)
+        else
+            return primitiveType(expr.Constant.Type)
+        end
 
     elseif expr.Type == "Declaration" then
         local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value) else primitiveType("nil")
@@ -1426,7 +1489,7 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
                 return functionType(ty.Generics, params, neverType(), rets)
 
             elseif ty.Kind == "Negation" then
-                return {
+                return makeType{
                     Kind = "Negation",
                     Negated = substituteAllIn(ty.Negated),
                 }
@@ -1656,7 +1719,7 @@ function instantiateType(ty: Type): Type
     elseif ty.Kind == "GenericInstantiation" then
         if ty.Name == "issubtypeof" then
             if #ty.Arguments ~= 2 then
-                inited = errorReport(`Expected exactly 2 type arguments to 'issubtypeof' type, got { #ty.Arguments } instead.`, {})
+                inited = errorReport(`Expected exactly 2 type arguments to 'issubtypeof' type, got { #ty.Arguments } instead.`, { Line = 1, Character = 1, Offset = 1 })
             else
                 local a = ty.Arguments[1]
                 local b = ty.Arguments[2]
@@ -1675,7 +1738,7 @@ function instantiateType(ty: Type): Type
                 inited = singletonType(result.Holds)
             end
         else
-            inited = errorReport(`Tried to instantiate invalid type alias '{ ty.Name }'.`, {})
+            inited = errorReport(`Tried to instantiate invalid type alias '{ ty.Name }'.`, { Line = 1, Character = 1, Offset = 1 })
         end
     elseif ty.Kind == "Negation" then
         return makeType{
