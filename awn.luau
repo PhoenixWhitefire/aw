@@ -90,7 +90,8 @@ type IntersectionType = {
 type FreeType = {
     read Kind: "Free",
     Name: string?,
-    Bound: Type,
+    UpperBound: Type,
+    LowerBound: Type,
 }
 
 type TypeData =
@@ -121,7 +122,8 @@ type NormalizedFunctionType = {
 
 type NormalizedFreeType = {
     Free: Type,
-    Bound: NormalizedType,
+    UpperBound: NormalizedType,
+    LowerBound: NormalizedType,
 }
 
 type NormalizedType = {
@@ -234,7 +236,8 @@ end
 local function freeType()
     return makeType{
         Kind = "Free",
-        Bound = unknownType(),
+        UpperBound = unknownType(),
+        LowerBound = neverType(),
     }
 end
 
@@ -687,12 +690,11 @@ local function normalize(ty: Type): NormalizedType
             intersectNormalizedType(n, inner)
         end
     elseif ty.Kind == "Free" then
-        n = normalize(ty.Bound)
-
         n.Free = {
             {
                 Free = ty,
-                Bound = n,
+                UpperBound = normalize(ty.UpperBound),
+                LowerBound = normalize(ty.LowerBound),
             }
         }
     else
@@ -995,10 +997,18 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
 
     if a.Free then
         for _, free in a.Free do
-            local result = isSubtypeOf(free.Bound, b)
+            assert(isSubtypeOf(free.LowerBound, free.UpperBound))
 
-            if not result.Holds then
-                return result
+            local ubResult = isSubtypeOf(free.UpperBound, b)
+
+            if not ubResult.Holds then
+                return ubResult
+            end
+
+            local lbResult = isSupertypeOf(free.LowerBound, b)
+
+            if not lbResult.Holds then
+                return lbResult
             end
         end
     end
@@ -1132,8 +1142,12 @@ local function typeToString(ty: Type, alias: string?): string
     elseif ty.Kind == "Free" then
         local str = freeTypeName(ty)
 
-        if ty.Bound.Kind ~= "unknown" then
-            str ..= ` <: { typeToString(ty.Bound) }`
+        if ty.UpperBound.Kind ~= "unknown" then
+            str ..= ` <: { typeToString(ty.UpperBound) }`
+        end
+
+        if ty.LowerBound.Kind ~= "never" then
+            str = `{ typeToString(ty.LowerBound) } <: ` .. str
         end
 
         return str
@@ -1318,7 +1332,13 @@ end
 local function dispatchSubtypeConstraints(constraints: { SubtypeConstraint })
     for _, sc in constraints do
         if sc.Target.Kind == "Free" then
-            sc.Target.Bound = makeIntersection(sc.Target.Bound, sc.Super)
+            if sc.Target ~= sc.Super then
+                sc.Target.UpperBound = makeIntersection(sc.Target.UpperBound, sc.Super)
+            end
+        elseif sc.Super.Kind == "Free" then
+            if sc.Target ~= sc.Super then
+                sc.Super.LowerBound = makeIntersection(sc.Super.LowerBound, sc.Target)
+            end
         else
             check(sc.Target, sc.Super, sc.Position)
         end
@@ -1332,7 +1352,7 @@ type InferenceState = {
     SubtypeConstraints: { SubtypeConstraint },
 }
 
-local function infer(state: InferenceState, expr: caw.Expression): Type?
+local function infer(state: InferenceState, expr: caw.Expression, expected: Type?): Type?
     if expr.Type == "Constant" then
         if expr.Constant.Type == "boolean" or expr.Constant.Type == "string" then
             return singletonType(expr.Constant.Value)
@@ -1341,13 +1361,12 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
         end
 
     elseif expr.Type == "Declaration" then
-        local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value) else primitiveType("nil")
+        local anno = if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation) else nil
+        local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value, anno) else primitiveType("nil")
 
         if not ty then
             errorReport(`Trying to assign '{ expr.Declaration.Name }' to an expression returning no values.`, expr.Position)
         end
-
-        local anno = if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation) else nil
 
         -- TODO luau type error on `ty` when `anno or` is removed
         typeAssociations[expr.Declaration.Name] = {
@@ -1387,8 +1406,8 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
 
             if ref.Expression.Type == "Function" then -- Function parameter.
                 if ref.Type.Kind == "Free" then
-                    local ty = makeIntersection(ref.Type.Bound, infer(state, value))
-                    ref.Type.Bound = ty
+                    local ty = makeIntersection(ref.Type.UpperBound, infer(state, value))
+                    ref.Type.UpperBound = ty
 
                     return ty
                 else
@@ -1411,7 +1430,77 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
             end
 
             return annoTy or valueTy
+        elseif expr.Operator == "+" or expr.Operator == "-" or expr.Operator == "*"
+            or expr.Operator == "/" or expr.Operator == "//"
+        then
+            local leftTy = infer(state, expr.Left)
+            local rightTy = infer(state, expr.Right)
+
+            if not leftTy then
+                return errorReport(`LHS is expression returning no value.`, expr.Left.Position)
+            end
+
+            if not rightTy then
+                return errorReport(`RHS is expression returning no value.`, expr.Right.Position)
+            end
+
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Left.Position, leftTy, primitiveType("number")))
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Left.Position, rightTy, primitiveType("number")))
+
+            return primitiveType("number")
+
+        elseif expr.Operator == ".." then
+            local leftTy = infer(state, expr.Left)
+            local rightTy = infer(state, expr.Right)
+
+            if not leftTy then
+                return errorReport(`LHS is expression returning no value.`, expr.Left.Position)
+            end
+
+            if not rightTy then
+                return errorReport(`RHS is expression returning no value.`, expr.Right.Position)
+            end
+
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Left.Position, leftTy, primitiveType("string")))
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Left.Position, rightTy, primitiveType("string")))
+
+            return primitiveType("string")
+
+        elseif expr.Operator == "<" or expr.Operator == "<=" or expr.Operator == ">"
+            or expr.Operator == ">="
+        then
+            local leftTy = infer(state, expr.Left)
+            local rightTy = infer(state, expr.Right)
+
+            if not leftTy then
+                return errorReport(`LHS is expression returning no value.`, expr.Left.Position)
+            end
+
+            if not rightTy then
+                return errorReport(`RHS is expression returning no value.`, expr.Right.Position)
+            end
+
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Left.Position, leftTy, primitiveType("number")))
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Left.Position, rightTy, primitiveType("number")))
+
+            return primitiveType("boolean")
+
+        elseif expr.Operator == "==" or expr.Operator == "~=" then
+            local leftTy = infer(state, expr.Left)
+            local rightTy = infer(state, expr.Right)
+
+            if not leftTy then
+                return errorReport(`LHS is expression returning no value.`, expr.Left.Position)
+            end
+
+            if not rightTy then
+                return errorReport(`RHS is expression returning no value.`, expr.Right.Position)
+            end
+
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Left.Position, leftTy, rightTy))
+            return primitiveType("boolean")
         else
+            unreachable(expr.Operator)
             error(`Cannot infer '{ expr.Operator }' operations.`)
         end
     elseif expr.Type == "Function" then
@@ -1419,7 +1508,10 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
         local params = table.create<<Type>>(#expr.Function.Parameters)
 
         for i, param in expr.Function.Parameters do
-            local ty = if param.Annotation then typeAnnotationToType(expr.Position, param.Annotation) else freeType()
+            local ty = if param.Annotation then typeAnnotationToType(expr.Position, param.Annotation)
+                        else if expected and expected.Kind == "Function" then expected.Parameters[i] or freeType()
+                        else freeType()
+
             params[i] = ty
 
             typeAssociations[param.Name] = {
@@ -1438,7 +1530,7 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
         end
 
         local prevRetTy = state.ReturnType
-        state.ReturnType = true
+        state.ReturnType = if expected and expected.Kind == "Function" then expected.Returns else true
 
         for _, expr in expr.Function.Body do
             infer(state, expr)
@@ -1457,9 +1549,7 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
             local paramTy = params[i]
 
             if paramTy.Kind == "Free" then
-                local normalizedBound = normalize(paramTy.Bound)
-
-                if isUnknown(normalizedBound) then
+                if paramTy.LowerBound.Kind == "never" and paramTy.UpperBound.Kind == "unknown" then
                     local gen = genericType(string.char((#gens + 19) % 26 + 65)) :: GenericType
                     freeTypeSubstitutions[paramTy] = gen :: Type
 
@@ -1469,7 +1559,8 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
 
                     table.insert(gens, gen)
                 else
-                    local bound = normalizationToType(normalizedBound)
+                    local replacement = if paramTy.LowerBound.Kind ~= "never" then normalize(paramTy.LowerBound) else normalize(paramTy.UpperBound)
+                    local bound = normalizationToType(replacement)
                     freeTypeSubstitutions[paramTy] = bound
 
                     if retTy == paramTy then
@@ -1557,12 +1648,21 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
         local retTy = state.ReturnType
 
         if retTy == true then
-            state.ReturnType = expr.Return and infer(state, expr.Return)
+            local inferred = expr.Return and infer(state, expr.Return)
+
+            if inferred then
+                state.ReturnType = makeType{
+                    Kind = "Free",
+                    UpperBound = unknownType(),
+                    LowerBound = inferred,
+                }
+            else
+                state.ReturnType = nil
+            end
 
             assert(state.ReturnType ~= true)
             return state.ReturnType
         elseif retTy ~= nil then
-            assert(retTy.Kind == "Free")
             local thisRet
 
             if expr.Return then
@@ -1570,10 +1670,15 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
             end
 
             if thisRet then
-                state.ReturnType = makeIntersection(retTy.Bound, thisRet)
+                if retTy.Kind == "Free" then
+                    state.ReturnType = makeUnion(retTy.LowerBound, thisRet)
 
-                assert(state.ReturnType ~= true)
-                return assert(state.ReturnType)
+                    assert(state.ReturnType ~= true)
+                    return assert(state.ReturnType)
+                else
+                    table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, thisRet, retTy))
+                    return retTy
+                end
             end
 
             return nil
@@ -1592,28 +1697,77 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
         local arguments = table.create<<Type>>(#expr.Call.Arguments)
 
         for i, a in expr.Call.Arguments do
-            arguments[i] = infer(state, a)
+            arguments[i] = infer(state, a, if fnTy.Kind == "Function" then fnTy.Parameters[i] else nil)
         end
 
-        local checkFnTy = functionType({}, arguments, neverType(), genericType("R"))
+        local checkFnTy = functionType({}, arguments, neverType(), expected or genericType("R"))
         table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, fnTy, checkFnTy))
 
         dispatchSubtypeConstraints(state.SubtypeConstraints)
 
-        if fnTy.Kind == "Free" then
-            local normFn = normalize(fnTy.Bound)
-            local finalFn = normalizationToType(normFn)
+        local normFn = if fnTy.Kind == "Free" then normalize(fnTy.UpperBound) else normalize(fnTy)
 
-            if finalFn.Kind == "Function" then
-                return finalFn.Returns
-            else
-                return errorReport(`Free: Cannot call a value of type '{ typeToString(fnTy.Bound) }'.`, expr.Position)
-            end
-        elseif fnTy.Kind == "Function" then
-            return fnTy.Returns
-        else
-            return errorReport(`Cannot call a value of type '{ typeToString(fnTy) }'.`, expr.Position)
+        if not normFn.Function then
+            return errorReport(`'{ normalizationToString(normFn) }' is not callable.`, expr.Position)
         end
+
+        if not normFn.Function.Components then
+            return errorReport(`The top 'function' type is not safe to call.`, expr.Position)
+        end
+
+        if #normFn.Function.Components == 1 then
+            local retTy = normFn.Function.Components[1].Return
+            return if retTy then normalizationToType(retTy) else nil
+        end
+
+        if #arguments ~= 1 then
+            return errorReport(`Cannot perform overload resolution for functions not accepting exactly 1 parameter.`, expr.Position)
+        end
+
+        local normArgs = table.create<<NormalizedType>>(#arguments)
+
+        for i, a in arguments do
+            normArgs[i] = normalize(a)
+        end
+
+        local normReturn = intersectApplicableReturns(normFn.Function.Components, normArgs[1])
+
+        if not normReturn then
+            local argStrings = table.create<<string>>(#arguments)
+
+            for i, a in arguments do
+                argStrings[i] = typeToString(a)
+            end
+
+            return errorReport(`No overload of '{ typeToString(fnTy) }' accepts parameters '({ table.concat(argStrings, ", ") })'`, expr.Position)
+        end
+
+        return normalizationToType(normReturn)
+
+    elseif expr.Type == "IfCondition" :: "IfCondition" then -- TODO luau cast?
+        local result = nil
+
+        for _, v in expr.IfBody do
+            result = infer(state, v)
+        end
+
+        if expr.ElseBody then
+            local last
+
+            for _, v in expr.ElseBody do
+                last = infer(state, v)
+            end
+
+            if last and result then
+                result = makeUnion(result, last)
+            end
+        end
+
+        if result and expected then
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, result, expected))
+        end
+
+        return result
 
     elseif expr.Type == "TypeAliasDeclaration" then
         local ty = typeAnnotationToType(expr.Position, expr.Value)
@@ -1623,6 +1777,7 @@ local function infer(state: InferenceState, expr: caw.Expression): Type?
         table.insert(typeEnvOrdered, expr.Name)
         return errorType()
     else
+        -- unreachable(expr.Type)
         error(`Cannot infer { expr.Type }s.`)
     end
 end
