@@ -437,7 +437,7 @@ local function dumpNormalization(n: NormalizedType)
             local frees = table.create<<string>>(#n.Free)
 
             for i, free in n.Free do
-                frees[i] = `t{i}` -- <: { dumpNormalization(free.Bound) }`
+                frees[i] = typeToString(free.Free, nil, true)
             end
 
             table.insert(t, table.concat(frees, " | "))
@@ -1031,7 +1031,7 @@ local genericTypeNameCount = 0
 local freeTypeNameCount = 0
 local instantiateType
 
-function typeToString(ty: Type, alias: string?): string
+function typeToString(ty: Type, alias: string?, hideFtyBounds: boolean?): string
     if ty.AliasName and ty.AliasName ~= alias then
         return ty.AliasName
     end
@@ -1097,7 +1097,7 @@ function typeToString(ty: Type, alias: string?): string
             local gens = table.create<<string>>(#ty.Generics)
 
             for i, gen in ty.Generics do
-                gens[i] = gen.Name
+                gens[i] = typeToString(gen)
             end
 
             str = `<{ table.concat(gens, ", ") }>`
@@ -1167,12 +1167,14 @@ function typeToString(ty: Type, alias: string?): string
     elseif ty.Kind == "Free" then
         local str = freeTypeName(ty)
 
-        if ty.UpperBound.Kind ~= "unknown" then
-            str ..= ` <: { typeToString(ty.UpperBound) }`
-        end
+        if not hideFtyBounds then
+            if ty.UpperBound.Kind ~= "unknown" then
+                str ..= ` <: { typeToString(ty.UpperBound) }`
+            end
 
-        if ty.LowerBound.Kind ~= "never" then
-            str = `{ typeToString(ty.LowerBound) } <: ` .. str
+            if ty.LowerBound.Kind ~= "never" then
+                str = `{ typeToString(ty.LowerBound) } <: ` .. str
+            end
         end
 
         return str
@@ -1307,6 +1309,20 @@ local function normalizationToString(n: NormalizedType): string
     return typeToString(normalizationToType(n))
 end
 
+local function dummyExpr(): caw.Expression
+    return {
+        Type = "Constant",
+        Constant = {
+            Type = "nil"
+        },
+        Position = {
+            Line = 0,
+            Character = 0,
+            Offset = 0,
+        }
+    }
+end
+
 -- Maps type names to types.
 local typeEnv: { [string]: Type? } = {
     never = neverType(),
@@ -1319,19 +1335,18 @@ local typeEnv: { [string]: Type? } = {
 -- Maps declaration names to types.
 local typeAssociations: { [string]: { Expression: caw.Expression, Type: Type }? } = {
     valuenever = {
-        Expression = {
-            Type = "Constant",
-            Constant = {
-                Type = "nil"
-            },
-            Position = {
-                Line = 0,
-                Character = 0,
-                Offset = 0,
-            }
-        },
+        Expression = dummyExpr(),
         Type = neverType()
     },
+
+    print = {
+        Type = functionType({}, { unknownType() }, unknownType()),
+        Expression = dummyExpr(),
+    },
+    tostring = {
+        Type = functionType({}, { unknownType() }, neverType(), primitiveType("string")),
+        Expression = dummyExpr(),
+    }
 }
 local typeEnvOrdered = {}
 local typeAssociationsOrdered = {}
@@ -1593,8 +1608,8 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                     local bound = normalizationToType(replacement)
                     freeTypeSubstitutions[paramTy] = bound
 
-                    if retTy == paramTy then
-                        retTy = bound
+                    if isNever(replacement) then
+                        errorReport(`Parameter '{ param.Name }' has conflicting usage and was reduced to 'never'. This function is not callable with any possible value.`, expr.Position)
                     end
                 end
             end
@@ -1746,7 +1761,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             arguments[i] = infer(state, a, if fnTy.Kind == "Function" then fnTy.Parameters[i] else nil)
         end
 
-        local checkFnTy = functionType({}, arguments, neverType(), expected or genericType())
+        local checkFnTy = functionType({}, arguments, neverType(), expected or unknownType())
         table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, fnTy, checkFnTy))
 
         dispatchSubtypeConstraints(state.SubtypeConstraints)
@@ -1824,7 +1839,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         return errorType()
     else
         -- unreachable(expr.Type)
-        error(`Cannot infer { expr.Type }s.`)
+        return errorReport(`Cannot infer { expr.Type } expressions.`, expr.Position)
     end
 end
 
