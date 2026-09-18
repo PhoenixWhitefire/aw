@@ -1497,7 +1497,9 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                 return errorReport(`RHS is expression returning no value.`, expr.Right.Position)
             end
 
-            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Left.Position, leftTy, rightTy))
+            -- TODO: This currently results in a recursive normalization.
+            -- table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Left.Position, leftTy, rightTy))
+            -- table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Left.Position, rightTy, leftTy))
             return primitiveType("boolean")
         else
             unreachable(expr.Operator)
@@ -1553,10 +1555,6 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                     local gen = genericType(string.char((#gens + 19) % 26 + 65)) :: GenericType
                     freeTypeSubstitutions[paramTy] = gen :: Type
 
-                    if retTy == paramTy then
-                        retTy = gen
-                    end
-
                     table.insert(gens, gen)
                 else
                     local replacement = if paramTy.LowerBound.Kind ~= "never" then normalize(paramTy.LowerBound) else normalize(paramTy.UpperBound)
@@ -1576,7 +1574,19 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             then
                 return ty
             elseif ty.Kind == "Free" then
-                return freeTypeSubstitutions[ty] or ty
+                if freeTypeSubstitutions[ty] then
+                    return freeTypeSubstitutions[ty]
+                end
+
+                if ty.LowerBound.Kind ~= "never" and ty.UpperBound.Kind == "unknown" then
+                    return substituteAllIn(ty.LowerBound)
+                else
+                    return makeType{
+                        Kind = "Free",
+                        UpperBound = substituteAllIn(ty.UpperBound),
+                        LowerBound = substituteAllIn(ty.LowerBound),
+                    }
+                end
             elseif ty.Kind == "Function" then
                 local params = table.create<<Type>>(#ty.Parameters)
 
@@ -1627,6 +1637,10 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         for i, param in params do
             params[i] = substituteAllIn(param)
+        end
+
+        if typeof(retTy) == "table" then
+            retTy = substituteAllIn(retTy)
         end
 
         if retTy == true then
