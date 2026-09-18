@@ -292,7 +292,7 @@ local function normalizedUnknown(): NormalizedType
         Nil = true,
         Boolean = {},
         Number = true,
-        String = {},
+        String = { Cofinite = false },
         Function = {},
         Generic = {},
         Free = {},
@@ -384,7 +384,7 @@ local function dumpNormalization(n: NormalizedType)
             if #s == 1 then
                 table.insert(t, s[1])
             else
-                table.insert(t, `({ table.concat(s, " | ") })`)
+                table.insert(t, `({ table.concat(s, if n.String.Cofinite then " & " else " | ") })`)
             end
         else
             table.insert(t, "string")
@@ -654,7 +654,7 @@ local function normalize(ty: Type): NormalizedType
 
             if n.String then
                 if n.String.Singletons then
-                    n.String.Cofinite = true
+                    n.String.Cofinite = not n.String.Cofinite
                 else
                     n.String = nil
                 end
@@ -662,8 +662,9 @@ local function normalize(ty: Type): NormalizedType
                 n.String = { Cofinite = false }
             end
 
-            if n.Function or n.Generic or n.Free then
-                print(`Cannot negate function, generic, or free types.`)
+            if n.Function and n.Function.Components or n.Generic or n.Free then
+                print(`Cannot negate non-top function, generic, or free types.`)
+                n.Error = true
             end
 
             n.Function = if n.Function then nil else {}
@@ -770,14 +771,12 @@ local function deepCopy(tab: any): any
     return t
 end
 
-local function intersectApplicableReturns(components: { NormalizedFunctionComponentType }, arguments: { read NormalizedType }): NormalizedType?
+local function intersectApplicableReturns(components: { NormalizedFunctionComponentType }, argument: NormalizedType): NormalizedType?
     local applicable = {}
 
     for _, c in components do
-        for i, a in arguments do
-            if isSubtypeOf(a, c.Parameters[i]).Holds then
-                table.insert(applicable, c.Return)
-            end
+        if #c.Parameters == 1 and isSubtypeOf(argument, c.Parameters[1]).Holds then
+            table.insert(applicable, c.Return)
         end
     end
 
@@ -840,19 +839,13 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
     end
 
     for i, cb in b.Components do
-        local singles = {}
-        local singledAny = false
+        local singles = nil
 
-        for i, param in cb.Parameters do
-            local thisSingle = decomposeToSingletons(param)
-            singles[i] = thisSingle or normalizedUnknown()
-
-            if thisSingle then
-                singledAny = true
-            end
+        if #cb.Parameters == 1 then
+            singles = decomposeToSingletons(cb.Parameters[1])
         end
 
-        if singledAny then
+        if singles then
             for _, single in singles do
                 local car = intersectApplicableReturns(a.Components, single)
 
@@ -872,7 +865,7 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
             local found = false
             local failed = {}
 
-            for _, ca in a.Components do
+            for ica, ca in a.Components do
                 local paramStrings = table.create<<string>>(#ca.Parameters)
 
                 for i, param in ca.Parameters do
@@ -886,6 +879,8 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
                     continue
                 end
 
+                local paramsMatched = true
+
                 for i, param in ca.Parameters do
                     local paramResult = isSupertypeOf(param, cb.Parameters[i])
 
@@ -894,8 +889,13 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
                             failed,
                             `'{ signature }' does not accept parameter #{ i } '{ dumpNormalization(cb.Parameters[i]) }'.`
                         )
+                        paramsMatched = false
                         continue
                     end
+                end
+
+                if not paramsMatched then
+                    continue
                 end
 
                 if ca.Return and cb.Return then
@@ -948,7 +948,7 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         return subtypeFailure("Unexpected `boolean`.")
     -- `boolean </: true` etc.
     elseif a.Boolean and a.Boolean.Value == nil and b.Boolean and b.Boolean.Value ~= nil then
-        return subtypeFailure(`Expected '{ b.Boolean.Value }', got top 'boolean' instead.`)
+        return subtypeFailure(`Expected exactly '{ b.Boolean.Value }', got 'boolean' instead.`)
     elseif a.Boolean and a.Boolean.Value ~= nil and b.Boolean and b.Boolean.Value ~= nil then
         -- `false </: true`
         if a.Boolean.Value ~=  b.Boolean.Value then
@@ -977,7 +977,7 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
             if found and b.String.Cofinite then
                 return subtypeFailure(`'"{ as }"' is excluded by '~"{ as }"'.`)
             elseif not found and not b.String.Cofinite then
-                return subtypeFailure(`Unexpected '"{ as }"'.`)
+                return subtypeFailure(`Unexpected '"{ as }"', expected singleton like '"{ b.String.Singletons[1] }"'.`)
             end
         end
     end
@@ -1171,14 +1171,22 @@ local function normalizationToType(n: NormalizedType): Type
 
         if n.String then
             if n.String.Singletons then
+                local strs = {}
+
                 for _, s in n.String.Singletons do
                     local sty = singletonType(s)
 
                     if n.String.Cofinite then
-                        table.insert(t, makeType{ Kind = "Negation", Negated = sty })
+                        table.insert(strs, makeType{ Kind = "Negation", Negated = sty })
                     else
-                        table.insert(t, sty)
+                        table.insert(strs, sty)
                     end
+                end
+
+                if n.String.Cofinite then
+                    table.insert(t, intersectionType(strs))
+                else
+                    table.insert(t, unionType(strs))
                 end
             else
                 table.insert(t, primitiveType("string"))
