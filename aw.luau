@@ -121,6 +121,14 @@ let h_hof = function(hx, hz, hw)
     return hn
 end
 
+let i_list = function(l, i, t)
+    return l[i] = t
+end
+
+let i_listbidi = function(l, i)
+    let li: string = l[i]
+end
+
 ]]
 
 local npProgram = [[

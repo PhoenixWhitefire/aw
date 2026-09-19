@@ -2,6 +2,7 @@
 -- Bidirectional inference with semantic subtyping and normalization.
 
 local caw = require("./caw")
+local logInference = false
 
 type ErrorType = {
     read Kind: "error",
@@ -35,9 +36,14 @@ type StringType = {
     read Primitive: "string",
 }
 
-type FunctionTopType = {
+type FunctionPrimitiveType = {
     read Kind: "Primitive",
     read Primitive: "function",
+}
+
+type ListPrimitiveType = {
+    read Kind: "Primitive",
+    read Primitive: "list",
 }
 
 type PrimitiveType =
@@ -45,7 +51,13 @@ type PrimitiveType =
     | BooleanType
     | NumberType
     | StringType
-    | FunctionTopType
+    | ListPrimitiveType
+    | FunctionPrimitiveType
+
+type ListType = {
+    read Kind: "List",
+    read Items: Type,
+}
 
 type SingletonType = {
     read Kind: "Singleton",
@@ -63,7 +75,6 @@ type FunctionType = {
     read Parameters: { read Type },
     read Variadic: Type,
     read Returns: Type?,
-    read IsTop: boolean?,
 }
 
 type GenericInstantiationType = {
@@ -99,6 +110,7 @@ type TypeData =
     | NeverType
     | UnknownType
     | PrimitiveType
+    | ListType
     | SingletonType
     | GenericType
     | FunctionType
@@ -146,6 +158,8 @@ type NormalizedType = {
         -- (took this term directly from Luau :)
         Cofinite: boolean,
     }?,
+    -- If `Items` is not present, we're the top.
+    List: { Items: NormalizedType? }?,
     -- `nil` = not present.
     Function: NormalizedFunctionType?,
     -- Union of generic types.
@@ -186,6 +200,13 @@ local function primitiveType(primitive: index<PrimitiveType, "Primitive">)
         Kind = "Primitive",
         -- TODO luau cast
         Primitive = primitive :: "nil",
+    }
+end
+
+local function listType(items: Type)
+    return makeType{
+        Kind = "List",
+        Items = items,
     }
 end
 
@@ -346,6 +367,7 @@ local function toUnknown(n: NormalizedType)
     n.Boolean = {}
     n.Number = true
     n.String = { Cofinite = false }
+    n.List = {}
     n.Function = {}
     n.Generic = {}
     n.Free = {}
@@ -354,8 +376,8 @@ end
 -- TODO string singleton
 local function isNever(n: NormalizedType)
     return not n.Top and not n.Nil and not n.Boolean
-        and not n.Number and not n.String and not n.Function
-        and not n.Generic and not n.Free
+        and not n.Number and not n.String and not n.List
+        and not n.Function and not n.Generic and not n.Free
 end
 
 local function isUnknown(n: NormalizedType)
@@ -407,6 +429,14 @@ local function dumpNormalization(n: NormalizedType)
             end
         else
             table.insert(t, "string")
+        end
+    end
+
+    if n.List then
+        if n.List.Items then
+            table.insert(t, `\{ { dumpNormalization(n.List.Items) } }`)
+        else
+            table.insert(t, "list")
         end
     end
 
@@ -528,6 +558,15 @@ local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
         n.String = n.String or with.String
     end
 
+    if not n.List and with.List then
+        n.List = with.List
+    elseif n.List and n.List.Items and with.List and not with.List.Items then
+        -- Reset to top.
+        n.List = {}
+    elseif n.List and n.List.Items and with.List and with.List.Items then
+        unionNormalizedType(n.List.Items, with.List.Items)
+    end
+
     if not n.Function and with.Function then
         n.Function = table.clone(with.Function)
     elseif n.Function and with.Function and not with.Function.Components and n.Function.Components then
@@ -591,6 +630,14 @@ local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
         n.String = nil
     end
 
+    if n.List and not with.List then
+        n.List = nil
+    elseif n.List and not n.List.Items and with.List and with.List.Items then
+        n.List.Items = with.List.Items
+    elseif n.List and n.List.Items and with.List and with.List.Items then
+        intersectNormalizedType(n.List.Items, with.List.Items)
+    end
+
     if n.Function and with.Function and with.Function.Components then
         if n.Function.Components then
             table.move(with.Function.Components, 1, #with.Function.Components, #n.Function.Components + 1, n.Function.Components)
@@ -632,12 +679,17 @@ local function normalize(ty: Type): NormalizedType
             n.Number = true
         elseif ty.Primitive == "string" then
             n.String = { Cofinite = false }
+        elseif ty.Primitive == "list" then
+            n.List = {}
         elseif ty.Primitive == "function" then
             n.Function = {}
         else
             unreachable(ty.Primitive)
             error(`Unreachable.`)
         end
+    elseif ty.Kind == "List" then
+        n.List = { Items = normalize(ty.Items) }
+
     elseif ty.Kind == "Singleton" then
         if typeof(ty.Value) == "boolean" then
             n.Boolean = { Value = ty.Value }
@@ -650,27 +702,23 @@ local function normalize(ty: Type): NormalizedType
         n.Generic = { ty }
 
     elseif ty.Kind == "Function" then
-        if ty.IsTop then
-            n.Function = {}
-        else
-            local params = table.create<<NormalizedType>>(#ty.Parameters)
+        local params = table.create<<NormalizedType>>(#ty.Parameters)
 
-            for i, param in ty.Parameters do
-                params[i] = normalize(param)
-            end
-
-            n.Function = {
-                Components = {
-                    {
-                        -- TODO luau
-                        Generics = table.clone(ty.Generics),
-                        Parameters = params,
-                        Variadic = normalize(ty.Variadic),
-                        Return = if ty.Returns then normalize(ty.Returns) else nil,
-                    },
-                }
-            }
+        for i, param in ty.Parameters do
+            params[i] = normalize(param)
         end
+
+        n.Function = {
+            Components = {
+                {
+                    -- TODO luau
+                    Generics = table.clone(ty.Generics),
+                    Parameters = params,
+                    Variadic = normalize(ty.Variadic),
+                    Return = if ty.Returns then normalize(ty.Returns) else nil,
+                },
+            }
+        }
 
     elseif ty.Kind == "GenericInstantiation" then
         toUnknown(n)
@@ -1042,7 +1090,7 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
 
     if a.Free then
         for _, free in a.Free do
-            assert(isSubtypeOf(free.LowerBound, free.UpperBound))
+            assert(isSubtypeOf(free.LowerBound, free.UpperBound).Holds)
 
             local ubResult = isSubtypeOf(free.UpperBound, b)
 
@@ -1116,6 +1164,10 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?): st
         return "unknown"
     elseif ty.Kind == "Primitive" then
         return ty.Primitive
+
+    elseif ty.Kind == "List" then
+        return `\{ { typeToString(ty.Items) } }`
+
     elseif ty.Kind == "Singleton" then
         if typeof(ty.Value) == "string" then
             return `"{ ty.Value }"`
@@ -1125,10 +1177,6 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?): st
     elseif ty.Kind == "Generic" then
         return genericTypeName(ty)
     elseif ty.Kind == "Function" then
-        if ty.IsTop then
-            return "function"
-        end
-
         local str = ""
 
         if #ty.Generics > 0 then
@@ -1277,6 +1325,14 @@ function normalizationToType(n: NormalizedType): Type
             end
         end
 
+        if n.List then
+            if n.List.Items then
+                table.insert(t, listType(normalizationToType(n.List.Items)))
+            else
+                table.insert(t, primitiveType("list"))
+            end
+        end
+
         if n.Function then
             if n.Function.Components then
                 local cs = table.create<<Type>>(#n.Function.Components)
@@ -1297,15 +1353,7 @@ function normalizationToType(n: NormalizedType): Type
                     table.insert(t, intersectionType(cs))
                 end
             else
-                local f: FunctionType = {
-                    Kind = "Function",
-                    Generics = {},
-                    Parameters = {},
-                    Variadic = neverType(),
-                    IsTop = true,
-                }
-
-                table.insert(t, makeType(f))
+                table.insert(t, primitiveType("function"))
             end
         end
 
@@ -1328,11 +1376,7 @@ function normalizationToType(n: NormalizedType): Type
                 local frees = table.create<<Type>>(#n.Free)
 
                 for i, free in n.Free do
-                    frees[i] = makeType{
-                        Kind = "Free",
-                        UpperBound = normalizationToType(free.UpperBound),
-                        LowerBound = normalizationToType(free.LowerBound),
-                    }
+                    frees[i] = free.Free
                 end
 
                 if #frees == 1 then
@@ -1357,20 +1401,6 @@ local function normalizationToString(n: NormalizedType): string
     return typeToString(normalizationToType(n))
 end
 
-local function dummyExpr(): caw.Expression
-    return {
-        Type = "Constant",
-        Constant = {
-            Type = "nil"
-        },
-        Position = {
-            Line = 0,
-            Character = 0,
-            Offset = 0,
-        }
-    }
-end
-
 -- Maps type names to types.
 local typeEnv: { [string]: Type? } = {
     never = neverType(),
@@ -1381,19 +1411,16 @@ local typeEnv: { [string]: Type? } = {
     string = primitiveType("string"),
 }
 -- Maps declaration names to types.
-local typeAssociations: { [string]: { Expression: caw.Expression, Type: Type }? } = {
+local typeAssociations: { [string]: { Expression: caw.Expression?, Type: Type }? } = {
     valuenever = {
-        Expression = dummyExpr(),
         Type = neverType()
     },
 
     print = {
         Type = functionType({}, { unknownType() }, unknownType()),
-        Expression = dummyExpr(),
     },
     tostring = {
         Type = functionType({}, { unknownType() }, neverType(), primitiveType("string")),
-        Expression = dummyExpr(),
     }
 }
 local typeEnvOrdered = {}
@@ -1402,39 +1429,42 @@ local typeAssociationsOrdered = {}
 local typeAnnotationToType
 local check
 
--- `Target <: Super`. Can modify `Target.Bound` if `Target` is Free.
+-- `Sub <: Super`. Can modify bounds of either if either are Free.
 -- Otherwise report error if relation does not hold.
--- TODO: Free type lower bounds: If `Super` is Free... then... we can do lower bounds I guess?
 type SubtypeConstraint = {
     read Position: caw.Position,
-    read Target: Type,
+    read Sub: Type,
     read Super: Type,
 }
 
-local function subtypeConstraint(position, target, super): SubtypeConstraint
+local function subtypeConstraint(position, sub, super): SubtypeConstraint
     return {
         Position = position,
-        Target = target,
+        Sub = sub,
         Super = super,
     }
 end
 
-local function dispatchSubtypeConstraints(constraints: { SubtypeConstraint })
-    for _, sc in constraints do
-        if sc.Target.Kind == "Free" then
-            if sc.Target ~= sc.Super then
-                sc.Target.UpperBound = makeIntersection(sc.Target.UpperBound, sc.Super)
+local function dispatchConstraints(state: InferenceState)
+    for _, sc in state.SubtypeConstraints do
+        if logInference then
+            print(`Dispatching '{ typeToString(sc.Sub) } <?: { typeToString(sc.Super) }'`)
+        end
+
+        if sc.Sub.Kind == "Free" then
+            if sc.Sub ~= sc.Super then
+                sc.Sub.UpperBound = makeIntersection(sc.Sub.UpperBound, sc.Super)
             end
         elseif sc.Super.Kind == "Free" then
-            if sc.Target ~= sc.Super then
-                sc.Super.LowerBound = makeIntersection(sc.Super.LowerBound, sc.Target)
+            if sc.Sub ~= sc.Super then
+                sc.Super.LowerBound = makeUnion(sc.Super.LowerBound, sc.Sub)
             end
         else
-            check(sc.Target, sc.Super, sc.Position)
+            check(sc.Sub, sc.Super, sc.Position)
         end
     end
 
-    table.clear(constraints)
+    table.clear(state.SubtypeConstraints)
 end
 
 local substituteAllIn
@@ -1444,6 +1474,9 @@ local function substituteAllIn_(ty: Type, substitutions: { read [Type]: Type }, 
         or ty.Kind == "Primitive" or ty.Kind == "Singleton"
     then
         return ty
+    elseif ty.Kind == "List" then
+        return listType(substituteAllIn(ty.Items, substitutions, traversed))
+
     elseif ty.Kind == "Generic" then
         return substitutions[ty] or ty
     elseif ty.Kind == "Free" then
@@ -1453,14 +1486,10 @@ local function substituteAllIn_(ty: Type, substitutions: { read [Type]: Type }, 
 
         if ty.LowerBound.Kind ~= "never" and ty.UpperBound.Kind == "unknown" then
             return substituteAllIn(ty.LowerBound, substitutions, traversed)
+        elseif ty.UpperBound.Kind ~= "unknown" then
+            return substituteAllIn(ty.UpperBound, substitutions, traversed)
         else
-            print("Left-over free type in substitutions")
-
-            return makeType{
-                Kind = "Free",
-                UpperBound = substituteAllIn(ty.UpperBound, substitutions, traversed),
-                LowerBound = substituteAllIn(ty.LowerBound, substitutions, traversed),
-            }
+            return ty
         end
     elseif ty.Kind == "Function" then
         local params = table.create<<Type>>(#ty.Parameters)
@@ -1573,16 +1602,86 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             return errorReport(`Invalid reference '{ name }'.`, expr.Position)
         end
 
-    elseif expr.Type == "BinaryOperation" then
-        local variable = expr.Left
-        local value = expr.Right
+    elseif expr.Type == "List" then
+        local itemsTy = if expected and expected.Kind == "List" then expected.Items else freeType()
 
+        for _, item in expr.List do
+            local itemTy = infer(state, item, itemsTy) or errorReport(`Expression does not return a value.`, item.Position)
+            table.insert(state.SubtypeConstraints, subtypeConstraint(item.Position, itemTy, itemsTy))
+        end
+
+        dispatchConstraints(state)
+        itemsTy = substituteAllIn(itemsTy, {}, {})
+        return listType(itemsTy)
+
+    elseif expr.Type == "ReadIndex" then
+        local itemsTy = expected or freeType()
+
+        local listTy = infer(state, expr.List, listType(itemsTy)) or errorReport(`Tried to index an expression that returned no value.`, expr.List.Position)
+        local indexTy = infer(state, expr.Index, primitiveType("number")) or errorReport(`Index was an expression that returned no value.`, expr.Index.Position)
+
+        table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, listTy, listType(itemsTy)))
+        table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, indexTy, primitiveType("number")))
+
+        return itemsTy
+
+    elseif expr.Type == "WriteIndex" then
+        local itemsTy = expected or freeType()
+
+        local listTy = infer(state, expr.List, listType(itemsTy)) or errorReport(`Tried to index an expression that returned no value.`, expr.List.Position)
+        local indexTy = infer(state, expr.Index, primitiveType("number")) or errorReport(`Index was an expression that returned no value.`, expr.Index.Position)
+
+        table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, listTy, listType(itemsTy)))
+        table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, indexTy, primitiveType("number")))
+
+        local valueTy = infer(state, expr.Value, itemsTy)
+
+        if not valueTy then
+            return errorReport(`Tried to assign list index to an expression that returns no value.`, expr.Value.Position)
+        end
+
+        table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, valueTy, itemsTy))
+        return valueTy
+
+    elseif expr.Type == "UnaryOperation" then
+        if expr.Operator == "-" then
+            local operand = infer(state, expr.Operand, primitiveType("number"))
+
+            if not operand then
+                return errorReport(`Attempted to use '-' on expression that returns no value.`, expr.Operand.Position)
+            end
+
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Operand.Position, operand, primitiveType("number")))
+            return primitiveType("number")
+
+        elseif expr.Operator == "#" then
+            local operand = infer(state, expr.Operand, unionType(primitiveType("string"), primitiveType("list")))
+
+            if not operand then
+                return errorReport(`Attempted to use '#' on expression that returns no value.`, expr.Operand.Position)
+            end
+
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Operand.Position, operand, unionType(primitiveType("string"), primitiveType("list"))))
+            return operand
+        else
+            unreachable(expr.Operator)
+            error(`Unreachable.`)
+        end
+
+    elseif expr.Type == "BinaryOperation" then
         if expr.Operator == "=" then
+            local variable = expr.Left
+            local value = expr.Right
+
             assert(variable.Type == "Reference")
             local ref = typeAssociations[variable.Reference]
 
             if not ref then
                 return errorReport(`Undefined variable '{ variable.Reference }'`, variable.Position)
+            end
+
+            if not ref.Expression then
+                return errorReport(`Cannot assign to builtins`, variable.Position)
             end
 
             assert(ref.Expression.Type == "Declaration" or ref.Expression.Type == "Function", ref.Expression.Type)
@@ -1736,7 +1835,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             infer(state, expr)
         end
 
-        dispatchSubtypeConstraints(state.SubtypeConstraints)
+        dispatchConstraints(state)
 
         local retTy = state.ReturnType
         local varTy = state.Variadic
@@ -1746,29 +1845,69 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         local freeTypeSubstitutions: { [Type]: Type } = {}
 
-        local function eliminateFreeType(ty: Type, name: string)
-            assert(ty.Kind == "Free")
-
-            if ty.LowerBound.Kind == "never" and ty.UpperBound.Kind == "unknown" then
-                local gen = genericType() :: GenericType
-                -- print(`Generalizing { typeToString(ty) } to '{ typeToString(gen) }'`)
-
-                freeTypeSubstitutions[ty] = gen :: Type
-                table.insert(gens, gen)
-            else
-                local replacement = if ty.LowerBound.Kind ~= "never" then normalize(ty.LowerBound) else normalize(ty.UpperBound)
-                local bound = normalizationToType(replacement)
-
-                -- print(`Concretizing '{ typeToString(ty) }' to '{ typeToString(bound) }'`)
-                freeTypeSubstitutions[ty] = bound
-
-                if isNever(replacement) then
-                    errorReport(`Parameter '{ name }' has conflicting usage and was reduced to 'never'. This function is not callable with any possible value.`, expr.Position)
-                end
-            end
+        if logInference then
+            print(`Eliminating free types: { typeToString(functionType(gens, params, varTy or neverType(), if typeof(retTy) == "table" then retTy else nil)) }`)
         end
 
-        -- print(`Eliminating free types: { typeToString(functionType(gens, params, varTy or neverType(), if typeof(retTy) == "table" then retTy else nil)) }`)
+        local function eliminateFree(ty: Type, name: string)
+            if ty.Kind == "Free" then
+                if freeTypeSubstitutions[ty] then
+                    return -- Do not re-generalize/concretize.
+                end
+
+                eliminateFree(ty.UpperBound, "<nested upper>")
+                eliminateFree(ty.LowerBound, "<nested lower>")
+
+                if ty.LowerBound.Kind == "never" and ty.UpperBound.Kind == "unknown" then
+                    local gen = genericType() :: GenericType
+
+                    if logInference then
+                        print(`Generalizing { typeToString(ty) } to '{ typeToString(gen) }'`)
+                    end
+
+                    freeTypeSubstitutions[ty] = gen :: Type
+                    table.insert(gens, gen)
+                else
+                    local replacement = if ty.LowerBound.Kind ~= "never" then normalize(ty.LowerBound) else normalize(ty.UpperBound)
+                    local bound = normalizationToType(replacement)
+
+                    if logInference then
+                        print(`Concretizing '{ typeToString(ty) }' to '{ typeToString(bound) }'`)
+                    end
+
+                    freeTypeSubstitutions[ty] = bound
+
+                    if isNever(replacement) then
+                        errorReport(`Parameter '{ name }' has conflicting usage and was reduced to 'never'. This function is not callable with any possible value.`, expr.Position)
+                    end
+                end
+
+            elseif ty.Kind == "List" then
+                eliminateFree(ty.Items, "<nested list items>")
+            elseif ty.Kind == "Function" then
+                for i, param in ty.Parameters do
+                    eliminateFree(param, "<nested parameter>")
+                end
+
+                eliminateFree(ty.Variadic, "<nested variadic>")
+
+                if ty.Returns then
+                    eliminateFree(ty.Returns, "<nested return>")
+                end
+            elseif ty.Kind == "Union" or ty.Kind == "Intersection" then
+                for i, c in ty.Components do
+                    eliminateFree(c, "<nested union or intersection component>")
+                end
+            elseif ty.Kind == "Negation" then
+                eliminateFree(ty.Negated, "<nested negation>")
+            elseif ty.Kind == "unknown" or ty.Kind == "never" or ty.Kind == "error" or ty.Kind == "Primitive"
+                or ty.Kind == "GenericInstantiation" or ty.Kind == "Generic" or ty.Kind == "Singleton"
+            then
+                -- Nothing.
+            else
+                unreachable(ty.Kind)
+            end
+        end
 
         for i, param in expr.Function.Parameters do
             typeAssociations[param.Name] = nil
@@ -1776,12 +1915,12 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             local paramTy = params[i]
 
             if paramTy.Kind == "Free" then
-                eliminateFreeType(paramTy, param.Name)
+                eliminateFree(paramTy, param.Name)
             end
         end
 
         if varTy then
-            eliminateFreeType(varTy, "...")
+            eliminateFree(varTy, "...")
         end
 
         local traversed = {}
@@ -1891,7 +2030,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         local checkFnTy = functionType(gens, arguments, neverType(), expected)
         table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, fnTy, checkFnTy))
 
-        dispatchSubtypeConstraints(state.SubtypeConstraints)
+        dispatchConstraints(state)
 
         local normFn = if fnTy.Kind == "Free" then normalize(fnTy.UpperBound) else normalize(fnTy)
 
@@ -1987,8 +2126,8 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
     elseif expr.Type == "InvalidSyntax" then
         return errorType()
     else
-        -- unreachable(expr.Type)
-        return errorReport(`Cannot infer { expr.Type } expressions.`, expr.Position)
+        unreachable(expr.Type)
+        error(`Unreachable.`)
     end
 end
 
@@ -2086,7 +2225,7 @@ function instantiateType(ty: Type): Type
 
     if ty.Kind == "error" or ty.Kind == "never" or ty.Kind == "unknown"
         or ty.Kind == "Primitive" or ty.Kind == "Singleton" or ty.Kind == "Generic"
-        or ty.Kind == "Free" or ty.Kind == "Function"
+        or ty.Kind == "Free" or ty.Kind == "Function" or ty.Kind == "List"
     then
         inited = ty
     elseif ty.Kind == "GenericInstantiation" then
@@ -2182,7 +2321,7 @@ function check(inferred: Type, annotation: Type, position: caw.Position, printNo
 end
 
 local function bidisemi(expressions: { read caw.Expression }, options: { read LogInference: boolean })
-    -- logInference = options.LogInference
+    logInference = options.LogInference
 
     local state: InferenceState = {
         Generics = {},
@@ -2200,7 +2339,7 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
         infer(state, expr)
     end
 
-    dispatchSubtypeConstraints(state.SubtypeConstraints)
+    dispatchConstraints(state)
 
     print("")
 
