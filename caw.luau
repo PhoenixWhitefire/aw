@@ -122,6 +122,11 @@ type SingletonTypeAnnotation = {
     read Value: string | boolean,
 }
 
+type ListTypeAnnotation = {
+    read Kind: "List",
+    read Items: TypeAnnotation,
+}
+
 type FunctionTypeAnnotation = {
     read Kind: "Function",
     read Parameters: { read TypeAnnotation },
@@ -152,6 +157,7 @@ type IntersectionTypeAnnotation = {
 export type TypeAnnotation =
     | ErroneousAnnotation
     | ReferenceAnnotation
+    | ListTypeAnnotation
     | SingletonTypeAnnotation
     | FunctionTypeAnnotation
     | GenericInstantiationTypeAnnotation
@@ -620,6 +626,18 @@ function parseTypeAnnotation(state: ParseState, report: Report, shallow: boolean
         else
             ty = params[1]
         end
+    elseif annotation.Type == "OpenCurlyBraces" then
+        local itemTy = parseTypeAnnotation(state, report)
+        local closeCurly = nextToken(state)
+
+        if closeCurly.Type ~= "CloseCurlyBraces" then
+            report(`Expected '}', got { closeCurly.Type }.`, closeCurly)
+        end
+
+        ty = {
+            Kind = "List",
+            Items = itemTy,
+        }
     else
         report(`Invalid annotation token '{ annotation.Type }'.`, annotation)
     end
@@ -1045,7 +1063,10 @@ function parseExpression(state: ParseState, report: Report, precedence: number?)
             itemTk, consumeClosingParentheses = peekNextToken(state)
 
             if itemTk.Type ~= "CloseCurlyBraces" then
-                if itemTk.Type ~= "Comma" then
+                if itemTk.Type == "Comma" then
+                    consumeClosingParentheses()
+                    itemTk, consumeClosingParentheses = peekNextToken(state)
+                else
                     return invalidExpr(state, `Expected comma or closing parentheses, got { itemTk.Type }.`, report)
                 end
             end

@@ -2142,6 +2142,9 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
         else
             return errorReport(`Unknown type '{ annotation.Reference }'`, position)
         end
+    elseif annotation.Kind == "List" then
+        return listType(typeAnnotationToType(position, annotation.Items))
+
     elseif annotation.Kind == "Singleton" then
         return singletonType(annotation.Value)
 
