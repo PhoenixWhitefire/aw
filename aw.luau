@@ -72,12 +72,61 @@ print(f_result)
 
 local snProgram = [[
 
-function foo(listy)
-    let greetings: { string } = {
-        "hello",
-        1,
-        "hi",
-    }
+let a_pushtype: (number) -> () = function(ax)
+    let ay = ax .. ", world!" -- We report a type error here instead of `function(ax)` because `ax` was inferred as `number` by just the function assignment.
+end
+
+-- We can infer the return type as being `"One" | nil`.
+let b_lowerbounds = function(bx)
+    if bx == 1 then
+        return "One"
+    else
+        return nil
+    end
+end
+
+let b_bounds2 = function(by)
+    by(1)
+    by(true)
+    let bz: string = by(nil)
+end
+
+type c_semantic = (string | nil) & (number | nil)
+let c_semA: c_semantic
+let c_semB: nil
+
+-- Both of these are allowed by semantic subtyping. `(string | nil) & (number | nil)` == `nil`.
+c_semA = c_semB
+c_semB = c_semA
+
+-- We can do negation types.
+let d_negation: string & ~"hello" & ~"goodbye" = "hi"
+let d_negation2: ~~number = 5
+
+function e_annotationConstrains(ex)
+    let ey: number = ex
+end
+
+function f_id(fx)
+    return fx
+end
+
+let f_hello = f_id("hello")
+
+let g_sets: (string | number) & number = 5
+let g_union: number | boolean = true
+
+let h_hof = function(hx, hz, hw)
+    let hn = hz(hx(hw))
+    return hn
+end
+
+let i_list = function(l, i, t)
+    return l[i] = t
+end
+
+let i_listbidi = function(l, i)
+    let li: string = l[i]
 end
 
 ]]
