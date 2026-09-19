@@ -1415,6 +1415,13 @@ type InferenceState = {
 }
 
 local function infer(state: InferenceState, expr: caw.Expression, expected: Type?): Type?
+    local function addGeneric()
+        local gen = genericType()
+        table.insert(state.Generics, gen)
+
+        return gen
+    end
+
     if expr.Type == "Constant" then
         if expr.Constant.Type == "boolean" or expr.Constant.Type == "string" then
             return singletonType(expr.Constant.Value)
@@ -1424,13 +1431,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
     elseif expr.Type == "Declaration" then
         local anno = if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation) else nil
-        local expect = anno
-
-        if not expect then
-            local gen = genericType()
-            table.insert(state.Generics, gen)
-            expect = gen
-        end
+        local expect = anno or addGeneric()
 
         local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value, expect) else primitiveType("nil")
 
@@ -1766,6 +1767,8 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         fty = substituteAllIn(fty)
 
         assert(fty.Kind == "Function")
+
+        -- Trim unused generics, e.g. `let x = function(f, y) return f(y) end`.
         local gensCheck = table.clone(fty.Generics)
         table.clear(fty.Generics)
 
@@ -1788,7 +1791,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         local retTy = state.ReturnType
 
         if retTy == true then
-            local inferred = expr.Return and infer(state, expr.Return)
+            local inferred = expr.Return and infer(state, expr.Return, addGeneric())
 
             if inferred then
                 state.ReturnType = makeType{
@@ -1806,7 +1809,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             local thisRet
 
             if expr.Return then
-                thisRet = infer(state, expr.Return)
+                thisRet = infer(state, expr.Return, addGeneric())
             end
 
             if thisRet then
@@ -1837,14 +1840,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         local arguments = table.create<<Type>>(#expr.Call.Arguments)
 
         for i, a in expr.Call.Arguments do
-            local expect = fnTy.Kind == "Function" and fnTy.Parameters[i]
-
-            if not expect then
-                local gen = genericType()
-                table.insert(state.Generics, gen)
-                expect = gen
-            end
-
+            local expect = (fnTy.Kind == "Function" and fnTy.Parameters[i]) or addGeneric()
             arguments[i] = infer(state, a, expect)
         end
 
