@@ -59,7 +59,7 @@ type GenericType = {
 
 type FunctionType = {
     read Kind: "Function",
-    read Generics: { read GenericType },
+    read Generics: { GenericType },
     read Parameters: { read Type },
     read Variadic: Type,
     read Returns: Type?,
@@ -247,6 +247,12 @@ local function errorReport(message, position: caw.Position): Type
 end
 
 local function makeUnion(a: Type, b: Type)
+    if a.Kind == "never" then
+        return b
+    elseif b.Kind == "never" then
+        return a
+    end
+
     local components = {}
 
     if a.Kind == "Union" then
@@ -268,6 +274,12 @@ local function makeUnion(a: Type, b: Type)
 end
 
 local function makeIntersection(a: Type, b: Type)
+    if a.Kind == "unknown" then
+        return b
+    elseif b.Kind == "unknown" then
+        return a
+    end
+
     local components = {}
 
     if a.Kind == "Intersection" then
@@ -859,7 +871,7 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
                 local car = intersectApplicableReturns(a.Components, single)
 
                 if not car then
-                    return subtypeFailure(`No overload accepts '{ dumpNormalization(single) }'`)
+                    return subtypeFailure(`No overload accepts '{ dumpNormalization(single) }'.`)
                 end
 
                 if cb.Return then
@@ -1229,6 +1241,7 @@ local function normalizationToType(n: NormalizedType): Type
                 end
 
                 if n.String.Cofinite then
+                    table.insert(strs, 1, primitiveType("string"))
                     table.insert(t, intersectionType(strs))
                 else
                     table.insert(t, unionType(strs))
@@ -1395,6 +1408,7 @@ local function dispatchSubtypeConstraints(constraints: { SubtypeConstraint })
 end
 
 type InferenceState = {
+    Generics: { GenericType },
     ReturnType: Type? | true,
     Variadic: Type?,
     SubtypeConstraints: { SubtypeConstraint },
@@ -1410,7 +1424,15 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
     elseif expr.Type == "Declaration" then
         local anno = if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation) else nil
-        local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value, anno) else primitiveType("nil")
+        local expect = anno
+
+        if not expect then
+            local gen = genericType()
+            table.insert(state.Generics, gen)
+            expect = gen
+        end
+
+        local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value, expect) else primitiveType("nil")
 
         if not ty then
             errorReport(`Trying to assign '{ expr.Declaration.Name }' to an expression returning no values.`, expr.Position)
@@ -1452,9 +1474,20 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                 return errorReport(`Undefined variable '{ variable.Reference }'`, variable.Position)
             end
 
+            assert(ref.Expression.Type == "Declaration" or ref.Expression.Type == "Function", ref.Expression.Type)
+
+            local annoTy = if ref.Expression.Type == "Declaration" and ref.Expression.Declaration.Annotation then typeAnnotationToType(ref.Expression.Position, ref.Expression.Declaration.Annotation) else nil
+            local valueTy = infer(state, value, annoTy or ref.Type)
+
+            if not valueTy then
+                return errorReport(`Tried to assign '{ variable.Reference }' to an expression that returns no value.`, expr.Position)
+            end
+
             if ref.Expression.Type == "Function" then -- Function parameter.
-                if ref.Type.Kind == "Free" then
-                    local ty = makeIntersection(ref.Type.UpperBound, infer(state, value))
+                if ref.Type.Kind == "Free" and ref.Type ~= valueTy then
+                    -- TODO luau, type error is reported on `ref.Type.UpperBound` instead of the `infer` call (returning optional `Type`).
+                    -- local ty = makeIntersection(ref.Type.UpperBound, infer(state, value))
+                    local ty = makeIntersection(ref.Type.UpperBound, valueTy)
                     ref.Type.UpperBound = ty
 
                     return ty
@@ -1463,15 +1496,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                 end
             end
 
-            assert(ref.Expression.Type == "Declaration", ref.Expression.Type)
-
-            local valueTy = infer(state, value)
-
-            if not valueTy then
-                return errorReport(`Tried to assign '{ variable.Reference }' to an expression that returns no value.`, expr.Position)
-            end
-
-            local annoTy = if ref.Expression.Declaration.Annotation then typeAnnotationToType(ref.Expression.Position, ref.Expression.Declaration.Annotation) else nil
+            assert(ref.Expression.Type == "Declaration")
 
             if annoTy then
                 table.insert(state.SubtypeConstraints, subtypeConstraint(value.Position, valueTy, annoTy))
@@ -1584,11 +1609,13 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             table.insert(typeAssociationsOrdered, expr.Function.Name)
         end
 
+        local prevGenerics = state.Generics
         local prevVarTy = state.Variadic
         local prevRetTy = state.ReturnType
+        state.Generics = gens
         state.ReturnType = if expected and expected.Kind == "Function" then expected.Returns else true
 
-        if expr.Function.Variadic then
+        if expr.Function.Variadic.Present then
             state.Variadic = freeType()
         else
             state.Variadic = nil
@@ -1602,6 +1629,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         local retTy = state.ReturnType
         local varTy = state.Variadic
+        state.Generics = prevGenerics
         state.ReturnType = prevRetTy
         state.Variadic = prevVarTy
 
@@ -1612,12 +1640,15 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
             if ty.LowerBound.Kind == "never" and ty.UpperBound.Kind == "unknown" then
                 local gen = genericType() :: GenericType
-                freeTypeSubstitutions[ty] = gen :: Type
+                -- print(`Generalizing { typeToString(ty) } to '{ typeToString(gen) }'`)
 
+                freeTypeSubstitutions[ty] = gen :: Type
                 table.insert(gens, gen)
             else
                 local replacement = if ty.LowerBound.Kind ~= "never" then normalize(ty.LowerBound) else normalize(ty.UpperBound)
                 local bound = normalizationToType(replacement)
+
+                -- print(`Concretizing '{ typeToString(ty) }' to '{ typeToString(bound) }'`)
                 freeTypeSubstitutions[ty] = bound
 
                 if isNever(replacement) then
@@ -1625,6 +1656,8 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                 end
             end
         end
+
+        -- print(`Eliminating free types: { typeToString(functionType(gens, params, varTy or neverType(), if typeof(retTy) == "table" then retTy else nil)) }`)
 
         for i, param in expr.Function.Parameters do
             typeAssociations[param.Name] = nil
@@ -1640,7 +1673,10 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             eliminateFreeType(varTy, "...")
         end
 
-        local function substituteAllIn(ty: Type): Type
+        local traversed = {}
+        local substituteAllIn
+
+        local function substituteAllIn_(ty: Type): Type
             if ty.Kind == "error" or ty.Kind == "never" or ty.Kind == "unknown"
                 or ty.Kind == "Primitive" or ty.Kind == "Singleton" or ty.Kind == "Generic"
             then
@@ -1653,6 +1689,8 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                 if ty.LowerBound.Kind ~= "never" and ty.UpperBound.Kind == "unknown" then
                     return substituteAllIn(ty.LowerBound)
                 else
+                    print("Left-over free type in substitutions")
+
                     return makeType{
                         Kind = "Free",
                         UpperBound = substituteAllIn(ty.UpperBound),
@@ -1667,7 +1705,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                 end
 
                 local rets = if ty.Returns then substituteAllIn(ty.Returns) else nil
-                return functionType(ty.Generics, params, neverType(), rets)
+                return functionType(ty.Generics, params, substituteAllIn(ty.Variadic), rets)
 
             elseif ty.Kind == "Negation" then
                 return makeType{
@@ -1707,23 +1745,35 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             end
         end
 
-        for i, param in params do
-            params[i] = substituteAllIn(param)
+        function substituteAllIn(ty: Type): Type
+            local replacement = substituteAllIn_(ty)
+            traversed[replacement] = true
+
+            return replacement
         end
 
-        if varTy then
-            varTy = substituteAllIn(varTy)
+        -- The substitutions themselves may have types that need to be substituted.
+        --
+        -- let x = function(y, f) --> `f` would be left as `() -> 'b` unless we substitute the substitution.
+        --     y = f()
+        -- end
+        --
+        for ty, sub in freeTypeSubstitutions do
+            freeTypeSubstitutions[ty] = substituteAllIn(sub)
         end
 
-        if typeof(retTy) == "table" then
-            retTy = substituteAllIn(retTy)
-        end
+        local fty = functionType(gens, params, varTy or neverType(), if typeof(retTy) == "table" then retTy else nil)
+        fty = substituteAllIn(fty)
 
-        if retTy == true then
-            retTy = nil
-        end
+        assert(fty.Kind == "Function")
+        local gensCheck = table.clone(fty.Generics)
+        table.clear(fty.Generics)
 
-        local fty = functionType(gens, params, varTy or neverType(), retTy)
+        for _, gen in gensCheck do
+            if traversed[gen] then
+                table.insert(fty.Generics, gen)
+            end
+        end
 
         if expr.Function.Name then
             typeAssociations[expr.Function.Name] = {
@@ -1787,10 +1837,18 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         local arguments = table.create<<Type>>(#expr.Call.Arguments)
 
         for i, a in expr.Call.Arguments do
-            arguments[i] = infer(state, a, if fnTy.Kind == "Function" then fnTy.Parameters[i] else nil)
+            local expect = fnTy.Kind == "Function" and fnTy.Parameters[i]
+
+            if not expect then
+                local gen = genericType()
+                table.insert(state.Generics, gen)
+                expect = gen
+            end
+
+            arguments[i] = infer(state, a, expect)
         end
 
-        local checkFnTy = functionType({}, arguments, neverType(), expected or unknownType())
+        local checkFnTy = functionType({}, arguments, neverType(), expected)
         table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, fnTy, checkFnTy))
 
         dispatchSubtypeConstraints(state.SubtypeConstraints)
@@ -2087,6 +2145,7 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
     -- logInference = options.LogInference
 
     local state: InferenceState = {
+        Generics = {},
         ReturnType = nil,
         SubtypeConstraints = {},
     }
@@ -2102,6 +2161,8 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
     end
 
     dispatchSubtypeConstraints(state.SubtypeConstraints)
+
+    print("")
 
     for _, k in typeAssociationsOrdered do
         local t = assert(typeAssociations[k])

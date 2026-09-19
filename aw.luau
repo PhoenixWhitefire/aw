@@ -70,6 +70,59 @@ print(f_result)
 
 ]]
 
+local snProgram = [[
+
+let a_pushtype: (number) -> () = function(ax)
+    let ay = ax .. ", world!" -- We report a type error here instead of `function(ax)` because `ax` was inferred as `number` by just the function assignment.
+end
+
+-- We can infer the return type as being `"One" | nil`.
+let b_lowerbounds = function(bx)
+    if bx == 1 then
+        return "One"
+    else
+        return nil
+    end
+end
+
+let b_bounds2 = function(by)
+    by(1)
+    by(true)
+    let bz: string = by(nil)
+end
+
+type c_semantic = (string | nil) & (number | nil)
+let c_semA: c_semantic
+let c_semB: nil
+
+-- Both of these are allowed by semantic subtyping. `(string | nil) & (number | nil)` == `nil`.
+c_semA = c_semB
+c_semB = c_semA
+
+-- We can do negation types.
+let d_negation: string & ~"hello" & ~"goodbye" = "hi"
+let d_negation2: ~~number = 5
+
+function e_annotationConstrains(ex)
+    let ey: number = ex
+end
+
+function f_id(fx)
+    return fx
+end
+
+let f_hello = f_id("hello")
+
+let g_sets: (string | number) & number = 5
+let g_union: number | boolean = true
+
+let h_hof = function(hx, hz, hw)
+    let hn = hz(hx(hw))
+    return hn
+end
+
+]]
+
 local npProgram = [[
 type Red = "red"
 type Blue = "blue"
@@ -93,6 +146,7 @@ let triangleIsUncolorable: issubtypeof<Triangle, Uncolorable> = valuenever
 
 local programs = {
     hm = hmProgram,
+    sn = snProgram,
     np = npProgram,
 }
 
@@ -188,8 +242,8 @@ if select("#", ...) > 0 then
                         program = hmProgram
                         print(`The default program will be 'hm'.\n`)
                     elseif algo == "sn" then
-                        program = npProgram
-                        print(`The default program will be 'np'.\n`)
+                        program = snProgram
+                        print(`The default program will be 'sn'.\n`)
                     end
                 else
                     print(`Invalid '--inferer' algorithm '{ algo }', please check '--help' for the supported algorithms.`)
