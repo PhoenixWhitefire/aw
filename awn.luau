@@ -59,7 +59,7 @@ type GenericType = {
 
 type FunctionType = {
     read Kind: "Function",
-    read Generics: { GenericType },
+    read Generics: { read GenericType },
     read Parameters: { read Type },
     read Variadic: Type,
     read Returns: Type?,
@@ -111,7 +111,9 @@ type TypeData =
 type Type = { AliasName: string? } & TypeData
 
 type NormalizedFunctionComponentType = {
+    Generics: { GenericType },
     Parameters: { NormalizedType },
+    Variadic: NormalizedType,
     Return: NormalizedType?,
 }
 
@@ -413,13 +415,23 @@ local function dumpNormalization(n: NormalizedType)
             local fs = table.create<<string>>(#n.Function.Components)
 
             for i, f in n.Function.Components do
-                local params = table.create<<string>>(#f.Parameters)
+                local gens = table.create<<string>>(#f.Generics)
+
+                for i, gen in gens do
+                    gens[i] = typeToString(gen)
+                end
+
+                local params = table.create<<string>>(#f.Parameters + 1)
 
                 for i, param in f.Parameters do
                     params[i] = dumpNormalization(param)
                 end
 
-                fs[i] = `({ table.concat(params, ", ") }) -> { if f.Return then dumpNormalization(f.Return) else "()" }`
+                if not isNever(f.Variadic) then
+                    table.insert(params, `...{ dumpNormalization(f.Variadic) }`)
+                end
+
+                fs[i] = `{ if #gens > 0 then "<" .. table.concat(gens, ", ") .. ">" else "" }({ table.concat(params, ", ") }) -> { if f.Return then dumpNormalization(f.Return) else "()" }`
             end
 
             table.insert(t, table.concat(fs, " & "))
@@ -449,7 +461,17 @@ local function dumpNormalization(n: NormalizedType)
             local frees = table.create<<string>>(#n.Free)
 
             for i, free in n.Free do
-                frees[i] = typeToString(free.Free, nil, true)
+                local str = typeToString(free.Free, nil, true)
+
+                if not isUnknown(free.UpperBound) then
+                    str = str .. ` <: { dumpNormalization(free.UpperBound) }`
+                end
+
+                if not isNever(free.LowerBound) then
+                    str = `{ dumpNormalization(free.LowerBound) } <: `.. str
+                end
+
+                frees[i] = str
             end
 
             table.insert(t, table.concat(frees, " | "))
@@ -640,7 +662,10 @@ local function normalize(ty: Type): NormalizedType
             n.Function = {
                 Components = {
                     {
+                        -- TODO luau
+                        Generics = table.clone(ty.Generics),
                         Parameters = params,
+                        Variadic = normalize(ty.Variadic),
                         Return = if ty.Returns then normalize(ty.Returns) else nil,
                     },
                 }
@@ -726,6 +751,7 @@ end
 
 local isSubtypeOf
 local isSupertypeOf
+local normalizationToType
 
 type SubtypingResult =
     | {
@@ -1044,7 +1070,7 @@ local freeTypeNameCount = 0
 local instantiateType
 
 function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?): string
-    if ty.AliasName and ty.AliasName ~= alias then
+    if (ty :: Type).AliasName and ty.AliasName ~= alias then
         return ty.AliasName
     end
 
@@ -1137,7 +1163,7 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?): st
             arguments[i] = typeToString(a)
         end
 
-        return `{ ty.Name }<{ table.concat(arguments, ", ") }> => { typeToString(instantiateType(ty)) }`
+        return `{ ty.Name }<{ table.concat(arguments, ", ") }> => { typeToString(instantiateType(ty :: Type)) }`
 
     elseif ty.Kind == "Negation" then
         local inner = typeToString(ty.Negated)
@@ -1200,7 +1226,7 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?): st
     end
 end
 
-local function normalizationToType(n: NormalizedType): Type
+function normalizationToType(n: NormalizedType): Type
     local t: { Type } = {}
 
     if n.Error then
@@ -1262,7 +1288,7 @@ local function normalizationToType(n: NormalizedType): Type
                         params[i] = normalizationToType(param)
                     end
 
-                    cs[i] = functionType({}, params, neverType(), if f.Return then normalizationToType(f.Return) else nil)
+                    cs[i] = functionType(f.Generics, params, normalizationToType(f.Variadic), if f.Return then normalizationToType(f.Return) else nil)
                 end
 
                 if #cs == 1 then
@@ -1302,7 +1328,11 @@ local function normalizationToType(n: NormalizedType): Type
                 local frees = table.create<<Type>>(#n.Free)
 
                 for i, free in n.Free do
-                    frees[i] = free.Free
+                    frees[i] = makeType{
+                        Kind = "Free",
+                        UpperBound = normalizationToType(free.UpperBound),
+                        LowerBound = normalizationToType(free.LowerBound),
+                    }
                 end
 
                 if #frees == 1 then
@@ -1407,6 +1437,86 @@ local function dispatchSubtypeConstraints(constraints: { SubtypeConstraint })
     table.clear(constraints)
 end
 
+local substituteAllIn
+
+local function substituteAllIn_(ty: Type, substitutions: { read [Type]: Type }, traversed: { [Type]: true }): Type
+    if ty.Kind == "error" or ty.Kind == "never" or ty.Kind == "unknown"
+        or ty.Kind == "Primitive" or ty.Kind == "Singleton"
+    then
+        return ty
+    elseif ty.Kind == "Generic" then
+        return substitutions[ty] or ty
+    elseif ty.Kind == "Free" then
+        if substitutions[ty] then
+            return substitutions[ty]
+        end
+
+        if ty.LowerBound.Kind ~= "never" and ty.UpperBound.Kind == "unknown" then
+            return substituteAllIn(ty.LowerBound, substitutions, traversed)
+        else
+            print("Left-over free type in substitutions")
+
+            return makeType{
+                Kind = "Free",
+                UpperBound = substituteAllIn(ty.UpperBound, substitutions, traversed),
+                LowerBound = substituteAllIn(ty.LowerBound, substitutions, traversed),
+            }
+        end
+    elseif ty.Kind == "Function" then
+        local params = table.create<<Type>>(#ty.Parameters)
+
+        for i, param in ty.Parameters do
+            params[i] = substituteAllIn(param, substitutions, traversed)
+        end
+
+        local rets = if ty.Returns then substituteAllIn(ty.Returns, substitutions, traversed) else nil
+        return functionType(ty.Generics, params, substituteAllIn(ty.Variadic, substitutions, traversed), rets)
+
+    elseif ty.Kind == "Negation" then
+        return makeType{
+            Kind = "Negation",
+            Negated = substituteAllIn(ty.Negated, substitutions, traversed),
+        }
+
+    elseif ty.Kind == "Union" then
+        local components = table.create<<Type>>(#ty.Components)
+
+        for i, c in ty.Components do
+            components[i] = substituteAllIn(c, substitutions, traversed)
+        end
+
+        return unionType(components)
+
+    elseif ty.Kind == "Intersection" then
+        local components = table.create<<Type>>(#ty.Components)
+
+        for i, c in ty.Components do
+            components[i] = substituteAllIn(c, substitutions, traversed)
+        end
+
+        return intersectionType(components)
+
+    elseif ty.Kind == "GenericInstantiation" then
+        local arguments = table.create<<Type>>(#ty.Arguments)
+
+        for i, a in ty.Arguments do
+            arguments[i] = substituteAllIn(a, substitutions, traversed)
+        end
+
+        return genericInstantationType(ty.Name, arguments)
+    else
+        unreachable(ty.Kind)
+        error(`Unreachable.`)
+    end
+end
+
+function substituteAllIn(ty, substitutions, traversed: { [Type]: true }): Type
+    local replacement = substituteAllIn_(ty, substitutions, traversed)
+    traversed[replacement] = true
+
+    return replacement
+end
+
 type InferenceState = {
     Generics: { GenericType },
     ReturnType: Type? | true,
@@ -1417,7 +1527,7 @@ type InferenceState = {
 local function infer(state: InferenceState, expr: caw.Expression, expected: Type?): Type?
     local function addGeneric()
         local gen = genericType()
-        table.insert(state.Generics, gen)
+        table.insert(state.Generics, gen :: GenericType) -- TODO luau cast (maybe?)
 
         return gen
     end
@@ -1675,83 +1785,6 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         end
 
         local traversed = {}
-        local substituteAllIn
-
-        local function substituteAllIn_(ty: Type): Type
-            if ty.Kind == "error" or ty.Kind == "never" or ty.Kind == "unknown"
-                or ty.Kind == "Primitive" or ty.Kind == "Singleton" or ty.Kind == "Generic"
-            then
-                return ty
-            elseif ty.Kind == "Free" then
-                if freeTypeSubstitutions[ty] then
-                    return freeTypeSubstitutions[ty]
-                end
-
-                if ty.LowerBound.Kind ~= "never" and ty.UpperBound.Kind == "unknown" then
-                    return substituteAllIn(ty.LowerBound)
-                else
-                    print("Left-over free type in substitutions")
-
-                    return makeType{
-                        Kind = "Free",
-                        UpperBound = substituteAllIn(ty.UpperBound),
-                        LowerBound = substituteAllIn(ty.LowerBound),
-                    }
-                end
-            elseif ty.Kind == "Function" then
-                local params = table.create<<Type>>(#ty.Parameters)
-
-                for i, param in ty.Parameters do
-                    params[i] = substituteAllIn(param)
-                end
-
-                local rets = if ty.Returns then substituteAllIn(ty.Returns) else nil
-                return functionType(ty.Generics, params, substituteAllIn(ty.Variadic), rets)
-
-            elseif ty.Kind == "Negation" then
-                return makeType{
-                    Kind = "Negation",
-                    Negated = substituteAllIn(ty.Negated),
-                }
-
-            elseif ty.Kind == "Union" then
-                local components = table.create<<Type>>(#ty.Components)
-
-                for i, c in ty.Components do
-                    components[i] = substituteAllIn(c)
-                end
-
-                return unionType(components)
-
-            elseif ty.Kind == "Intersection" then
-                local components = table.create<<Type>>(#ty.Components)
-
-                for i, c in ty.Components do
-                    components[i] = substituteAllIn(c)
-                end
-
-                return intersectionType(components)
-
-            elseif ty.Kind == "GenericInstantiation" then
-                local arguments = table.create<<Type>>(#ty.Arguments)
-
-                for i, a in ty.Arguments do
-                    arguments[i] = substituteAllIn(a)
-                end
-
-                return genericInstantationType(ty.Name, arguments)
-            else
-                unreachable(ty.Kind)
-                error(`Unreachable.`)
-            end
-        end
-
-        function substituteAllIn(ty: Type): Type
-            local replacement = substituteAllIn_(ty)
-            traversed[replacement] = true
-
-            return replacement
-        end
 
         -- The substitutions themselves may have types that need to be substituted.
         --
@@ -1760,11 +1793,11 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         -- end
         --
         for ty, sub in freeTypeSubstitutions do
-            freeTypeSubstitutions[ty] = substituteAllIn(sub)
+            freeTypeSubstitutions[ty] = substituteAllIn(sub, freeTypeSubstitutions, traversed)
         end
 
         local fty = functionType(gens, params, varTy or neverType(), if typeof(retTy) == "table" then retTy else nil)
-        fty = substituteAllIn(fty)
+        fty = substituteAllIn(fty, freeTypeSubstitutions, traversed)
 
         assert(fty.Kind == "Function")
 
@@ -1837,6 +1870,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         local fnTy = fn.Type
 
+        local gens = {}
         local arguments = table.create<<Type>>(#expr.Call.Arguments)
 
         for i, a in expr.Call.Arguments do
@@ -1844,7 +1878,17 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             arguments[i] = infer(state, a, expect)
         end
 
-        local checkFnTy = functionType({}, arguments, neverType(), expected)
+        if fnTy.Kind == "Function" and #fnTy.Generics > 0 then
+            local genericSubstitutions = {}
+
+            for _, gen in fnTy.Generics do
+                genericSubstitutions[gen] = freeType()
+            end
+
+            fnTy = substituteAllIn(fnTy, genericSubstitutions, {})
+        end
+
+        local checkFnTy = functionType(gens, arguments, neverType(), expected)
         table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, fnTy, checkFnTy))
 
         dispatchSubtypeConstraints(state.SubtypeConstraints)
