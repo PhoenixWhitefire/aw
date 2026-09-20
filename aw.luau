@@ -151,6 +151,11 @@ let h_result = h_add1mul2(4)
 print(h_hofresult)
 print(h_result)
 
+let h_genericreturn = function(hg)
+    let hgx = hg()
+    return hgx
+end
+
 let i_list = function(l, i, t)
     return l[i] = t
 end
