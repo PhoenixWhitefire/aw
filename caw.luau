@@ -228,6 +228,7 @@ type ExpressionData =
             read Generics: { read string }?,
             read Parameters: { read FunctionParameter },
             read Variadic: FunctionVariadicParameter,
+            read ReturnAnnotation: TypeAnnotation?,
             read Body: { Expression },
         },
       }
@@ -788,6 +789,14 @@ local function parseFunction(state: ParseState, report: Report, token: Token): E
         end
     end
 
+    local returnTypeAnnotation = nil
+    local maybeColon, consumeColon = peekNextToken(state)
+
+    if maybeColon.Type == "Colon" then
+        consumeColon()
+        returnTypeAnnotation = parseTypeAnnotation(state, report)
+    end
+
     state.FunctionDepth += 1
 
     local body = parseBody(state, report)
@@ -800,6 +809,7 @@ local function parseFunction(state: ParseState, report: Report, token: Token): E
             Name = name,
             Parameters = parameters,
             Variadic = variadic,
+            ReturnAnnotation = returnTypeAnnotation,
             Body = body,
         },
     }, token)

@@ -1957,7 +1957,9 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         local prevVarTy = state.Variadic
         local prevRetTy = state.ReturnType
         state.Generics = gens
-        state.ReturnType = if expected and expected.Kind == "Function" then expected.Returns else true
+        state.ReturnType = if expected and expected.Kind == "Function" then expected.Returns
+                            else if expr.Function.ReturnAnnotation then typeAnnotationToType(expr.Position, expr.Function.ReturnAnnotation)
+                            else true
 
         if expr.Function.Variadic.Present then
             state.Variadic = freeType(nil, nil, "Negative") -- Variadic parameter is still in a contravariant position.
@@ -2071,7 +2073,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             local thisRet
 
             if expr.Return then
-                thisRet = infer(state, expr.Return, addGeneric())
+                thisRet = infer(state, expr.Return, if retTy.Kind == "Free" then addGeneric() else retTy)
 
                 if thisRet and thisRet.Kind == "Free" then
                     polarizePositive(thisRet)
