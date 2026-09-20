@@ -1,6 +1,12 @@
 -- awn.luau, 09/09/2026
 -- Bidirectional inference with semantic subtyping and normalization.
 
+-- https://pnwamk.github.io/sst-tutorial/
+-- https://rfcs.luau.org/local-type-inference.html
+-- https://rfcs.luau.org/lower-bounds-calculation.html
+-- https://luau.org/news/2022-10-31-luau-semantic-subtyping/
+-- https://www.cduce.org/papers/gentle.pdf
+
 local caw = require("./caw")
 local logInference = false
 
@@ -16,43 +22,10 @@ type UnknownType = {
     read Kind: "unknown",
 }
 
-type NilType = {
+type PrimitiveType = {
     read Kind: "Primitive",
-    read Primitive: "nil",
+    read Primitive: "nil" | "boolean" | "number" | "string" | "list" | "function"
 }
-
-type BooleanType = {
-    read Kind: "Primitive",
-    read Primitive: "boolean",
-}
-
-type NumberType = {
-    read Kind: "Primitive",
-    read Primitive: "number",
-}
-
-type StringType = {
-    read Kind: "Primitive",
-    read Primitive: "string",
-}
-
-type FunctionPrimitiveType = {
-    read Kind: "Primitive",
-    read Primitive: "function",
-}
-
-type ListPrimitiveType = {
-    read Kind: "Primitive",
-    read Primitive: "list",
-}
-
-type PrimitiveType =
-    | NilType
-    | BooleanType
-    | NumberType
-    | StringType
-    | ListPrimitiveType
-    | FunctionPrimitiveType
 
 type ListType = {
     read Kind: "List",
@@ -71,7 +44,7 @@ type GenericType = {
 
 type FunctionType = {
     read Kind: "Function",
-    read Generics: { read GenericType },
+    read Generics: { read Type },
     read Parameters: { read Type },
     read Variadic: Type,
     read Returns: Type?,
@@ -123,7 +96,7 @@ type TypeData =
 type Type = { AliasName: string? } & TypeData
 
 type NormalizedFunctionComponentType = {
-    Generics: { GenericType },
+    Generics: { Type },
     Parameters: { NormalizedType },
     Variadic: NormalizedType,
     Return: NormalizedType?,
@@ -224,7 +197,7 @@ local function genericType(name: string?)
     }
 end
 
-local function functionType(generics: { read GenericType }, parameters: { read Type }, variadic: Type, returns: Type?)
+local function functionType(generics: { read Type }, parameters: { read Type }, variadic: Type, returns: Type?)
     return makeType{
         Kind = "Function",
         Generics = generics,
@@ -323,20 +296,6 @@ local function makeIntersection(a: Type, b: Type)
     }
 end
 
-local function normalizedUnknown(): NormalizedType
-    return {
-        Error = false,
-        Top = true,
-        Nil = true,
-        Boolean = {},
-        Number = true,
-        String = { Cofinite = false },
-        Function = {},
-        Generic = {},
-        Free = {},
-    }
-end
-
 local function normalizedNever(): NormalizedType
     return {
         Error = false,
@@ -356,6 +315,7 @@ local function toNever(n: NormalizedType)
     n.Boolean = nil
     n.Number = false
     n.String = nil
+    n.List = nil
     n.Function = nil
     n.Generic = nil
 end
@@ -447,7 +407,7 @@ local function dumpNormalization(n: NormalizedType)
             for i, f in n.Function.Components do
                 local gens = table.create<<string>>(#f.Generics)
 
-                for i, gen in gens do
+                for i, gen in f.Generics do
                     gens[i] = typeToString(gen)
                 end
 
@@ -1318,7 +1278,11 @@ function normalizationToType(n: NormalizedType): Type
                     table.insert(strs, 1, primitiveType("string"))
                     table.insert(t, intersectionType(strs))
                 else
-                    table.insert(t, unionType(strs))
+                    if #strs == 1 then
+                        table.insert(t, strs[1])
+                    else
+                        table.insert(t, unionType(strs))
+                    end
                 end
             else
                 table.insert(t, primitiveType("string"))
@@ -1547,7 +1511,7 @@ function substituteAllIn(ty, substitutions, traversed: { [Type]: true }): Type
 end
 
 type InferenceState = {
-    Generics: { GenericType },
+    Generics: { Type },
     ReturnType: Type? | true,
     Variadic: Type?,
     SubtypeConstraints: { SubtypeConstraint },
@@ -1556,7 +1520,7 @@ type InferenceState = {
 local function infer(state: InferenceState, expr: caw.Expression, expected: Type?): Type?
     local function addGeneric()
         local gen = genericType()
-        table.insert(state.Generics, gen :: GenericType) -- TODO luau cast (maybe?)
+        table.insert(state.Generics, gen)
 
         return gen
     end
@@ -1655,14 +1619,14 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             return primitiveType("number")
 
         elseif expr.Operator == "#" then
-            local operand = infer(state, expr.Operand, unionType(primitiveType("string"), primitiveType("list")))
+            local operand = infer(state, expr.Operand, unionType({ primitiveType("string"), primitiveType("list") }))
 
             if not operand then
                 return errorReport(`Attempted to use '#' on expression that returns no value.`, expr.Operand.Position)
             end
 
-            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Operand.Position, operand, unionType(primitiveType("string"), primitiveType("list"))))
-            return operand
+            table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Operand.Position, operand, unionType({ primitiveType("string"), primitiveType("list") })))
+            return primitiveType("number")
         else
             unreachable(expr.Operator)
             error(`Unreachable.`)
@@ -1794,7 +1758,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             error(`Cannot infer '{ expr.Operator }' operations.`)
         end
     elseif expr.Type == "Function" then
-        local gens = table.create<<GenericType>>(#expr.Function.Parameters)
+        local gens = table.create<<Type>>(#expr.Function.Parameters)
         local params = table.create<<Type>>(#expr.Function.Parameters)
 
         for i, param in expr.Function.Parameters do
@@ -1859,13 +1823,13 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                 eliminateFree(ty.LowerBound, "<nested lower>")
 
                 if ty.LowerBound.Kind == "never" and ty.UpperBound.Kind == "unknown" then
-                    local gen = genericType() :: GenericType
+                    local gen = genericType()
 
                     if logInference then
                         print(`Generalizing { typeToString(ty) } to '{ typeToString(gen) }'`)
                     end
 
-                    freeTypeSubstitutions[ty] = gen :: Type
+                    freeTypeSubstitutions[ty] = gen
                     table.insert(gens, gen)
                 else
                     local replacement = if ty.LowerBound.Kind ~= "never" then normalize(ty.LowerBound) else normalize(ty.UpperBound)
@@ -1935,20 +1899,31 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             freeTypeSubstitutions[ty] = substituteAllIn(sub, freeTypeSubstitutions, traversed)
         end
 
-        local fty = functionType(gens, params, varTy or neverType(), if typeof(retTy) == "table" then retTy else nil)
-        fty = substituteAllIn(fty, freeTypeSubstitutions, traversed)
+        for i, param in params do
+            params[i] = substituteAllIn(param, freeTypeSubstitutions, traversed)
+        end
 
-        assert(fty.Kind == "Function")
+        if varTy then
+            varTy = substituteAllIn(varTy, freeTypeSubstitutions, traversed)
+        else
+            varTy = neverType()
+        end
+
+        if typeof(retTy) == "table" then
+            retTy = substituteAllIn(retTy, freeTypeSubstitutions, traversed)
+        end
 
         -- Trim unused generics, e.g. `let x = function(f, y) return f(y) end`.
-        local gensCheck = table.clone(fty.Generics)
-        table.clear(fty.Generics)
+        local gensCheck = table.clone(gens)
+        table.clear(gens)
 
         for _, gen in gensCheck do
             if traversed[gen] then
-                table.insert(fty.Generics, gen)
+                table.insert(gens, gen)
             end
         end
+
+        local fty = functionType(gens, params, varTy, if typeof(retTy) == "table" then retTy else nil)
 
         if expr.Function.Name then
             typeAssociations[expr.Function.Name] = {
@@ -1986,7 +1961,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
             if thisRet then
                 if retTy.Kind == "Free" then
-                    state.ReturnType = makeUnion(retTy.LowerBound, thisRet)
+                    retTy.LowerBound = makeUnion(retTy.LowerBound, thisRet)
 
                     assert(state.ReturnType ~= true)
                     return assert(state.ReturnType)
@@ -2009,7 +1984,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         local fnTy = fn.Type
 
-        local gens = {}
+        local gens: { Type } = {}
         local arguments = table.create<<Type>>(#expr.Call.Arguments)
 
         for i, a in expr.Call.Arguments do
@@ -2018,7 +1993,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         end
 
         if fnTy.Kind == "Function" and #fnTy.Generics > 0 then
-            local genericSubstitutions = {}
+            local genericSubstitutions: { [Type]: Type } = {}
 
             for _, gen in fnTy.Generics do
                 genericSubstitutions[gen] = freeType()
