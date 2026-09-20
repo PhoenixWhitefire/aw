@@ -1682,7 +1682,11 @@ end
 
 type InferenceState = {
     Generics: { Type },
-    ReturnType: Type? | true,
+    -- `true` = We're inferring a return type, but we haven't come across a `return` yet.
+    -- `false`= Function is explicitly annotated as returning no value.
+    -- `Type` = `FreeType`: We're currently inferring a return type.
+    -- `Type` = Other: The return type was explicitly annotated.
+    ReturnType: nil | Type | boolean,
     Variadic: Type?,
     SubtypeConstraints: { SubtypeConstraint },
 }
@@ -1958,7 +1962,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         local prevRetTy = state.ReturnType
         state.Generics = gens
         state.ReturnType = if expected and expected.Kind == "Function" then expected.Returns
-                            else if expr.Function.ReturnAnnotation then typeAnnotationToType(expr.Position, expr.Function.ReturnAnnotation)
+                            else if expr.Function.ReturnAnnotation then if expr.Function.ReturnAnnotation.Kind == "Unit" then false else typeAnnotationToType(expr.Position, expr.Function.ReturnAnnotation)
                             else true
 
         if expr.Function.Variadic.Present then
@@ -2068,8 +2072,13 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             end
 
             assert(state.ReturnType ~= true)
+            assert(state.ReturnType ~= false)
             return state.ReturnType
         elseif retTy ~= nil then
+            if retTy == false then
+                return errorReport(`Function is annotated as returning no value, got 'return' statement here.`, expr.Position)
+            end
+
             local thisRet
 
             if expr.Return then
@@ -2242,6 +2251,8 @@ end
 function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnotation): Type
     if annotation.Kind == "Error" then
         return errorType()
+    elseif annotation.Kind == "Unit" then
+        return errorReport(`Unexpected '()'.`, position)
     elseif annotation.Kind == "Reference" then
         local ty = typeEnv[annotation.Reference]
 

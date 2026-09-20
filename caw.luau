@@ -112,6 +112,11 @@ type ErroneousAnnotation = {
     read Kind: "Error",
 }
 
+-- `()` in function return annotations.
+type UnitTypeAnnotation = {
+    read Kind: "Unit",
+}
+
 type ReferenceAnnotation = {
     read Kind: "Reference",
     read Reference: string,
@@ -156,6 +161,7 @@ type IntersectionTypeAnnotation = {
 
 export type TypeAnnotation =
     | ErroneousAnnotation
+    | UnitTypeAnnotation
     | ReferenceAnnotation
     | ListTypeAnnotation
     | SingletonTypeAnnotation
@@ -625,7 +631,7 @@ function parseTypeAnnotation(state: ParseState, report: Report, shallow: boolean
             report(`Expected '->', got { maybeArrow.Type } instead.`, maybeArrow)
         -- ... but `(T)` is.
         else
-            ty = params[1]
+            ty = params[1] or { Kind = "Unit" }
         end
     elseif annotation.Type == "OpenCurlyBraces" then
         local itemTy = parseTypeAnnotation(state, report)
