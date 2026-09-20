@@ -617,8 +617,8 @@ function parseTypeAnnotation(state: ParseState, report: Report, shallow: boolean
 
             local returns = parseTypeAnnotation(state, report)
 
-            if returns.Kind == "Error" then
-                returns = nil -- For `(T) -> ()`, `()` will parse as `{ Kind = "Error" }` due to `ty = params[1]`.
+            if returns.Kind == "Unit" then
+                returns = nil
             end
 
             ty = {

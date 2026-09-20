@@ -1961,7 +1961,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         local prevVarTy = state.Variadic
         local prevRetTy = state.ReturnType
         state.Generics = gens
-        state.ReturnType = if expected and expected.Kind == "Function" then expected.Returns
+        state.ReturnType = if expected and expected.Kind == "Function" then if expected.Returns == nil then false else expected.Returns
                             else if expr.Function.ReturnAnnotation then if expr.Function.ReturnAnnotation.Kind == "Unit" then false else typeAnnotationToType(expr.Position, expr.Function.ReturnAnnotation)
                             else true
 
