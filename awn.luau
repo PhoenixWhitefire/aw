@@ -1624,8 +1624,8 @@ local function gatherFreeTypeSubstitutions(ty: Type, name: string, freeTypeSubst
 
         freeTypeSubstitutions[ty] = neverType() -- Prevent re-entering.
 
-        gatherFreeTypeSubstitutions(ty.UpperBound, "<nested upper>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
-        gatherFreeTypeSubstitutions(ty.LowerBound, "<nested lower>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+        gatherFreeTypeSubstitutions(ty.UpperBound, name, freeTypeSubstitutions, gens, expr, alwaysConcretize)
+        gatherFreeTypeSubstitutions(ty.LowerBound, `lower bound of { name }`, freeTypeSubstitutions, gens, expr, alwaysConcretize)
 
         -- TODO: For `h_hof`. We do another check for if the free type received any bounds at all, as by default parameters have a Negative polarity,
         -- so it would concretize to `unknown` instead of generalizing.
@@ -1643,34 +1643,34 @@ local function gatherFreeTypeSubstitutions(ty: Type, name: string, freeTypeSubst
             local bound = normalizationToType(replacement)
 
             if logInference then
-                print(`Concretizing '{ typeToString(ty) }' to '{ typeToString(bound) }'`)
+                print(`Concretizing { typeToString(ty) } to '{ typeToString(bound) }' ({ if ty.Polarity == "Negative" then "upper bound" else "lower bound" })`)
             end
 
             freeTypeSubstitutions[ty] = bound
 
             if isNever(replacement) then
-                errorReport(`Parameter '{ name }' has conflicting usage and was reduced to 'never'. This function is not callable with any possible value.`, expr.Position)
+                errorReport(`{ name } has conflicting usage and was reduced to 'never'. This function is not callable with any possible value.`, expr.Position)
             end
         end
 
     elseif ty.Kind == "List" then
-        gatherFreeTypeSubstitutions(ty.Items, "<nested list items>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+        gatherFreeTypeSubstitutions(ty.Items, name .. "[X]", freeTypeSubstitutions, gens, expr, alwaysConcretize)
     elseif ty.Kind == "Function" then
         for i, param in ty.Parameters do
-            gatherFreeTypeSubstitutions(param, "<nested parameter>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+            gatherFreeTypeSubstitutions(param, `parameter { i } of { name }`, freeTypeSubstitutions, gens, expr, alwaysConcretize)
         end
 
-        gatherFreeTypeSubstitutions(ty.Variadic, "<nested variadic>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+        gatherFreeTypeSubstitutions(ty.Variadic, `variadic argument type of { name }`, freeTypeSubstitutions, gens, expr, alwaysConcretize)
 
         if ty.Returns then
-            gatherFreeTypeSubstitutions(ty.Returns, "<nested return>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+            gatherFreeTypeSubstitutions(ty.Returns, `return type of { name }`, freeTypeSubstitutions, gens, expr, alwaysConcretize)
         end
     elseif ty.Kind == "Union" or ty.Kind == "Intersection" then
         for i, c in ty.Components do
-            gatherFreeTypeSubstitutions(c, "<nested union or intersection component>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+            gatherFreeTypeSubstitutions(c, `a component of the { string.lower(ty.Kind) } of { name }`, freeTypeSubstitutions, gens, expr, alwaysConcretize)
         end
     elseif ty.Kind == "Negation" then
-        gatherFreeTypeSubstitutions(ty.Negated, "<nested negation>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+        gatherFreeTypeSubstitutions(ty.Negated, `negation of { name }`, freeTypeSubstitutions, gens, expr, alwaysConcretize)
     elseif ty.Kind == "unknown" or ty.Kind == "never" or ty.Kind == "error" or ty.Kind == "Primitive"
         or ty.Kind == "GenericInstantiation" or ty.Kind == "Generic" or ty.Kind == "Singleton"
     then
@@ -1692,13 +1692,6 @@ type InferenceState = {
 }
 
 local function infer(state: InferenceState, expr: caw.Expression, expected: Type?): Type?
-    local function addGeneric()
-        local gen = genericType()
-        table.insert(state.Generics, gen)
-
-        return gen
-    end
-
     if expr.Type == "Constant" then
         if expr.Constant.Type == "boolean" or expr.Constant.Type == "string" then
             return singletonType(expr.Constant.Value)
@@ -1708,7 +1701,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
     elseif expr.Type == "Declaration" then
         local anno = if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation) else nil
-        local expect = anno or addGeneric()
+        local expect = anno or freeType()
 
         local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value, expect) else primitiveType("nil")
 
@@ -1995,7 +1988,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             local paramTy = params[i]
 
             if paramTy.Kind == "Free" then
-                gatherFreeTypeSubstitutions(paramTy, param.Name, freeTypeSubstitutions, gens, expr)
+                gatherFreeTypeSubstitutions(paramTy, `parameter '{ param.Name }'`, freeTypeSubstitutions, gens, expr)
             end
         end
 
@@ -2054,7 +2047,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         local retTy = state.ReturnType
 
         if retTy == true then
-            local inferred = expr.Return and infer(state, expr.Return, addGeneric())
+            local inferred = expr.Return and infer(state, expr.Return, freeType())
 
             if inferred then
                 if inferred.Kind == "Free" then
@@ -2082,7 +2075,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             local thisRet
 
             if expr.Return then
-                thisRet = infer(state, expr.Return, if retTy.Kind == "Free" then addGeneric() else retTy)
+                thisRet = infer(state, expr.Return, if retTy.Kind == "Free" then freeType() else retTy)
 
                 if thisRet and thisRet.Kind == "Free" then
                     polarizePositive(thisRet)
@@ -2118,7 +2111,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         local arguments = table.create<<Type>>(#expr.Call.Arguments)
 
         for i, a in expr.Call.Arguments do
-            local expect = (fnTy.Kind == "Function" and fnTy.Parameters[i]) or addGeneric()
+            local expect = (fnTy.Kind == "Function" and fnTy.Parameters[i]) or freeType()
             arguments[i] = infer(state, a, expect)
         end
 
@@ -2143,7 +2136,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         local substitutions = {}
         local newGens = {}
-        gatherFreeTypeSubstitutions(fnTy, "function", substitutions, newGens, expr, true)
+        gatherFreeTypeSubstitutions(fnTy, "function call", substitutions, newGens, expr, true)
 
         -- assert(#newGens == 0)
         local traversed = {}
