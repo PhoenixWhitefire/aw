@@ -129,6 +129,28 @@ let h_hof = function(hx, hz, hw)
     return hn
 end
 
+let h_compose = function(hx, hy)
+    return function(hz)
+        return hy(hx(hz))
+    end
+end
+
+let h_add1 = function(hax)
+    return hax + 1
+end
+
+let h_mul2 = function(hay)
+    return hay * 2
+end
+
+let h_hofresult = h_hof(h_add1, h_mul2, 3)
+
+let h_add1mul2 = h_compose(h_add1, h_mul2)
+let h_result = h_add1mul2(4)
+
+print(h_hofresult)
+print(h_result)
+
 let i_list = function(l, i, t)
     return l[i] = t
 end

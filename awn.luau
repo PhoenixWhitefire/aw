@@ -1205,7 +1205,7 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?): st
         if tyvar.Name then
             return tyvar.Name
         else
-            local name = `'{ string.char((freeTypeNameCount + 19) % 26 + 78) }`
+            local name = `'{ string.char(freeTypeNameCount % 26 + 97) }`
 
             if freeTypeNameCount > 25 then
                 name ..= freeTypeNameCount // 25 + 1
@@ -1627,7 +1627,9 @@ local function gatherFreeTypeSubstitutions(ty: Type, name: string, freeTypeSubst
         gatherFreeTypeSubstitutions(ty.UpperBound, "<nested upper>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
         gatherFreeTypeSubstitutions(ty.LowerBound, "<nested lower>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
 
-        if (ty.Polarity == "Unknown" or ty.Polarity == "Mixed") and not alwaysConcretize then
+        -- TODO: For `h_hof`. We do another check for if the free type received any bounds at all, as by default parameters have a Negative polarity,
+        -- so it would concretize to `unknown` instead of generalizing.
+        if (ty.Polarity == "Unknown" or ty.Polarity == "Mixed" or (ty.UpperBound.Kind == "unknown" and ty.LowerBound.Kind == "never")) and not alwaysConcretize then
             local gen = genericType()
 
             if logInference then
