@@ -71,11 +71,18 @@ type IntersectionType = {
     read Components: { read Type },
 }
 
+-- "Unknown"  = Not yet determined.
+-- "Negative" = Appears in contravariant positions only, take lower bound.
+-- "Positive" = Appears in covariant positions only, take upper bound.
+-- "Mixed"    = Appears in both kinds of positions, generalize.
+type Polarity = "Unknown" | "Negative" | "Positive" | "Mixed"
+
 type FreeType = {
     read Kind: "Free",
     Name: string?,
     UpperBound: Type,
     LowerBound: Type,
+    Polarity: Polarity,
 }
 
 type TypeData =
@@ -229,11 +236,12 @@ local function intersectionType(components: { read Type })
     }
 end
 
-local function freeType()
+local function freeType(upper: Type?, lower: Type?, polarity: Polarity?)
     return makeType{
         Kind = "Free",
-        UpperBound = unknownType(),
-        LowerBound = neverType(),
+        UpperBound = upper or unknownType(),
+        LowerBound = lower or neverType(),
+        Polarity = polarity or "Unknown",
     }
 end
 
@@ -1217,6 +1225,14 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?): st
     elseif ty.Kind == "Free" then
         local str = freeTypeName(ty)
 
+        if ty.Polarity == "Mixed" then
+            str = "/" .. str
+        elseif ty.Polarity == "Positive" then
+            str = "+" .. str
+        elseif ty.Polarity == "Negative" then
+            str = "-" .. str
+        end
+
         if not hideFtyBounds then
             if ty.UpperBound.Kind ~= "unknown" then
                 str ..= ` <: { typeToString(ty.UpperBound) }`
@@ -1409,6 +1425,28 @@ local function subtypeConstraint(position, sub, super): SubtypeConstraint
     }
 end
 
+local function polarizePositive(fty: Type)
+    assert(fty.Kind == "Free")
+
+    if fty.Polarity == "Unknown" then
+        fty.Polarity = "Positive"
+
+    elseif fty.Polarity == "Negative" then
+        fty.Polarity = "Mixed"
+    end
+end
+
+local function polarizeNegative(fty: Type)
+    assert(fty.Kind == "Free")
+
+    if fty.Polarity == "Unknown" then
+        fty.Polarity = "Negative"
+
+    elseif fty.Polarity == "Positive" then
+        fty.Polarity = "Mixed"
+    end
+end
+
 local function dispatchConstraints(state: InferenceState)
     for _, sc in state.SubtypeConstraints do
         if logInference then
@@ -1418,10 +1456,12 @@ local function dispatchConstraints(state: InferenceState)
         if sc.Sub.Kind == "Free" then
             if sc.Sub ~= sc.Super then
                 sc.Sub.UpperBound = makeIntersection(sc.Sub.UpperBound, sc.Super)
+                polarizeNegative(sc.Sub)
             end
         elseif sc.Super.Kind == "Free" then
             if sc.Sub ~= sc.Super then
                 sc.Super.LowerBound = makeUnion(sc.Super.LowerBound, sc.Sub)
+                polarizePositive(sc.Super)
             end
         else
             check(sc.Sub, sc.Super, sc.Position)
@@ -1567,7 +1607,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         end
 
     elseif expr.Type == "List" then
-        local itemsTy = if expected and expected.Kind == "List" then expected.Items else freeType()
+        local itemsTy = if expected and expected.Kind == "List" then expected.Items else freeType(nil, nil, "Positive")
 
         for _, item in expr.List do
             local itemTy = infer(state, item, itemsTy) or errorReport(`Expression does not return a value.`, item.Position)
@@ -1579,7 +1619,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         return listType(itemsTy)
 
     elseif expr.Type == "ReadIndex" then
-        local itemsTy = expected or freeType()
+        local itemsTy = expected or freeType(nil, nil, "Positive")
 
         local listTy = infer(state, expr.List, listType(itemsTy)) or errorReport(`Tried to index an expression that returned no value.`, expr.List.Position)
         local indexTy = infer(state, expr.Index, primitiveType("number")) or errorReport(`Index was an expression that returned no value.`, expr.Index.Position)
@@ -1590,7 +1630,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         return itemsTy
 
     elseif expr.Type == "WriteIndex" then
-        local itemsTy = expected or freeType()
+        local itemsTy = expected or freeType(nil, nil, "Positive")
 
         local listTy = infer(state, expr.List, listType(itemsTy)) or errorReport(`Tried to index an expression that returned no value.`, expr.List.Position)
         local indexTy = infer(state, expr.Index, primitiveType("number")) or errorReport(`Index was an expression that returned no value.`, expr.Index.Position)
@@ -1763,8 +1803,8 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         for i, param in expr.Function.Parameters do
             local ty = if param.Annotation then typeAnnotationToType(expr.Position, param.Annotation)
-                        else if expected and expected.Kind == "Function" then expected.Parameters[i] or freeType()
-                        else freeType()
+                        else if expected and expected.Kind == "Function" then expected.Parameters[i] or freeType(nil, nil, "Negative") -- Parameters are a contravariant position.
+                        else freeType(nil, nil, "Negative") -- Ditto.
 
             params[i] = ty
 
@@ -1776,7 +1816,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         if expr.Function.Name then
             typeAssociations[expr.Function.Name] = {
-                Type = functionType({}, params, neverType(), freeType()),
+                Type = functionType({}, params, neverType(), freeType(nil, nil, "Negative")),
                 Expression = expr,
             }
 
@@ -1790,7 +1830,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         state.ReturnType = if expected and expected.Kind == "Function" then expected.Returns else true
 
         if expr.Function.Variadic.Present then
-            state.Variadic = freeType()
+            state.Variadic = freeType(nil, nil, "Negative") -- Variadic parameter is still in a contravariant position.
         else
             state.Variadic = nil
         end
@@ -1822,7 +1862,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                 eliminateFree(ty.UpperBound, "<nested upper>")
                 eliminateFree(ty.LowerBound, "<nested lower>")
 
-                if ty.LowerBound.Kind == "never" and ty.UpperBound.Kind == "unknown" then
+                if ty.Polarity == "Unknown" or ty.Polarity == "Mixed" then
                     local gen = genericType()
 
                     if logInference then
@@ -1832,7 +1872,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                     freeTypeSubstitutions[ty] = gen
                     table.insert(gens, gen)
                 else
-                    local replacement = if ty.LowerBound.Kind ~= "never" then normalize(ty.LowerBound) else normalize(ty.UpperBound)
+                    local replacement = if ty.Polarity == "Positive" then normalize(ty.LowerBound) else normalize(ty.UpperBound)
                     local bound = normalizationToType(replacement)
 
                     if logInference then
@@ -1941,11 +1981,16 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             local inferred = expr.Return and infer(state, expr.Return, addGeneric())
 
             if inferred then
-                state.ReturnType = makeType{
-                    Kind = "Free",
-                    UpperBound = unknownType(),
-                    LowerBound = inferred,
-                }
+                if inferred.Kind == "Free" then
+                    polarizePositive(inferred)
+                end
+
+                state.ReturnType = freeType(
+                    unknownType(),
+                    inferred,
+                    -- Return value is a covariant position.
+                    "Positive"
+                )
             else
                 state.ReturnType = nil
             end
@@ -1957,6 +2002,10 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
             if expr.Return then
                 thisRet = infer(state, expr.Return, addGeneric())
+
+                if thisRet and thisRet.Kind == "Free" then
+                    polarizePositive(thisRet)
+                end
             end
 
             if thisRet then
@@ -1996,7 +2045,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             local genericSubstitutions: { [Type]: Type } = {}
 
             for _, gen in fnTy.Generics do
-                genericSubstitutions[gen] = freeType()
+                genericSubstitutions[gen] = freeType(nil, nil, "Negative")
             end
 
             fnTy = substituteAllIn(fnTy, genericSubstitutions, {})

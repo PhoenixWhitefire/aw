@@ -91,6 +91,14 @@ let b_bounds2 = function(by)
     let bz: string = by(nil)
 end
 
+let b_genericlowerbounds = function(bh, bj)
+    if true then
+        return bh
+    else
+        return bj
+    end
+end
+
 type c_semantic = (string | nil) & (number | nil)
 let c_semA: c_semantic
 let c_semB: nil
