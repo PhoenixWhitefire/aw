@@ -781,24 +781,28 @@ type RequiredBoundsChange =
           read UnionLowerWith: Type?,
       }
 
+type SubtypingVariance = "Covariant" | "Contravariant" | "Invariant"
+
 type SubtypingResult =
     | {
         read Holds: true,
+        Variance: SubtypingVariance,
         read FailedPath: nil,
         -- Changes to free type bounds we need to make so that the relation holds.
         read RequiredBoundsChanges: { read RequiredBoundsChange },
       }
     | {
         read Holds: false,
+        Variance: SubtypingVariance,
         read FailedPath: string,
       }
 
-local function subtypeSuccess(changes: { read RequiredBoundsChange }?): SubtypingResult
-    return { Holds = true, RequiredBoundsChanges = changes or {} }
+local function subtypeSuccess(changes: { read RequiredBoundsChange }?, variance: SubtypingVariance?): SubtypingResult
+    return { Holds = true, Variance = variance or "Covariant", RequiredBoundsChanges = changes or {} }
 end
 
-local function subtypeFailure(failed): SubtypingResult
-    return { Holds = false, FailedPath = failed }
+local function subtypeFailure(failed, variance: SubtypingVariance?): SubtypingResult
+    return { Holds = false, Variance = variance or "Covariant", FailedPath = failed }
 end
 
 local function normalizedNil()
@@ -913,7 +917,7 @@ local function intersectApplicableReturns(components: { NormalizedFunctionCompon
 end
 
 local function decomposeToSingletons(n: NormalizedType): { NormalizedType }?
-    if n.Top or n.Number or n.Function or n.Generic or n.Free then
+    if n.Top or n.Number or n.List or n.Function or n.Generic or n.Free then
         return nil
     end
 
@@ -1137,6 +1141,33 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
 
     local requiredChanges = {}
 
+    if a.List and not b.List then
+        return subtypeFailure(`Unexpected list.`)
+    -- `list </: { T }
+    elseif a.List and not a.List.Items and b.List and b.List.Items then
+        return subtypeFailure(`'list' top type is not a subtype of any '\{ T }' type.`)
+    elseif a.List and a.List.Items and b.List and b.List.Items then
+        -- Check invariantly.
+        -- `T <: U && U <: T` is equivalent to `T == U`.
+        local first = isSubtypeOf(a.List.Items, b.List.Items)
+
+        if not first.Holds then
+            first.Variance = "Invariant"
+            return first
+        end
+
+        table.move(first.RequiredBoundsChanges, 1, #first.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+
+        local second = isSupertypeOf(a.List.Items, b.List.Items)
+
+        if not second.Holds then
+            second.Variance = "Invariant"
+            return second
+        end
+
+        table.move(second.RequiredBoundsChanges, 1, #second.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+    end
+
     if a.Function and not b.Function then
         return subtypeFailure("Unexpected function.")
     -- `function </: ((A) -> B) & ((C) -> D) & ...`
@@ -1144,7 +1175,7 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         local result = isFunctionSubtypeOf(a.Function, b.Function)
 
         if result.Holds then
-            requiredChanges = result.RequiredBoundsChanges
+            table.move(result.RequiredBoundsChanges, 1, #result.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
         else
             return result
         end
@@ -1172,7 +1203,10 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
 end
 
 function isSupertypeOf(a: NormalizedType, b: NormalizedType)
-    return isSubtypeOf(b, a)
+    local result = isSubtypeOf(b, a)
+    result.Variance = "Contravariant"
+
+    return result
 end
 
 local genericTypeNameCount = 0
@@ -2307,7 +2341,7 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
     end
 end
 
-local function reportMismatch(a: Type, na: NormalizedType, b: Type, nb: NormalizedType, position: caw.Position, reason: string)
+local function reportMismatch(a: Type, na: NormalizedType, b: Type, nb: NormalizedType, position: caw.Position, result: SubtypingResult)
     local err = `{ position.Line }:{ position.Character }: Type error: `
 
     local as = typeToString(a)
@@ -2319,7 +2353,15 @@ local function reportMismatch(a: Type, na: NormalizedType, b: Type, nb: Normaliz
         err ..= `(aka '{ nas }') `
     end
 
-    err ..= "is not a subtype of "
+    err ..= "is not "
+
+    if result.Variance == "Covariant" then
+        err ..= "a subtype of "
+    elseif result.Variance == "Contravariant" then
+        err ..= "a supertype of "
+    else
+        err ..= "exactly "
+    end
 
     local bs = typeToString(b)
     local nbs = normalizationToString(nb)
@@ -2330,7 +2372,7 @@ local function reportMismatch(a: Type, na: NormalizedType, b: Type, nb: Normaliz
         err ..= ` (aka '{ nbs }')`
     end
 
-    err ..= `. { reason }`
+    err ..= `. { result.FailedPath }`
 
     print(err)
 end
@@ -2429,7 +2471,7 @@ function check(inferred: Type, annotation: Type, position: caw.Position, printNo
     local subtypeResult = isSubtypeOf(normalizedInference, normalizedAnnotation)
 
     if not subtypeResult.Holds then
-        reportMismatch(inferred, normalizedInference, annotation, normalizedAnnotation, position, subtypeResult.FailedPath)
+        reportMismatch(inferred, normalizedInference, annotation, normalizedAnnotation, position, subtypeResult)
     elseif printNote then
         print(`'{ typeToString(inferred) }' is a subtype of '{ typeToString(annotation) }'.`)
     end
