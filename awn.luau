@@ -769,18 +769,32 @@ local isSubtypeOf
 local isSupertypeOf
 local normalizationToType
 
+type RequiredBoundsChange =
+    | {
+          read Target: Type,
+          read IntersectUpperWith: Type?,
+          read UnionLowerWith: nil,
+      }
+    | {
+          read Target: Type,
+          read IntersectUpperWith: nil,
+          read UnionLowerWith: Type?,
+      }
+
 type SubtypingResult =
     | {
         read Holds: true,
         read FailedPath: nil,
+        -- Changes to free type bounds we need to make so that the relation holds.
+        read RequiredBoundsChanges: { read RequiredBoundsChange },
       }
     | {
         read Holds: false,
         read FailedPath: string,
       }
 
-local function subtypeSuccess(): SubtypingResult
-    return { Holds = true }
+local function subtypeSuccess(changes: { read RequiredBoundsChange }?): SubtypingResult
+    return { Holds = true, RequiredBoundsChanges = changes or {} }
 end
 
 local function subtypeFailure(failed): SubtypingResult
@@ -834,12 +848,54 @@ local function deepCopy(tab: any): any
     return t
 end
 
+local function polarizePositive(fty: Type)
+    assert(fty.Kind == "Free")
+
+    if fty.Polarity == "Unknown" then
+        fty.Polarity = "Positive"
+
+    elseif fty.Polarity == "Negative" then
+        fty.Polarity = "Mixed"
+    end
+end
+
+local function polarizeNegative(fty: Type)
+    assert(fty.Kind == "Free")
+
+    if fty.Polarity == "Unknown" then
+        fty.Polarity = "Negative"
+
+    elseif fty.Polarity == "Positive" then
+        fty.Polarity = "Mixed"
+    end
+end
+
+local function applyBoundsChanges(changes: { read RequiredBoundsChange })
+    for _, change in changes do
+        assert(change.Target.Kind == "Free")
+
+        if change.IntersectUpperWith then
+            change.Target.UpperBound = makeIntersection(change.Target.UpperBound, change.IntersectUpperWith)
+            polarizeNegative(change.Target)
+        else
+            assert(change.UnionLowerWith)
+            change.Target.LowerBound = makeUnion(change.Target.LowerBound, change.UnionLowerWith)
+            polarizePositive(change.Target)
+        end
+    end
+end
+
 local function intersectApplicableReturns(components: { NormalizedFunctionComponentType }, argument: NormalizedType): NormalizedType?
     local applicable = {}
 
     for _, c in components do
-        if #c.Parameters == 1 and isSubtypeOf(argument, c.Parameters[1]).Holds then
-            table.insert(applicable, c.Return)
+        if #c.Parameters == 1 then
+            local result = isSubtypeOf(argument, c.Parameters[1])
+
+            if result.Holds then
+                applyBoundsChanges(result.RequiredBoundsChanges)
+                table.insert(applicable, c.Return)
+            end
         end
     end
 
@@ -901,6 +957,8 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
         return subtypeFailure(`Unexpected 'top' function type.`)
     end
 
+    local requiredChanges = {}
+
     for i, cb in b.Components do
         local singles = nil
 
@@ -919,7 +977,9 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
                 if cb.Return then
                     local result = isSubtypeOf(car, cb.Return)
 
-                    if not result.Holds then
+                    if result.Holds then
+                        table.move(result.RequiredBoundsChanges, 1, #result.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+                    else
                         return subtypeFailure(`With '{ dumpNormalization(single) }': { result.FailedPath }`)
                     end
                 end
@@ -947,7 +1007,9 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
                 for i, param in ca.Parameters do
                     local paramResult = isSupertypeOf(param, cb.Parameters[i])
 
-                    if not paramResult.Holds then
+                    if paramResult.Holds then
+                        table.move(paramResult.RequiredBoundsChanges, 1, #paramResult.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+                    else
                         table.insert(
                             failed,
                             `'{ signature }' does not accept parameter #{ i } '{ dumpNormalization(cb.Parameters[i]) }'.`
@@ -964,7 +1026,9 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
                 if ca.Return and cb.Return then
                     local returnResult = isSubtypeOf(ca.Return, cb.Return)
 
-                    if not returnResult.Holds then
+                    if returnResult.Holds then
+                        table.move(returnResult.RequiredBoundsChanges, 1, #returnResult.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+                    else
                         table.insert(
                             failed,
                             `'{ signature }' does not return '{ dumpNormalization(cb.Return) }'.`
@@ -991,7 +1055,7 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
         end
     end
 
-    return subtypeSuccess()
+    return subtypeSuccess(requiredChanges)
 end
 
 function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
@@ -1001,6 +1065,32 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
 
     if b.Top then
         return subtypeSuccess()
+    end
+
+    if a.Free then
+        local changes = {}
+
+        for _, free in a.Free do
+            table.insert(changes, {
+                Target = free.Free,
+                IntersectUpperWith = normalizationToType(b),
+            })
+        end
+
+        return subtypeSuccess(changes)
+    end
+
+    if b.Free then
+        local changes = {}
+
+        for _, free in b.Free do
+            table.insert(changes, {
+                Target = free.Free,
+                UnionLowerWith = normalizationToType(a),
+            })
+        end
+
+        return subtypeSuccess(changes)
     end
 
     if a.Nil and not b.Nil then
@@ -1045,13 +1135,17 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         end
     end
 
+    local requiredChanges = {}
+
     if a.Function and not b.Function then
         return subtypeFailure("Unexpected function.")
     -- `function </: ((A) -> B) & ((C) -> D) & ...`
     elseif a.Function and b.Function then
         local result = isFunctionSubtypeOf(a.Function, b.Function)
 
-        if not result.Holds then
+        if result.Holds then
+            requiredChanges = result.RequiredBoundsChanges
+        else
             return result
         end
     end
@@ -1074,7 +1168,7 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         end
     end
 
-    return subtypeSuccess()
+    return subtypeSuccess(requiredChanges)
 end
 
 function isSupertypeOf(a: NormalizedType, b: NormalizedType)
@@ -1425,47 +1519,19 @@ local function subtypeConstraint(position, sub, super): SubtypeConstraint
     }
 end
 
-local function polarizePositive(fty: Type)
-    assert(fty.Kind == "Free")
-
-    if fty.Polarity == "Unknown" then
-        fty.Polarity = "Positive"
-
-    elseif fty.Polarity == "Negative" then
-        fty.Polarity = "Mixed"
-    end
-end
-
-local function polarizeNegative(fty: Type)
-    assert(fty.Kind == "Free")
-
-    if fty.Polarity == "Unknown" then
-        fty.Polarity = "Negative"
-
-    elseif fty.Polarity == "Positive" then
-        fty.Polarity = "Mixed"
-    end
-end
-
 local function dispatchConstraints(state: InferenceState)
     for _, sc in state.SubtypeConstraints do
         if logInference then
             print(`Dispatching '{ typeToString(sc.Sub) } <?: { typeToString(sc.Super) }'`)
         end
 
-        if sc.Sub.Kind == "Free" then
-            if sc.Sub ~= sc.Super then
-                sc.Sub.UpperBound = makeIntersection(sc.Sub.UpperBound, sc.Super)
-                polarizeNegative(sc.Sub)
-            end
-        elseif sc.Super.Kind == "Free" then
-            if sc.Sub ~= sc.Super then
-                sc.Super.LowerBound = makeUnion(sc.Super.LowerBound, sc.Sub)
-                polarizePositive(sc.Super)
-            end
-        else
-            check(sc.Sub, sc.Super, sc.Position)
+        local result = isSubtypeOf(normalize(sc.Sub), normalize(sc.Super))
+
+        if result.Holds then
+            applyBoundsChanges(result.RequiredBoundsChanges)
         end
+
+        check(sc.Sub, sc.Super, sc.Position)
     end
 
     table.clear(state.SubtypeConstraints)
@@ -1548,6 +1614,68 @@ function substituteAllIn(ty, substitutions, traversed: { [Type]: true }): Type
     traversed[replacement] = true
 
     return replacement
+end
+
+local function gatherFreeTypeSubstitutions(ty: Type, name: string, freeTypeSubstitutions: { [Type]: Type }, gens: { Type }, expr: caw.Expression, alwaysConcretize: boolean?)
+    if ty.Kind == "Free" then
+        if freeTypeSubstitutions[ty] then
+            return -- Do not re-generalize/concretize.
+        end
+
+        freeTypeSubstitutions[ty] = neverType() -- Prevent re-entering.
+
+        gatherFreeTypeSubstitutions(ty.UpperBound, "<nested upper>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+        gatherFreeTypeSubstitutions(ty.LowerBound, "<nested lower>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+
+        if (ty.Polarity == "Unknown" or ty.Polarity == "Mixed") and not alwaysConcretize then
+            local gen = genericType()
+
+            if logInference then
+                print(`Generalizing { typeToString(ty) } to '{ typeToString(gen) }'`)
+            end
+
+            freeTypeSubstitutions[ty] = gen
+            table.insert(gens, gen)
+        else
+            local replacement = if ty.Polarity == "Negative" then normalize(ty.UpperBound) else normalize(ty.LowerBound)
+            local bound = normalizationToType(replacement)
+
+            if logInference then
+                print(`Concretizing '{ typeToString(ty) }' to '{ typeToString(bound) }'`)
+            end
+
+            freeTypeSubstitutions[ty] = bound
+
+            if isNever(replacement) then
+                errorReport(`Parameter '{ name }' has conflicting usage and was reduced to 'never'. This function is not callable with any possible value.`, expr.Position)
+            end
+        end
+
+    elseif ty.Kind == "List" then
+        gatherFreeTypeSubstitutions(ty.Items, "<nested list items>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+    elseif ty.Kind == "Function" then
+        for i, param in ty.Parameters do
+            gatherFreeTypeSubstitutions(param, "<nested parameter>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+        end
+
+        gatherFreeTypeSubstitutions(ty.Variadic, "<nested variadic>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+
+        if ty.Returns then
+            gatherFreeTypeSubstitutions(ty.Returns, "<nested return>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+        end
+    elseif ty.Kind == "Union" or ty.Kind == "Intersection" then
+        for i, c in ty.Components do
+            gatherFreeTypeSubstitutions(c, "<nested union or intersection component>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+        end
+    elseif ty.Kind == "Negation" then
+        gatherFreeTypeSubstitutions(ty.Negated, "<nested negation>", freeTypeSubstitutions, gens, expr, alwaysConcretize)
+    elseif ty.Kind == "unknown" or ty.Kind == "never" or ty.Kind == "error" or ty.Kind == "Primitive"
+        or ty.Kind == "GenericInstantiation" or ty.Kind == "Generic" or ty.Kind == "Singleton"
+    then
+        -- Nothing.
+    else
+        unreachable(ty.Kind)
+    end
 end
 
 type InferenceState = {
@@ -1853,78 +1981,18 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             print(`Eliminating free types: { typeToString(functionType(gens, params, varTy or neverType(), if typeof(retTy) == "table" then retTy else nil)) }`)
         end
 
-        local function eliminateFree(ty: Type, name: string)
-            if ty.Kind == "Free" then
-                if freeTypeSubstitutions[ty] then
-                    return -- Do not re-generalize/concretize.
-                end
-
-                eliminateFree(ty.UpperBound, "<nested upper>")
-                eliminateFree(ty.LowerBound, "<nested lower>")
-
-                if ty.Polarity == "Unknown" or ty.Polarity == "Mixed" then
-                    local gen = genericType()
-
-                    if logInference then
-                        print(`Generalizing { typeToString(ty) } to '{ typeToString(gen) }'`)
-                    end
-
-                    freeTypeSubstitutions[ty] = gen
-                    table.insert(gens, gen)
-                else
-                    local replacement = if ty.Polarity == "Positive" then normalize(ty.LowerBound) else normalize(ty.UpperBound)
-                    local bound = normalizationToType(replacement)
-
-                    if logInference then
-                        print(`Concretizing '{ typeToString(ty) }' to '{ typeToString(bound) }'`)
-                    end
-
-                    freeTypeSubstitutions[ty] = bound
-
-                    if isNever(replacement) then
-                        errorReport(`Parameter '{ name }' has conflicting usage and was reduced to 'never'. This function is not callable with any possible value.`, expr.Position)
-                    end
-                end
-
-            elseif ty.Kind == "List" then
-                eliminateFree(ty.Items, "<nested list items>")
-            elseif ty.Kind == "Function" then
-                for i, param in ty.Parameters do
-                    eliminateFree(param, "<nested parameter>")
-                end
-
-                eliminateFree(ty.Variadic, "<nested variadic>")
-
-                if ty.Returns then
-                    eliminateFree(ty.Returns, "<nested return>")
-                end
-            elseif ty.Kind == "Union" or ty.Kind == "Intersection" then
-                for i, c in ty.Components do
-                    eliminateFree(c, "<nested union or intersection component>")
-                end
-            elseif ty.Kind == "Negation" then
-                eliminateFree(ty.Negated, "<nested negation>")
-            elseif ty.Kind == "unknown" or ty.Kind == "never" or ty.Kind == "error" or ty.Kind == "Primitive"
-                or ty.Kind == "GenericInstantiation" or ty.Kind == "Generic" or ty.Kind == "Singleton"
-            then
-                -- Nothing.
-            else
-                unreachable(ty.Kind)
-            end
-        end
-
         for i, param in expr.Function.Parameters do
             typeAssociations[param.Name] = nil
 
             local paramTy = params[i]
 
             if paramTy.Kind == "Free" then
-                eliminateFree(paramTy, param.Name)
+                gatherFreeTypeSubstitutions(paramTy, param.Name, freeTypeSubstitutions, gens, expr)
             end
         end
 
         if varTy then
-            eliminateFree(varTy, "...")
+            gatherFreeTypeSubstitutions(varTy, "...", freeTypeSubstitutions, gens, expr)
         end
 
         local traversed = {}
@@ -2049,12 +2117,24 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             end
 
             fnTy = substituteAllIn(fnTy, genericSubstitutions, {})
+
+            -- Remove now-useless generic parameters.
+            assert(fnTy.Kind == "Function")
+            fnTy = functionType({}, fnTy.Parameters, fnTy.Variadic, fnTy.Returns)
         end
 
         local checkFnTy = functionType(gens, arguments, neverType(), expected)
         table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, fnTy, checkFnTy))
 
         dispatchConstraints(state)
+
+        local substitutions = {}
+        local newGens = {}
+        gatherFreeTypeSubstitutions(fnTy, "function", substitutions, newGens, expr, true)
+
+        -- assert(#newGens == 0)
+        local traversed = {}
+        fnTy = substituteAllIn(fnTy, substitutions, traversed)
 
         local normFn = if fnTy.Kind == "Free" then normalize(fnTy.UpperBound) else normalize(fnTy)
 
@@ -2095,7 +2175,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         return normalizationToType(normReturn)
 
-    elseif expr.Type == "IfCondition" :: "IfCondition" then -- TODO luau cast?
+    elseif expr.Type == "IfCondition" then -- TODO luau cast?
         local result = nil
 
         for _, v in expr.IfBody do
