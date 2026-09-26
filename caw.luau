@@ -132,14 +132,20 @@ type ListTypeAnnotation = {
     read Items: TypeAnnotation,
 }
 
+type GenericTypeAnnotation = {
+    read Kind: "Generic",
+    read Name: string,
+}
+
 type FunctionTypeAnnotation = {
     read Kind: "Function",
+    read Generics: { read GenericTypeAnnotation },
     read Parameters: { read TypeAnnotation },
     read Returns: TypeAnnotation?,
 }
 
-type GenericInstantiationTypeAnnotation = {
-    read Kind: "GenericInstantiation",
+type AliasInstantiationTypeAnnotation = {
+    read Kind: "AliasInstantiation",
     read Name: string,
     read Arguments: { read TypeAnnotation },
 }
@@ -165,8 +171,9 @@ export type TypeAnnotation =
     | ReferenceAnnotation
     | ListTypeAnnotation
     | SingletonTypeAnnotation
+    | GenericTypeAnnotation
     | FunctionTypeAnnotation
-    | GenericInstantiationTypeAnnotation
+    | AliasInstantiationTypeAnnotation
     | NegationTypeAnnotation
     | UnionTypeAnnotation
     | IntersectionTypeAnnotation
@@ -231,7 +238,7 @@ type ExpressionData =
         read Type: "Function",
         read Function: {
             read Name: string?,
-            read Generics: { read string }?,
+            read Generics: { read GenericTypeAnnotation },
             read Parameters: { read FunctionParameter },
             read Variadic: FunctionVariadicParameter,
             read ReturnAnnotation: TypeAnnotation?,
@@ -528,6 +535,31 @@ function maybeCombineWithTypeOperator(state: ParseState, report: Report, left: T
     end
 end
 
+local function parseGenericParameterList(state: ParseState, report: Report): { read GenericTypeAnnotation }
+    local maybeCloser, consumeCloser = peekNextToken(state)
+    local gens = {}
+
+    while maybeCloser.Type ~= "Operator" or maybeCloser.Operator ~= ">" do
+        local gen = nextToken(state)
+
+        if gen.Type ~= "Identifier" then
+            report(`Expected generic name, got { gen.Type } instead.`, gen)
+            break
+        end
+
+        table.insert(gens, { Kind = "Generic", Name = gen.Identifier })
+        maybeCloser, consumeCloser = peekNextToken(state)
+
+        if maybeCloser.Type == "Comma" then
+            consumeCloser()
+            maybeCloser, consumeCloser = peekNextToken(state)
+        end
+    end
+
+    consumeCloser()
+    return gens
+end
+
 function parseTypeAnnotation(state: ParseState, report: Report, shallow: boolean?): TypeAnnotation
     local annotation = nextToken(state)
     local ty: TypeAnnotation? = nil
@@ -554,7 +586,7 @@ function parseTypeAnnotation(state: ParseState, report: Report, shallow: boolean
             consumeCloseInstantiation()
 
             ty = {
-                Kind = "GenericInstantiation",
+                Kind = "AliasInstantiation",
                 Name = annotation.Identifier,
                 Arguments = typeArguments,
             }
@@ -593,6 +625,22 @@ function parseTypeAnnotation(state: ParseState, report: Report, shallow: boolean
             Kind = "Negation",
             Negated = parseTypeAnnotation(state, report, true),
         }
+    elseif annotation.Type == "Operator" and annotation.Operator == "<" then
+        local gens = parseGenericParameterList(state, report)
+        local next = peekNextToken(state)
+        local func = parseTypeAnnotation(state, report)
+
+        if func.Kind == "Function" then
+            ty = {
+                Kind = "Function",
+                Generics = gens,
+                Parameters = func.Parameters,
+                Returns = func.Returns,
+            }
+        else
+           report(`Expected function type to follow generic parameter list, got { func.Kind } instead.`, next)
+        end
+
     elseif annotation.Type == "OpenParentheses" then
         local params = {}
         local definitelyFunction = false
@@ -623,6 +671,7 @@ function parseTypeAnnotation(state: ParseState, report: Report, shallow: boolean
 
             ty = {
                 Kind = "Function",
+                Generics = {},
                 Parameters = params,
                 Returns = returns,
             }
@@ -741,11 +790,17 @@ function maybeCombineWithBinaryOperation(state: ParseState, report: Report, left
 end
 
 local function parseFunction(state: ParseState, report: Report, token: Token): Expression
+    local gens = {}
     local name = nil
     local openParenTk = nextToken(state)
 
     if openParenTk.Type == "Identifier" then
         name = openParenTk.Identifier
+        openParenTk = nextToken(state)
+    end
+
+    if openParenTk.Type == "Operator" and openParenTk.Operator == "<" then
+        gens = parseGenericParameterList(state, report)
         openParenTk = nextToken(state)
     end
 
@@ -813,6 +868,7 @@ local function parseFunction(state: ParseState, report: Report, token: Token): E
         Type = "Function",
         Function = {
             Name = name,
+            Generics = gens,
             Parameters = parameters,
             Variadic = variadic,
             ReturnAnnotation = returnTypeAnnotation,

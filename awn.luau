@@ -51,9 +51,9 @@ type FunctionType = {
 }
 
 -- Types of the form `T<U>`, where they can't resolve immediately but instead
--- need to be "instantiated".
-type GenericInstantiationType = {
-    read Kind: "GenericInstantiation",
+-- need to be "expanded".
+type PendingExpansionType = {
+    read Kind: "PendingExpansion",
     read Name: string,
     read Arguments: { read Type },
 }
@@ -96,7 +96,7 @@ type TypeData =
     | SingletonType
     | GenericType
     | FunctionType
-    | GenericInstantiationType
+    | PendingExpansionType
     | NegationType
     | UnionType
     | IntersectionType
@@ -124,7 +124,6 @@ type NormalizedFreeType = {
 
 type NormalizedType = {
     Error:   boolean,
-    Top:     boolean,
     Nil:     boolean,
     -- `nil` = not present.
     Boolean: {
@@ -149,6 +148,8 @@ type NormalizedType = {
     -- Union of free types.
     Free: { NormalizedFreeType }?,
 }
+
+local typeToString
 
 local function unreachable(x: never): never
     error(`Unexpected branch with value '{ x }' ({ typeof(x) }), this is an internal error.`)
@@ -216,9 +217,9 @@ local function functionType(generics: { read Type }, parameters: { read Type }, 
     }
 end
 
-local function genericInstantationType(name: string, arguments: { read Type })
+local function pendingExpansionType(name: string, arguments: { read Type })
     return makeType{
-        Kind = "GenericInstantiation",
+        Kind = "PendingExpansion",
         Name = name,
         Arguments = arguments,
     }
@@ -320,7 +321,6 @@ end
 
 local function toNever(n: NormalizedType)
     n.Error = false
-    n.Top = false
     n.Nil = false
     n.Boolean = nil
     n.Number = false
@@ -332,7 +332,6 @@ end
 
 local function toUnknown(n: NormalizedType)
     n.Error = false
-    n.Top = true
     n.Nil = true
     n.Boolean = {}
     n.Number = true
@@ -350,11 +349,8 @@ local function isNever(n: NormalizedType)
 end
 
 local function isUnknown(n: NormalizedType)
-    assert((not not (n.Nil and n.Boolean and n.Number and n.String and n.List and n.Function and n.Generic and n.Free)) == n.Top)
-    return n.Top
+    return not not (n.Nil and n.Boolean and n.Number and n.String and n.List and n.Function and n.Generic and n.Free)
 end
-
-local typeToString
 
 local function dumpNormalization(n: NormalizedType)
     local t = {}
@@ -363,7 +359,7 @@ local function dumpNormalization(n: NormalizedType)
         table.insert(t, "*error*")
     end
 
-    if n.Top then
+    if isUnknown(n) then
         table.insert(t, "unknown")
         return table.concat(t, " | ")
     end
@@ -491,7 +487,6 @@ end
 
 local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
     n.Error = n.Error or with.Error
-    n.Top = n.Top or with.Top
     n.Nil = n.Nil or with.Nil
     n.Number = n.Number or with.Number
 
@@ -562,7 +557,6 @@ end
 
 local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
     n.Error = n.Error or with.Error
-    n.Top = n.Top and with.Top
     n.Nil = n.Nil and with.Nil
     n.Boolean = n.Boolean and with.Boolean
     n.Number = n.Number and with.Number
@@ -694,10 +688,10 @@ local function normalize(ty: Type): NormalizedType
             }
         }
 
-    elseif ty.Kind == "GenericInstantiation" then
+    elseif ty.Kind == "PendingExpansion" then
         toUnknown(n)
         n.Error = true
-        print(`Cannot normalize generic instantiations.`)
+        print(`Cannot normalize pending expansions.`)
 
     elseif ty.Kind == "Negation" then
         n = normalize(ty.Negated)
@@ -796,6 +790,7 @@ type SubtypingResult =
         read FailedPath: nil,
         -- Changes to free type bounds we need to make so that the relation holds.
         read RequiredBoundsChanges: { read RequiredBoundsChange },
+        read Instantiations: { read [Type]: Type },
       }
     | {
         read Holds: false,
@@ -804,7 +799,12 @@ type SubtypingResult =
       }
 
 local function subtypeSuccess(changes: { read RequiredBoundsChange }?, variance: SubtypingVariance?): SubtypingResult
-    return { Holds = true, Variance = variance or "Covariant", RequiredBoundsChanges = changes or {} }
+    return {
+        Holds = true,
+        Variance = variance or "Covariant",
+        RequiredBoundsChanges = changes or {},
+        Instantiations = {},
+    }
 end
 
 local function subtypeFailure(failed, variance: SubtypingVariance?): SubtypingResult
@@ -898,6 +898,31 @@ local function applyBoundsChanges(changes: { read RequiredBoundsChange })
         else
             assert(change.UnionLowerWith)
             change.Target.LowerBound = makeUnion(change.Target.LowerBound, change.UnionLowerWith)
+            --[[
+                TODO: For:
+
+                function fac(n)
+                    if n > 1 then
+                        return n * fac(n - 1)
+                    else
+                        return n
+                    end
+                end
+
+                , if we polarize here, `n` is incorrectly generalized and `fac` is inferred as `<T>(T) -> number | T`.
+                `>` is only valid for `number`s. `n`'s free type receives `number` as both its lower *and* upper bound
+                during inference.
+
+                If we do not polarize, then:
+
+                function id(x)
+                    return x
+                end
+
+                let y = id(5)
+
+                , leaves `y` as `'d`.
+            ]]--
             polarizePositive(change.Target)
         end
 
@@ -933,7 +958,7 @@ local function intersectApplicableReturns(components: { NormalizedFunctionCompon
 end
 
 local function decomposeToSingletons(n: NormalizedType): { NormalizedType }?
-    if n.Top or n.Number or n.List or n.Function or n.Generic or n.Free then
+    if n.Number or n.List or n.Function or n.Generic or n.Free then
         return nil
     end
 
@@ -966,6 +991,12 @@ local function decomposeToSingletons(n: NormalizedType): { NormalizedType }?
     return singles
 end
 
+local function copyTable(source, dest)
+    for k, v in source do
+        dest[k] = v
+    end
+end
+
 local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunctionType): SubtypingResult
     -- `((A) -> B) & ((C) -> D) & ... <: function`
     if not b.Components then
@@ -978,6 +1009,7 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
     end
 
     local requiredChanges = {}
+    local instantiations = {}
 
     for i, cb in b.Components do
         local singles = nil
@@ -999,6 +1031,7 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
 
                     if result.Holds then
                         table.move(result.RequiredBoundsChanges, 1, #result.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+                        copyTable(result.Instantiations, instantiations)
                     else
                         return subtypeFailure(`With '{ dumpNormalization(single) }': { result.FailedPath }`)
                     end
@@ -1029,6 +1062,7 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
 
                     if paramResult.Holds then
                         table.move(paramResult.RequiredBoundsChanges, 1, #paramResult.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+                        copyTable(paramResult.Instantiations, instantiations)
                     else
                         table.insert(
                             failed,
@@ -1048,6 +1082,7 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
 
                     if returnResult.Holds then
                         table.move(returnResult.RequiredBoundsChanges, 1, #returnResult.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+                        copyTable(returnResult.Instantiations, instantiations)
                     else
                         table.insert(
                             failed,
@@ -1075,7 +1110,12 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
         end
     end
 
-    return subtypeSuccess(requiredChanges)
+    return {
+        Holds = true,
+        Variance = "Covariant",
+        RequiredBoundsChanges = requiredChanges,
+        Instantiations = instantiations,
+    }
 end
 
 function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
@@ -1083,8 +1123,20 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         return subtypeSuccess()
     end
 
-    if b.Top then
-        return subtypeSuccess()
+    if b.Generic and #b.Generic > 0 then
+        local at = normalizationToType(a)
+        local toInstantiate = {}
+
+        for _, gen in b.Generic do
+            toInstantiate[gen] = at
+        end
+
+        return {
+            Holds = true,
+            Variance = "Covariant",
+            RequiredBoundsChanges = {},
+            Instantiations = toInstantiate,
+        }
     end
 
     if a.Free then
@@ -1156,6 +1208,7 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
     end
 
     local requiredChanges = {}
+    local instantiations = {}
 
     if a.List and not b.List then
         return subtypeFailure(`Unexpected list.`)
@@ -1173,6 +1226,7 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         end
 
         table.move(first.RequiredBoundsChanges, 1, #first.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+        copyTable(first.Instantiations, instantiations)
 
         local second = isSupertypeOf(a.List.Items, b.List.Items)
 
@@ -1182,6 +1236,7 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         end
 
         table.move(second.RequiredBoundsChanges, 1, #second.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+        copyTable(first.Instantiations, instantiations)
     end
 
     if a.Function and not b.Function then
@@ -1192,6 +1247,7 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
 
         if result.Holds then
             table.move(result.RequiredBoundsChanges, 1, #result.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+            copyTable(result.Instantiations, instantiations)
         else
             return result
         end
@@ -1213,7 +1269,12 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         end
     end
 
-    return subtypeSuccess(requiredChanges)
+    return {
+        Holds = true,
+        Variance = "Covariant",
+        RequiredBoundsChanges = requiredChanges,
+        Instantiations = instantiations,
+    }
 end
 
 function isSupertypeOf(a: NormalizedType, b: NormalizedType)
@@ -1314,7 +1375,7 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?): st
 
         return str
 
-    elseif ty.Kind == "GenericInstantiation" then
+    elseif ty.Kind == "PendingExpansion" then
         local arguments = table.create<<string>>(#ty.Arguments)
 
         for i, a in ty.Arguments do
@@ -1570,13 +1631,34 @@ end
 local function dispatchConstraints(state: InferenceState)
     for _, sc in state.SubtypeConstraints do
         if logInference then
-            print(`Dispatching '{ typeToString(sc.Sub) } <?: { typeToString(sc.Super) }'`)
+            print(`Dispatching '{ typeToString(sc.Sub) } <: { typeToString(sc.Super) }'`)
         end
 
         local result = isSubtypeOf(normalize(sc.Sub), normalize(sc.Super))
 
         if result.Holds then
-            applyBoundsChanges(result.RequiredBoundsChanges)
+            if #result.RequiredBoundsChanges > 0 then
+                applyBoundsChanges(result.RequiredBoundsChanges)
+            end
+
+            for gen, ty in result.Instantiations do
+                assert(gen.Kind == "Generic")
+
+                if state.Generics[gen] then
+                    if sc.Super.Kind == "Generic" and sc.Sub.Kind ~= "Generic" then
+                        ty = sc.Sub
+                    end
+
+                    local prev = state.Instantiations[gen] or neverType()
+                    state.Instantiations[gen] = unionType({ prev, ty })
+
+                    if logInference then
+                        print(`Instantiating { gen.Name } to { typeToString(ty) }`)
+                    end
+                else
+                    print(`Generic '{ gen.Name }' is not within scope to instantiate to '{ typeToString(sc.Super) }' (with subtype '{ typeToString(sc.Sub) }')`)
+                end
+            end
         end
 
         check(sc.Sub, sc.Super, sc.Position)
@@ -1643,14 +1725,14 @@ local function substituteAllIn_(ty: Type, substitutions: { read [Type]: Type }, 
 
         return intersectionType(components)
 
-    elseif ty.Kind == "GenericInstantiation" then
+    elseif ty.Kind == "PendingExpansion" then
         local arguments = table.create<<Type>>(#ty.Arguments)
 
         for i, a in ty.Arguments do
             arguments[i] = substituteAllIn(a, substitutions, traversed)
         end
 
-        return genericInstantationType(ty.Name, arguments)
+        return pendingExpansionType(ty.Name, arguments)
     else
         unreachable(ty.Kind)
         error(`Unreachable.`)
@@ -1739,7 +1821,7 @@ local function gatherFreeTypeSubstitutions(ty: Type, name: string, freeTypeSubst
     elseif ty.Kind == "Negation" then
         gatherFreeTypeSubstitutions(ty.Negated, `negation of { name }`, freeTypeSubstitutions, gens, expr, alwaysConcretize)
     elseif ty.Kind == "unknown" or ty.Kind == "never" or ty.Kind == "error" or ty.Kind == "Primitive"
-        or ty.Kind == "GenericInstantiation" or ty.Kind == "Generic" or ty.Kind == "Singleton"
+        or ty.Kind == "PendingExpansion" or ty.Kind == "Generic" or ty.Kind == "Singleton"
     then
         -- Nothing.
     else
@@ -1748,7 +1830,8 @@ local function gatherFreeTypeSubstitutions(ty: Type, name: string, freeTypeSubst
 end
 
 type InferenceState = {
-    Generics: { Type },
+    Generics: { [Type]: true | nil },
+    Instantiations: { [Type]: Type },
     -- `true` = We're inferring a return type, but we haven't come across a `return` yet.
     -- `false`= Function is explicitly annotated as returning no value.
     -- `Type` = `FreeType`: We're currently inferring a return type.
@@ -1993,6 +2076,13 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         end
     elseif expr.Type == "Function" then
         local gens = table.create<<Type>>(#expr.Function.Parameters)
+
+        for _, gen in expr.Function.Generics do
+            local genTy = typeAnnotationToType(expr.Position, gen)
+            typeEnv[gen.Name] = genTy
+            table.insert(gens, genTy)
+        end
+
         local params = table.create<<Type>>(#expr.Function.Parameters)
 
         for i, param in expr.Function.Parameters do
@@ -2017,10 +2107,8 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             table.insert(typeAssociationsOrdered, expr.Function.Name)
         end
 
-        local prevGenerics = state.Generics
         local prevVarTy = state.Variadic
         local prevRetTy = state.ReturnType
-        state.Generics = gens
         state.ReturnType = if expected and expected.Kind == "Function" then if expected.Returns == nil then false else expected.Returns
                             else if expr.Function.ReturnAnnotation then if expr.Function.ReturnAnnotation.Kind == "Unit" then false else typeAnnotationToType(expr.Position, expr.Function.ReturnAnnotation)
                             else true
@@ -2039,7 +2127,6 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         local retTy = state.ReturnType
         local varTy = state.Variadic
-        state.Generics = prevGenerics
         state.ReturnType = prevRetTy
         state.Variadic = prevVarTy
 
@@ -2180,35 +2267,35 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         end
 
         local fnTy = fn.Type
-
-        local gens: { Type } = {}
         local arguments = table.create<<Type>>(#expr.Call.Arguments)
+        local prevInstantiations = table.clone(state.Instantiations)
+        state.Instantiations = {}
+
+        if fnTy.Kind == "Function" then
+            for _, gen in fnTy.Generics do
+                state.Generics[gen] = true
+            end
+        end
 
         for i, a in expr.Call.Arguments do
             local expect = (fnTy.Kind == "Function" and fnTy.Parameters[i]) or freeType()
             arguments[i] = infer(state, a, expect)
         end
 
-        if fnTy.Kind == "Function" and #fnTy.Generics > 0 then
-            local genericSubstitutions: { [Type]: Type } = {}
-
-            for _, gen in fnTy.Generics do
-                genericSubstitutions[gen] = freeType("Negative")
-            end
-
-            fnTy = substituteAllIn(fnTy, genericSubstitutions, {})
-
-            -- Remove now-useless generic parameters.
-            assert(fnTy.Kind == "Function")
-            fnTy = functionType({}, fnTy.Parameters, fnTy.Variadic, fnTy.Returns)
-        end
-
-        local checkFnTy = functionType(gens, arguments, neverType(), expected)
+        local checkFnTy = functionType({}, arguments, neverType(), expected)
         table.insert(state.SubtypeConstraints, subtypeConstraint(expr.Position, fnTy, checkFnTy))
 
         dispatchConstraints(state)
 
-        local substitutions = {}
+        if fnTy.Kind == "Function" then
+            for _, gen in fnTy.Generics do
+                state.Generics[gen] = nil
+            end
+        end
+
+        local substitutions = state.Instantiations
+        state.Instantiations = prevInstantiations
+
         local newGens = {}
         gatherFreeTypeSubstitutions(fnTy, "function call", substitutions, newGens, expr, true)
 
@@ -2334,23 +2421,35 @@ function typeAnnotationToType(position: caw.Position, annotation: caw.TypeAnnota
     elseif annotation.Kind == "Singleton" then
         return singletonType(annotation.Value)
 
+    elseif annotation.Kind == "Generic" then
+        local genTy = genericType(annotation.Name)
+
+        typeEnv[annotation.Name] = genTy
+        return genTy
+
     elseif annotation.Kind == "Function" then
+        local gens = table.create<<Type>>(#annotation.Generics)
+
+        for i, gen in annotation.Generics do
+            gens[i] = typeAnnotationToType(position, gen)
+        end
+
         local params = table.create<<Type>>(#annotation.Parameters)
 
         for i, param in annotation.Parameters do
             params[i] = typeAnnotationToType(position, param)
         end
 
-        return functionType({}, params, neverType(), if annotation.Returns then typeAnnotationToType(position, annotation.Returns) else nil)
+        return functionType(gens, params, neverType(), if annotation.Returns then typeAnnotationToType(position, annotation.Returns) else nil)
 
-    elseif annotation.Kind == "GenericInstantiation" then
+    elseif annotation.Kind == "AliasInstantiation" then
         local arguments = table.create<<Type>>(#annotation.Arguments)
 
         for i, a in annotation.Arguments do
             arguments[i] = typeAnnotationToType(position, a)
         end
 
-        return genericInstantationType(annotation.Name, arguments)
+        return pendingExpansionType(annotation.Name, arguments)
 
     elseif annotation.Kind == "Negation" then
         return makeType{
@@ -2425,7 +2524,7 @@ function instantiateType(ty: Type): Type
         or ty.Kind == "Free" or ty.Kind == "Function" or ty.Kind == "List"
     then
         inited = ty
-    elseif ty.Kind == "GenericInstantiation" then
+    elseif ty.Kind == "PendingExpansion" then
         if ty.Name == "issubtypeof" then
             if #ty.Arguments ~= 2 then
                 inited = errorReport(`Expected exactly 2 type arguments to 'issubtypeof' type, got { #ty.Arguments } instead.`, { Line = 1, Character = 1, Offset = 1 })
@@ -2522,6 +2621,7 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
 
     local state: InferenceState = {
         Generics = {},
+        Instantiations = {},
         ReturnType = nil,
         SubtypeConstraints = {},
     }
