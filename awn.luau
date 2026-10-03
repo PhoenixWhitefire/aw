@@ -238,12 +238,11 @@ local function intersectionType(components: { read Type })
     }
 end
 
-local function freeType(polarity: Polarity?, upper: Type?, lower: Type?)
+local function freeType(upper: Type?, lower: Type?)
     return makeType{
         Kind = "Free",
         UpperBound = upper or unknownType(),
         LowerBound = lower or neverType(),
-        Polarity = polarity or "Unknown",
     }
 end
 
@@ -627,6 +626,8 @@ local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
 
     if n.Free and not with.Free then
         n.Free = nil
+    elseif not n.Free and with.Free then
+        n.Free = table.clone(with.Free)
     elseif n.Free and #n.Free == 0 and with.Free and #with.Free > 0 then
         n.Free = table.clone(with.Free)
     end
@@ -772,6 +773,10 @@ local isSubtypeOf
 local isSupertypeOf
 local normalizationToType
 
+local function simplify(ty: Type)
+    return normalizationToType(normalize(ty))
+end
+
 type RequiredBoundsChange =
     | {
           read Target: Type,
@@ -859,53 +864,22 @@ local function deepCopy(tab: any): any
     return t
 end
 
-local function polarize(current: Polarity, desired: Polarity): Polarity
-    if current == "Unknown" or current == desired then
-        return desired
-    else
-        return "Mixed"
-    end
-end
-
 local function applyBoundsChanges(changes: { read RequiredBoundsChange })
     for _, change in changes do
         assert(change.Target.Kind == "Free")
 
         if change.IntersectUpperWith then
             change.Target.UpperBound = makeIntersection(change.Target.UpperBound, change.IntersectUpperWith)
-            -- polarizeNegative(change.Target)
         else
             assert(change.UnionLowerWith)
             change.Target.LowerBound = makeUnion(change.Target.LowerBound, change.UnionLowerWith)
-            --[[
-                TODO: For:
-
-                function fac(n)
-                    if n > 1 then
-                        return n * fac(n - 1)
-                    else
-                        return n
-                    end
-                end
-
-                , if we polarize here, `n` is incorrectly generalized and `fac` is inferred as `<T>(T) -> number | T`.
-                `>` is only valid for `number`s. `n`'s free type receives `number` as both its lower *and* upper bound
-                during inference.
-
-                If we do not polarize, then:
-
-                function id(x)
-                    return x
-                end
-
-                let y = id(5)
-
-                , leaves `y` as `'d`.
-            ]]--
-            -- polarizePositive(change.Target)
         end
 
-        assert(isSubtypeOf(normalize(change.Target.LowerBound), normalize(change.Target.UpperBound)).Holds)
+        local consistencyResult = isSubtypeOf(normalize(change.Target.LowerBound), normalize(change.Target.UpperBound))
+
+        if not consistencyResult.Holds then
+            print(`Internal error: { typeToString(change.Target) } has incompatible bounds: { typeToString(simplify(change.Target.LowerBound)) } </: { typeToString(simplify(change.Target.UpperBound)) }`)
+        end
     end
 end
 
@@ -1087,17 +1061,6 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         return subtypeSuccess()
     end
 
-    if b.Generic and #b.Generic > 0 then
-        local at = normalizationToType(a)
-        local toInstantiate = {}
-
-        for _, gen in b.Generic do
-            toInstantiate[gen] = at
-        end
-
-        return subtypeSuccess()
-    end
-
     if a.Free then
         -- TODO luau removing annotation causes read-write indexer mismatch error
         local changes: { RequiredBoundsChange } = {}
@@ -1234,10 +1197,6 @@ function isSupertypeOf(a: NormalizedType, b: NormalizedType)
     result.Variance = "Contravariant"
 
     return result
-end
-
-local function simplify(ty: Type)
-    return normalizationToType(normalize(ty))
 end
 
 local genericTypeNameCount = 0
@@ -1716,10 +1675,6 @@ local function gatherFreeTypeSubstitutions(state: GatherFreeTypeSubstitutionsSta
                     if isUnknown(normUpper) then
                         -- If there's no constraint, generalize.
                         replacement = genericType()
-
-                        if logInference then
-                            print(`Generalized { typeToString(ty, nil, true) } to { typeToString(replacement) }`)
-                        end
                     else
                         if logInference then
                             print(`{ typeToString(ty, nil, true) } upper bound '{ typeToString(ty.UpperBound) }' will be clipped for intersection with '{ typeToString(previous) }'`)
@@ -1733,10 +1688,6 @@ local function gatherFreeTypeSubstitutions(state: GatherFreeTypeSubstitutionsSta
 
                     if isUnknown(normUpper) then
                         replacement = genericType()
-
-                        if logInference then
-                            print(`Generalized { typeToString(ty, nil, true) } to { typeToString(replacement) }`)
-                        end
                     else
                         if logInference then
                             print(`{ typeToString(ty, nil, true) } upper bound '{ typeToString(ty.UpperBound) }' will be clipped`)
@@ -1752,22 +1703,30 @@ local function gatherFreeTypeSubstitutions(state: GatherFreeTypeSubstitutionsSta
             end
         end
 
-        if logInference then
-            if state.Polarity == "Positive" then
-                print(`Concretizing { typeToString(ty, nil, true) } to lower bound '{ typeToString(ty.LowerBound) }'`)
-            else
-                print(`Concretizing { typeToString(ty, nil, true) } to upper bound '{ typeToString(ty.UpperBound) }'`)
-            end
+        if state.Polarity ~= "Positive" and ty.UpperBound.Kind == "Intersection" and isNever(normalize(ty.UpperBound)) then
+            local nameCorrected = string.upper(string.sub(name, 1, 1)) .. string.sub(name, 2, #name)
+            state.Substitutions[ty] = errorReport(`{ nameCorrected } has been reduced to never, this function is not callable with any value.`, state.Expression.Position)
+        else
+            state.Substitutions[ty] = if state.Polarity == "Positive" then ty.LowerBound else ty.UpperBound
         end
 
-        state.Substitutions[ty] = if state.Polarity == "Positive" then ty.LowerBound else ty.UpperBound
         state.Polarities[ty] = state.Polarity
 
         gatherFreeTypeSubstitutions(state, ty.UpperBound, name)
         gatherFreeTypeSubstitutions(state, ty.LowerBound, `lower bound of { name }`)
 
     elseif ty.Kind == "List" then
+        local prevPolarity = state.Polarity
+
+        -- Lists are invariant. Force it to be generic.
+        state.Polarity = "Negative"
         gatherFreeTypeSubstitutions(state, ty.Items, name .. "[X]")
+
+        state.Polarity = "Positive"
+        gatherFreeTypeSubstitutions(state, ty.Items, name .. "[X]")
+
+        state.Polarity = prevPolarity
+
     elseif ty.Kind == "Function" then
         local prevPolarity = state.Polarity
         state.Polarity = "Positive"
@@ -1821,7 +1780,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
     elseif expr.Type == "Declaration" then
         local anno = if expr.Declaration.Annotation then typeAnnotationToType(expr.Position, expr.Declaration.Annotation) else nil
-        local expect = anno or freeType("Negative")
+        local expect = anno or freeType()
 
         local ty = if expr.Declaration.Value then infer(state, expr.Declaration.Value, expect) else primitiveType("nil")
 
@@ -1854,7 +1813,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         end
 
     elseif expr.Type == "List" then
-        local itemsTy = if expected and expected.Kind == "List" then expected.Items else freeType("Positive")
+        local itemsTy = if expected and expected.Kind == "List" then expected.Items else freeType()
 
         for _, item in expr.List do
             local itemTy = infer(state, item, itemsTy) or errorReport(`Expression does not return a value.`, item.Position)
@@ -1866,7 +1825,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         return listType(itemsTy)
 
     elseif expr.Type == "ReadIndex" then
-        local itemsTy = expected or freeType("Positive")
+        local itemsTy = expected or freeType()
 
         local listTy = infer(state, expr.List, listType(itemsTy)) or errorReport(`Tried to index an expression that returned no value.`, expr.List.Position)
         local indexTy = infer(state, expr.Index, primitiveType("number")) or errorReport(`Index was an expression that returned no value.`, expr.Index.Position)
@@ -1877,7 +1836,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         return itemsTy
 
     elseif expr.Type == "WriteIndex" then
-        local itemsTy = expected or freeType("Positive")
+        local itemsTy = expected or freeType()
 
         local listTy = infer(state, expr.List, listType(itemsTy)) or errorReport(`Tried to index an expression that returned no value.`, expr.List.Position)
         local indexTy = infer(state, expr.Index, primitiveType("number")) or errorReport(`Index was an expression that returned no value.`, expr.Index.Position)
@@ -2051,8 +2010,8 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         for i, param in expr.Function.Parameters do
             local ty = if param.Annotation then typeAnnotationToType(expr.Position, param.Annotation)
-                        else if expected and expected.Kind == "Function" then expected.Parameters[i] or freeType("Negative") -- Parameters are a contravariant position.
-                        else freeType("Negative") -- Ditto.
+                        else if expected and expected.Kind == "Function" then expected.Parameters[i] or freeType()
+                        else freeType()
 
             params[i] = ty
 
@@ -2064,7 +2023,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
 
         if expr.Function.Name then
             typeAssociations[expr.Function.Name] = {
-                Type = functionType({}, params, neverType(), freeType("Negative")),
+                Type = functionType({}, params, neverType(), freeType()),
                 Expression = expr,
             }
 
@@ -2078,7 +2037,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                             else true
 
         if expr.Function.Variadic.Present then
-            state.Variadic = freeType("Negative") -- Variadic parameter is still in a contravariant position.
+            state.Variadic = freeType()
         else
             state.Variadic = nil
         end
@@ -2190,12 +2149,10 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
         local retTy = state.ReturnType
 
         if retTy == true then
-            local inferred = expr.Return and infer(state, expr.Return, freeType("Positive"))
+            local inferred = expr.Return and infer(state, expr.Return, freeType())
 
             if inferred then
                 state.ReturnType = freeType(
-                    -- Return value is a covariant position.
-                    "Positive",
                     unknownType(),
                     inferred
                 )
@@ -2215,12 +2172,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             local thisRet
 
             if expr.Return then
-                thisRet = infer(state, expr.Return, if retTy.Kind == "Free" then freeType("Positive") else retTy)
-
-                if thisRet and thisRet.Kind == "Free" then
-                    -- TODO: Incorrectly results in `let x = function(y): string return y end` being generalized?
-                    -- polarizePositive(thisRet)
-                end
+                thisRet = infer(state, expr.Return, if retTy.Kind == "Free" then freeType() else retTy)
             end
 
             if thisRet then
@@ -2621,7 +2573,6 @@ local function bidisemi(expressions: { read caw.Expression }, options: { read Lo
 
     local state: InferenceState = {
         Generics = {},
-        Instantiations = {},
         ReturnType = nil,
         SubtypeConstraints = {},
     }
