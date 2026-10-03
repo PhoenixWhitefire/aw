@@ -150,7 +150,7 @@ local function exprToStringShallow(expr: caw.Expression)
 end
 
 local function errorReport(msg, expr: caw.Expression)
-    print(`{ expr.Position.Line }:{ expr.Position.Character } - { exprToStringShallow(expr) }: { msg }`)
+    print(`{ expr.Position.Line }:{ expr.Position.Column } - { exprToStringShallow(expr) }: { msg }`)
     return errorType()
 end
 
@@ -478,9 +478,9 @@ local function unify(a: Type, b: Type, expr: caw.Expression, depth: number?): bo
     if not success then
         -- Leaving the unification trail as diagnostics is bad.
         if depth > 1 then
-            print(`{ expr.Position.Line }:{ expr.Position.Character }: { typeToString(a) } is not { typeToString(b) }, so`)
+            print(`{ expr.Position.Line }:{ expr.Position.Column }: { typeToString(a) } is not { typeToString(b) }, so`)
         else
-            print(`{ expr.Position.Line }:{ expr.Position.Character }: { typeToString(a) } is not { typeToString(b) }.`)
+            print(`{ expr.Position.Line }:{ expr.Position.Column }: { typeToString(a) } is not { typeToString(b) }.`)
         end
     end
 
@@ -862,7 +862,7 @@ local function writeInferenceLogs()
 
     local function logInferenceStep(step: InferenceStep, indent: string?)
         indent = indent or ""
-        print(`{ indent }Infer { step.Source.Position.Line }:{ step.Source.Position.Character }:{ exprToStringShallow(step.Source) }.`)
+        print(`{ indent }Infer { step.Source.Position.Line }:{ step.Source.Position.Column }:{ exprToStringShallow(step.Source) }.`)
 
         for _, unification in step.Unifications do
             logUnificationStep(unification, indent .. "  ")

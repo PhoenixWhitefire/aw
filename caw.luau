@@ -105,7 +105,7 @@ type TokenData =
     | OperatorToken
     | BasicToken
 
-export type Position = { Line: number, Character: number, Offset: number }
+export type Position = { Line: number, Column: number, Offset: number }
 type Token = TokenData & { Position: Position }
 
 type ErroneousAnnotation = {
@@ -356,15 +356,15 @@ local function nextToken(state: ParseState): Token
 
     repeat
         c, state.Position.Offset = nextCharacter(state.Program, state.Position.Offset)
-        state.Position.Character += 1
+        state.Position.Column += 1
 
         if c == "\n" then
             state.Position.Line += 1
-            state.Position.Character = 1
+            state.Position.Column = 1
         end
     until not isWhitespace(c)
 
-    state.Position.Character += 1
+    state.Position.Column += 1
     local start = table.clone(state.Position)
 
     local function tk(t: TokenData): Token
@@ -392,7 +392,7 @@ local function nextToken(state: ParseState): Token
                 state.Position.Offset = pos
             until next == "\n" or isEof(next)
 
-            state.Position.Character = 1
+            state.Position.Column = 1
             state.Position.Line += 1
             return nextToken(state)
         end
@@ -485,6 +485,14 @@ local function peekNextToken(state: ParseState): (Token, () -> ())
     end
 end
 
+local function consumeOptionalComma(state: ParseState)
+    local next, consume = peekNextToken(state)
+
+    if next.Type == "Comma" then
+        consume()
+    end
+end
+
 type ParseState = {
     Program: string,
     Position: Position,
@@ -548,12 +556,9 @@ local function parseGenericParameterList(state: ParseState, report: Report): { r
         end
 
         table.insert(gens, { Kind = "Generic", Name = gen.Identifier })
-        maybeCloser, consumeCloser = peekNextToken(state)
 
-        if maybeCloser.Type == "Comma" then
-            consumeCloser()
-            maybeCloser, consumeCloser = peekNextToken(state)
-        end
+        consumeOptionalComma(state)
+        maybeCloser, consumeCloser = peekNextToken(state)
     end
 
     consumeCloser()
@@ -575,12 +580,9 @@ function parseTypeAnnotation(state: ParseState, report: Report, shallow: boolean
 
             while closeInstantiation.Type ~= "Operator" or closeInstantiation.Operator ~= ">" do
                 table.insert(typeArguments, parseTypeAnnotation(state, report))
-                closeInstantiation, consumeCloseInstantiation = peekNextToken(state)
 
-                if closeInstantiation.Type == "Comma" then
-                    consumeCloseInstantiation()
-                    closeInstantiation, consumeCloseInstantiation = peekNextToken(state)
-                end
+                consumeOptionalComma(state)
+                closeInstantiation, consumeCloseInstantiation = peekNextToken(state)
             end
 
             consumeCloseInstantiation()
@@ -677,7 +679,7 @@ function parseTypeAnnotation(state: ParseState, report: Report, shallow: boolean
             }
         -- `(T, U)` is not a valid annotation,
         elseif definitelyFunction then
-            report(`Expected '->', got { maybeArrow.Type } instead.`, maybeArrow)
+            report(`Expected '->' for function type, got { maybeArrow.Type } instead.`, maybeArrow)
         -- ... but `(T)` is.
         else
             ty = params[1] or { Kind = "Unit" }
@@ -826,11 +828,9 @@ local function parseFunction(state: ParseState, report: Report, token: Token): E
                 Annotation = maybeParseTypeAnnotation(state, report),
             })
             paramsPresent[paramTk.Identifier] = true
-            paramTk = nextToken(state)
 
-            if paramTk.Type == "Comma" then
-                paramTk = nextToken(state)
-            end
+            consumeOptionalComma(state)
+            paramTk = nextToken(state)
         elseif paramTk.Type == "Ellipsis" then
             variadic = {
                 Present = true,
@@ -1091,7 +1091,7 @@ function parseExpression(state: ParseState, report: Report, precedence: number?)
 
                 inner = parseExpression(state, report) or invalidExpr(state, `Got end-of-file parsing '{ token.Operator }' expression after parentheses.`, report)
                 state.Position.Offset += 1 -- skip closing parens
-                state.Position.Character += 1
+                state.Position.Column += 1
             elseif nextTk.Type == "Ellipsis" then
                 if token.Operator == "#" then
                     consumeNext()
@@ -1132,16 +1132,8 @@ function parseExpression(state: ParseState, report: Report, precedence: number?)
                 return invalidExpr(state, `Reached end-of-file parsing list items.`, report)
             end
 
+            consumeOptionalComma(state)
             itemTk, consumeClosingParentheses = peekNextToken(state)
-
-            if itemTk.Type ~= "CloseCurlyBraces" then
-                if itemTk.Type == "Comma" then
-                    consumeClosingParentheses()
-                    itemTk, consumeClosingParentheses = peekNextToken(state)
-                else
-                    return invalidExpr(state, `Expected comma or closing parentheses, got { itemTk.Type }.`, report)
-                end
-            end
         end
 
         consumeClosingParentheses()
@@ -1197,7 +1189,7 @@ function caw.parse(program: string): ParseResult
         Program = program,
         Position = {
             Line = 1,
-            Character = 1,
+            Column = 1,
             Offset = 1,
         },
         FunctionDepth = 0,
@@ -1211,7 +1203,7 @@ function caw.parse(program: string): ParseResult
     while tk.Type ~= "EndOfFile" do
         local expr = parseExpression(state, function(s, e)
             success = false
-            print(`{ e.Position.Line }:{ e.Position.Character }: { s }`)
+            print(`{ e.Position.Line }:{ e.Position.Column }: { s }`)
         end)
         assert(expr)
 
@@ -1345,7 +1337,7 @@ local function evaluate(expr: Expression): Value?
     assert(expr.Type ~= "InvalidSyntax")
 
     local function fail(msg): never
-        error(`{ expr.Position.Line }:{ expr.Position.Character }: { msg }`)
+        error(`{ expr.Position.Line }:{ expr.Position.Column }: { msg }`)
     end
 
     if expr.Type == "Declaration" then
