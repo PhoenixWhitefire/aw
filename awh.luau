@@ -1,4 +1,4 @@
--- awm.luau, detached from aw.luau on 08/09/2026
+-- awh.luau, detached from aw.luau on 08/09/2026
 -- Hindley-Milner style inference and checking.
 
 local caw = require("./caw")

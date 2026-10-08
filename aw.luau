@@ -218,7 +218,7 @@ local function prettyPrint(t: any, indent: string?)
 end
 
 local inferers = {
-    hm = require("./awm"),
+    hm = require("./awh"),
     sn = require("./awn"),
 }
 
