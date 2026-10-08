@@ -164,6 +164,16 @@ let i_listbidi = function(l, i)
     let li: string = l[i]
 end
 
+function j_fac(jn)
+    if jn == 1 then
+        return jn
+    else
+        return jn * j_fac(jn - 1)
+    end
+end
+
+print(j_fac(5))
+
 ]]
 
 local npProgram = [[
