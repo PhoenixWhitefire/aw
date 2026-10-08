@@ -353,7 +353,31 @@ local function isNever(n: NormalizedType)
 end
 
 local function isUnknown(n: NormalizedType)
-    return not not (n.Nil and n.Boolean and n.Number and n.String and n.List and n.Function)
+    -- Check for all tops.
+    return not not (
+        n.Nil
+        and (n.Boolean and n.Boolean.Value == nil)
+        and n.Number
+        and (n.String and not n.String.Cofinite and not n.String.Singletons)
+        and (n.List and not n.List.Items)
+        and (n.Function and not n.Function.Components)
+    )
+end
+
+-- TODO luau any
+local function deepCopy(tab: any): any
+    assert(typeof(tab) == "table")
+    local t = table.clone(tab)
+
+    for k, v in t do -- TODO luau, `intersect<>` should always reduce methinks? only occurs when function signature is `local function deepCopy<T>(tab: T & {}): T`
+        if typeof(v) == "table" then
+            t[k] = deepCopy(v)
+        else
+            t[k] = v
+        end
+    end
+
+    return t
 end
 
 local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
@@ -412,15 +436,19 @@ local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
     elseif n.Function and with.Function and not with.Function.Components and n.Function.Components then
         n.Function = {}
     elseif n.Function and with.Function and n.Function.Components and with.Function.Components then
-        table.move(with.Function.Components, 1, #with.Function.Components, #n.Function.Components + 1, n.Function.Components)
+        n.Function = {} -- No.
     end
 
     if with.Generic then
         local gens = n.Generic or {}
 
         for gen, intersect in with.Generic do
-            intersect = table.clone(intersect)
-            gens[gen] = if gens[gen] then unionNormalizedType(intersect, gens[gen]) else intersect
+            intersect = deepCopy(intersect)
+            if gens[gen] then
+                unionNormalizedType(intersect, gens[gen])
+            else
+                gens[gen] = intersect
+            end
         end
 
         n.Generic = gens
@@ -430,8 +458,12 @@ local function unionNormalizedType(n: NormalizedType, with: NormalizedType)
         local frees = n.Free or {}
 
         for free, intersect in with.Free do
-            intersect = table.clone(intersect)
-            frees[free] = if frees[free] then unionNormalizedType(intersect, frees[free]) else intersect
+            intersect = deepCopy(intersect)
+            if frees[free] then
+                unionNormalizedType(intersect, frees[free])
+            else
+                frees[free] = intersect
+            end
         end
 
         n.Free = frees
@@ -518,34 +550,6 @@ local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
         for free, intersect in n.Free do
             intersectNormalizedType(intersect, with)
         end
-    end
-
-    if with.Generic then
-        local gens = n.Generic or {}
-
-        for gen, intersect in with.Generic do
-            if gens[gen] then
-                intersectNormalizedType(gens[gen], intersect)
-            else
-                gens[gen] = intersect
-            end
-        end
-
-        n.Generic = gens
-    end
-
-    if with.Free then
-        local frees = n.Free or {}
-
-        for free, intersect in with.Free do
-            if frees[free] then
-                intersectNormalizedType(frees[free], intersect)
-            else
-                frees[free] = intersect
-            end
-        end
-
-        n.Free = frees
     end
 end
 
@@ -758,22 +762,6 @@ local function normalizedString(singleton: string?)
     return n
 end
 
--- TODO luau any
-local function deepCopy(tab: any): any
-    assert(typeof(tab) == "table")
-    local t = table.clone(tab)
-
-    for k, v in t do -- TODO luau, `intersect<>` should always reduce methinks? only occurs when function signature is `local function deepCopy<T>(tab: T & {}): T`
-        if typeof(v) == "table" then
-            t[k] = deepCopy(v)
-        else
-            t[k] = v
-        end
-    end
-
-    return t
-end
-
 local function applyBoundsChanges(changes: { read RequiredBoundsChange })
     for _, change in changes do
         assert(change.Target.Kind == "Free")
@@ -922,7 +910,7 @@ local function isFunctionSubtypeOf(a: NormalizedFunctionType, b: NormalizedFunct
                     else
                         table.insert(
                             failed,
-                            `'{ signature }' does not accept parameter #{ i } '{ normalizationToString(cb.Parameters[i]) }'.`
+                            `'{ signature }' does not accept parameter #{ i } '{ normalizationToString(cb.Parameters[i]) }': { paramResult.FailedPath }`
                         )
                         paramsMatched = false
                         continue
@@ -971,33 +959,6 @@ end
 function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
     if a.Error or b.Error then
         return subtypeSuccess()
-    end
-
-    if a.Free then
-        -- TODO luau removing annotation causes read-write indexer mismatch error
-        local changes: { RequiredBoundsChange } = {}
-
-        for free, _ in a.Free do
-            table.insert(changes, {
-                Target = free,
-                IntersectUpperWith = normalizationToType(b),
-            })
-        end
-
-        return subtypeSuccess(changes)
-    end
-
-    if b.Free then
-        local changes: { RequiredBoundsChange } = {}
-
-        for free, _ in b.Free do
-            table.insert(changes, {
-                Target = free,
-                UnionLowerWith = normalizationToType(a),
-            })
-        end
-
-        return subtypeSuccess(changes)
     end
 
     if a.Nil and not b.Nil then
@@ -1083,22 +1044,52 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         end
     end
 
-    if a.Free then
-        for _, free in a.Free do
-            local ubResult = isSubtypeOf(free.UpperBound, b)
+    if a.Generic then
+        if b.Generic then
+            for gen, inter in a.Generic do
+                local bi = b.Generic[gen]
+                if bi then
+                    local result = isSubtypeOf(inter, bi)
 
-            if not ubResult.Holds then
-                return ubResult
+                    if result.Holds then
+                        table.move(result.RequiredBoundsChanges, 1, #result.RequiredBoundsChanges, #requiredChanges + 1, requiredChanges)
+                    else
+                        return subtypeFailure(`Generic intersection '{ normalizationToString(inter) }' is not a subtype of '{ normalizationToString(bi) }'.`)
+                    end
+                else
+                    return subtypeFailure(`Unexpected '{ typeToString(gen) }'.`)
+                end
             end
-
-            -- TODO luau?
-            assert(isSupertypeOf)
-            local lbResult = isSupertypeOf(free.LowerBound, b)
-
-            if not lbResult.Holds then
-                return lbResult
-            end
+        else
+            return subtypeFailure(`Not generic.`)
         end
+    end
+
+    if a.Free then
+        -- TODO luau removing annotation causes read-write indexer mismatch error
+        local changes: { RequiredBoundsChange } = {}
+
+        for free, _ in a.Free do
+            table.insert(changes, {
+                Target = free,
+                IntersectUpperWith = normalizationToType(b),
+            })
+        end
+
+        return subtypeSuccess(changes)
+    end
+
+    if b.Free then
+        local changes: { RequiredBoundsChange } = {}
+
+        for free, _ in b.Free do
+            table.insert(changes, {
+                Target = free,
+                UnionLowerWith = normalizationToType(a),
+            })
+        end
+
+        return subtypeSuccess(changes)
     end
 
     return subtypeSuccess(requiredChanges)
@@ -1374,6 +1365,8 @@ function normalizationToType(n: NormalizedType): Type
                 end
             end
 
+            assert(#gens > 0)
+
             if #gens == 1 then
                 table.insert(t, gens[1])
             else
@@ -1391,6 +1384,8 @@ function normalizationToType(n: NormalizedType): Type
                     table.insert(frees, makeIntersection(free, normalizationToType(inter)))
                 end
             end
+
+            assert(#frees > 0)
 
             if #frees == 1 then
                 table.insert(t, frees[1])
