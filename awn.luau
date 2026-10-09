@@ -553,7 +553,11 @@ local function intersectNormalizedType(n: NormalizedType, with: NormalizedType)
     end
 end
 
-local function normalize(ty: Type): NormalizedType
+local function normalize_(ty: Type, seen: { [Type]: NormalizedType }): NormalizedType
+    if seen[ty] then
+        return seen[ty]
+    end
+
     local n = normalizedNever()
 
     if ty.Kind == "error" then
@@ -580,7 +584,7 @@ local function normalize(ty: Type): NormalizedType
             error(`Unreachable.`)
         end
     elseif ty.Kind == "List" then
-        n.List = { Items = normalize(ty.Items) }
+        n.List = { Items = normalize_(ty.Items, seen) }
 
     elseif ty.Kind == "Singleton" then
         if typeof(ty.Value) == "boolean" then
@@ -597,7 +601,7 @@ local function normalize(ty: Type): NormalizedType
         local params = table.create<<NormalizedType>>(#ty.Parameters)
 
         for i, param in ty.Parameters do
-            params[i] = normalize(param)
+            params[i] = normalize_(param, seen)
         end
 
         n.Function = {
@@ -606,8 +610,8 @@ local function normalize(ty: Type): NormalizedType
                     -- TODO luau
                     Generics = table.clone(ty.Generics :: any),
                     Parameters = params,
-                    Variadic = normalize(ty.Variadic),
-                    Return = if ty.Returns then normalize(ty.Returns) else nil,
+                    Variadic = normalize_(ty.Variadic, seen),
+                    Return = if ty.Returns then normalize_(ty.Returns, seen) else nil,
                 },
             }
         }
@@ -618,7 +622,7 @@ local function normalize(ty: Type): NormalizedType
         print(`Cannot normalize pending expansions.`)
 
     elseif ty.Kind == "Negation" then
-        n = normalize(ty.Negated)
+        n = normalize_(ty.Negated, seen)
 
         if isUnknown(n) then
             toNever(n)
@@ -662,7 +666,7 @@ local function normalize(ty: Type): NormalizedType
         toNever(n)
 
         for i, c in ty.Components do
-            local inner = normalize(c)
+            local inner = normalize_(c, seen)
             unionNormalizedType(n, inner)
         end
     elseif ty.Kind == "Intersection" then
@@ -670,7 +674,7 @@ local function normalize(ty: Type): NormalizedType
         toUnknown(n)
 
         for i, c in ty.Components do
-            local inner = normalize(c)
+            local inner = normalize_(c, seen)
             intersectNormalizedType(n, inner)
         end
     elseif ty.Kind == "Free" then
@@ -680,7 +684,12 @@ local function normalize(ty: Type): NormalizedType
         error(`Unreachable.`)
     end
 
+    seen[ty] = n
     return n
+end
+
+local function normalize(ty: Type): NormalizedType
+    return normalize_(ty, {})
 end
 
 local isSubtypeOf
@@ -1105,9 +1114,22 @@ end
 local genericTypeNameCount = 0
 local freeTypeNameCount = 0
 local instantiateType
+local typeEnv: { [string]: Type? }
 
-function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?, isNotMainFreeType: boolean?): string
-    if (ty :: Type).AliasName and ty.AliasName ~= alias then
+type ToStringSeen = {
+    [TypeData]: { Name: string?, Reached: boolean, read Stringification: string }?,
+}
+
+type ToStringOptions = {
+    read Alias: string?,
+    read HideFreeTypeBounds: boolean?,
+    read IsNotMainFreeType: boolean?,
+}
+
+function typeToString(ty: TypeData, tsopts: ToStringOptions?): string
+    local opts: ToStringOptions = tsopts or {}
+
+    if (ty :: Type).AliasName and ty.AliasName ~= opts.Alias then
         return ty.AliasName
     end
 
@@ -1119,6 +1141,15 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?, isN
 
             if genericTypeNameCount > 25 then
                 name ..= genericTypeNameCount // 25 + 1
+            end
+
+            while typeEnv[name] do
+                genericTypeNameCount += 1
+                name = string.char((genericTypeNameCount + 19) % 26 + 65)
+
+                if genericTypeNameCount > 25 then
+                    name ..= genericTypeNameCount // 25 + 1
+                end
             end
 
             tyvar.Name = name
@@ -1155,7 +1186,7 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?, isN
         return ty.Primitive
 
     elseif ty.Kind == "List" then
-        return `\{ { typeToString(ty.Items) } }`
+        return `\{ { typeToString(ty.Items, opts) } }`
 
     elseif ty.Kind == "Singleton" then
         if typeof(ty.Value) == "string" then
@@ -1172,7 +1203,7 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?, isN
             local gens = table.create<<string>>(#ty.Generics)
 
             for i, gen in ty.Generics do
-                gens[i] = typeToString(gen)
+                gens[i] = typeToString(gen, opts)
             end
 
             str = `<{ table.concat(gens, ", ") }>`
@@ -1181,7 +1212,7 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?, isN
         local params = table.create<<string>>(#ty.Parameters + 1)
 
         for i, param in ty.Parameters do
-            params[i] = typeToString(param)
+            params[i] = typeToString(param, opts)
         end
 
         -- if ty.Variadic.Kind ~= "never" then
@@ -1189,7 +1220,7 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?, isN
         -- end
 
         str ..= `({ table.concat(params, ", ") }) -> `
-        str ..= if ty.Returns then typeToString(ty.Returns) else "()"
+        str ..= if ty.Returns then typeToString(ty.Returns, opts) else "()"
 
         return str
 
@@ -1197,13 +1228,13 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?, isN
         local arguments = table.create<<string>>(#ty.Arguments)
 
         for i, a in ty.Arguments do
-            arguments[i] = typeToString(a)
+            arguments[i] = typeToString(a, opts)
         end
 
-        return `{ ty.Name }<{ table.concat(arguments, ", ") }> => { typeToString(instantiateType(ty :: Type)) }`
+        return `{ ty.Name }<{ table.concat(arguments, ", ") }> => { typeToString(instantiateType(ty :: Type), opts) }`
 
     elseif ty.Kind == "Negation" then
-        local inner = typeToString(ty.Negated)
+        local inner = typeToString(ty.Negated, opts)
 
         if ty.Negated.Kind == "Union" or ty.Negated.Kind == "Intersection" then
             return `~({ inner })`
@@ -1216,7 +1247,7 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?, isN
         local length = 0
 
         for i, c in ty.Components do
-            local ts = typeToString(c)
+            local ts = typeToString(c, opts)
             length += #ts
 
             if c.Kind == "Union" or c.Kind == "Intersection" then
@@ -1232,7 +1263,7 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?, isN
         local length = 0
 
         for i, c in ty.Components do
-            local ts = typeToString(c)
+            local ts = typeToString(c, opts)
             length += #ts
 
             if c.Kind == "Union" or c.Kind == "Intersection" then
@@ -1246,17 +1277,17 @@ function typeToString(ty: TypeData, alias: string?, hideFtyBounds: boolean?, isN
     elseif ty.Kind == "Free" then
         local str = freeTypeName(ty)
 
-        if isNotMainFreeType then
+        if opts.IsNotMainFreeType then
             str  = string.sub(str, 2, #str) -- Remove `'`.
         end
 
-        if not hideFtyBounds then
+        if not opts.HideFreeTypeBounds then
             if ty.UpperBound.Kind ~= "unknown" then
-                str ..= ` <: { typeToString(ty.UpperBound, nil, false, true) }`
+                str ..= ` <: { typeToString(ty.UpperBound, { IsNotMainFreeType = true }) }`
             end
 
             if ty.LowerBound.Kind ~= "never" then
-                str = `{ typeToString(ty.LowerBound, nil, false, true) } <: ` .. str
+                str = `{ typeToString(ty.LowerBound, { IsNotMainFreeType = true }) } <: ` .. str
             end
         end
 
@@ -1409,7 +1440,7 @@ function normalizationToString(n: NormalizedType): string
 end
 
 -- Maps type names to types.
-local typeEnv: { [string]: Type? } = {
+typeEnv = {
     never = neverType(),
     unknown = unknownType(),
     ["nil"] = primitiveType("nil"),
@@ -1564,7 +1595,7 @@ type GatherFreeTypeSubstitutionsState = {
     Polarities: { [Type]: Polarity },
     Generics: { Type },
     Polarity: Polarity,
-    AlwaysConcretize: boolean
+    AlwaysConcretize: boolean,
 }
 
 local function gatherFreeTypeSubstitutions(state: GatherFreeTypeSubstitutionsState, ty: Type, name: string)
@@ -1588,6 +1619,7 @@ local function gatherFreeTypeSubstitutions(state: GatherFreeTypeSubstitutionsSta
                     if isUnknown(normUpper) then
                         -- If there's no constraint, generalize.
                         replacement = genericType()
+                        table.insert(state.Generics, replacement)
                     else
                         if logInference then
                             print(`{ typeToString(ty, nil, true) } upper bound '{ typeToString(ty.UpperBound) }' will be clipped for intersection with '{ typeToString(previous) }'`)
@@ -1601,6 +1633,7 @@ local function gatherFreeTypeSubstitutions(state: GatherFreeTypeSubstitutionsSta
 
                     if isUnknown(normUpper) then
                         replacement = genericType()
+                        table.insert(state.Generics, replacement)
                     else
                         if logInference then
                             print(`{ typeToString(ty, nil, true) } upper bound '{ typeToString(ty.UpperBound) }' will be clipped`)
@@ -2050,16 +2083,7 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
             retTy = substituteAllIn(retTy, freeTypeSubstitutions.Substitutions, traversed)
         end
 
-        -- Trim unused generics, e.g. `let x = function(f, y) return f(y) end`.
-        local gensCheck = table.clone(gens)
-        table.clear(gens)
-
-        for _, gen in gensCheck do
-            if traversed[gen] then
-                table.insert(gens, gen)
-            end
-        end
-
+        table.move(freeTypeSubstitutions.Generics, 1, #freeTypeSubstitutions.Generics, #gens + 1, gens)
         local fty = functionType(gens, params, varTy, if typeof(retTy) == "table" then retTy else nil)
 
         if expr.Function.Name then
@@ -2067,6 +2091,10 @@ local function infer(state: InferenceState, expr: caw.Expression, expected: Type
                 Type = fty,
                 Expression = expr,
             }
+        end
+
+        if logInference then
+            print("")
         end
 
         return fty
