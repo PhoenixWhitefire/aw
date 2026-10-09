@@ -961,6 +961,33 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         return subtypeSuccess()
     end
 
+    if a.Free then
+        -- TODO luau removing annotation causes read-write indexer mismatch error
+        local changes: { RequiredBoundsChange } = {}
+
+        for free, _ in a.Free do
+            table.insert(changes, {
+                Target = free,
+                IntersectUpperWith = normalizationToType(b),
+            })
+        end
+
+        return subtypeSuccess(changes)
+    end
+
+    if b.Free then
+        local changes: { RequiredBoundsChange } = {}
+
+        for free, _ in b.Free do
+            table.insert(changes, {
+                Target = free,
+                UnionLowerWith = normalizationToType(a),
+            })
+        end
+
+        return subtypeSuccess(changes)
+    end
+
     if a.Nil and not b.Nil then
         return subtypeFailure("Unexpected `nil`.")
     end
@@ -1063,33 +1090,6 @@ function isSubtypeOf(a: NormalizedType, b: NormalizedType): SubtypingResult
         else
             return subtypeFailure(`Not generic.`)
         end
-    end
-
-    if a.Free then
-        -- TODO luau removing annotation causes read-write indexer mismatch error
-        local changes: { RequiredBoundsChange } = {}
-
-        for free, _ in a.Free do
-            table.insert(changes, {
-                Target = free,
-                IntersectUpperWith = normalizationToType(b),
-            })
-        end
-
-        return subtypeSuccess(changes)
-    end
-
-    if b.Free then
-        local changes: { RequiredBoundsChange } = {}
-
-        for free, _ in b.Free do
-            table.insert(changes, {
-                Target = free,
-                UnionLowerWith = normalizationToType(a),
-            })
-        end
-
-        return subtypeSuccess(changes)
     end
 
     return subtypeSuccess(requiredChanges)
